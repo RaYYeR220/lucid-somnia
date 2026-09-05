@@ -4,6 +4,7 @@ contracts/lib/forge-std/
 contracts/lib/openzeppelin-contracts/
 contracts/lib/solady/
 contracts/out/
+contracts/out-*/
 contracts/cache/
 contracts/broadcast/
 web/.next/
