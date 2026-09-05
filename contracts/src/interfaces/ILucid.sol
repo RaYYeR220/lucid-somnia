@@ -5,6 +5,8 @@ import {LucidTypes} from "../types/LucidTypes.sol";
 
 /// @notice The router owns every reactivity subscription, because the precompile requires the
 /// subscribing contract to hold at least 32 SOMI. Desks never subscribe; they are dispatched to.
+/// @dev The copy-trading graph deliberately lives in the factory, which already knows which
+/// address owns which desk. The router only reads it at fan-out time.
 interface ILucidRouter {
     function armVenue(address module, bytes32 venueId_) external;
     function registerDesk(address desk) external;
@@ -12,8 +14,7 @@ interface ILucidRouter {
     function topUp(address desk) external payable;
     function gasCreditOf(address desk) external view returns (uint256);
     function onVerdict(bytes32 marketId, LucidTypes.Verdict calldata v) external;
-    function follow(address leader, address follower, uint16 scaleBps) external;
-    function unfollow(address leader, address follower) external;
+    function reportTrade(bytes32 marketId, uint8 kind, uint256 stake) external;
     function marketOf(bytes32 marketId) external view returns (LucidTypes.MarketInfo memory);
 }
 
