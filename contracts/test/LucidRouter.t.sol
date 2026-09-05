@@ -44,6 +44,30 @@ contract MockFactoryView {
     }
 }
 
+/// @notice The slice of `LucidKeeper` the router drives: one call, and nothing else.
+/// @dev Kept here for the same reason as `MockFactoryView`: it pins the router's view of a contract
+/// it deliberately does not depend on. The keeper runs upkeep for the whole venue, so the router
+/// must be able to call it without being able to break when it misbehaves.
+contract MockKeeperForRouter {
+    error KeeperIsDown();
+
+    uint256 public keepCalls;
+    bytes32 public lastMarketId;
+    address public lastMarket;
+    bool public revertOnKeep;
+
+    function setRevertOnKeep(bool on) external {
+        revertOnKeep = on;
+    }
+
+    function keep(LucidTypes.MarketInfo calldata m) external {
+        if (revertOnKeep) revert KeeperIsDown();
+        ++keepCalls;
+        lastMarketId = m.marketId;
+        lastMarket = m.market;
+    }
+}
+
 /// @title LucidRouterTest
 /// @notice Exercises the one contract that talks to Somnia's reactivity precompile.
 ///
@@ -67,6 +91,7 @@ contract LucidRouterTest is Test {
     // ── fixture identities ────────────────────────────────────────────────────
     bytes32 internal constant VENUE_ID = 0x1a1e6821cde7d0159c0d293177871e09677b4e42307c7db3ba94f8648a5a050f;
     bytes32 internal constant BTC_MARKET_ID = bytes32(uint256(0x14898));
+    address internal constant BTC_MARKET_ADDR = 0xc7B7f71513EAF972B9Ff6C0DDb6144E322bA63B0;
     address internal constant BTC_POOL = 0xcc2c4f74C8c3Dd5684EE2e18B1eb8fB1952fb308;
     bytes32 internal constant ETH_MARKET_ID = bytes32(uint256(0x14899));
     address internal constant ETH_POOL = 0x56154C18cf0e7E601919b13c7478747398AA5057;
@@ -610,6 +635,83 @@ contract LucidRouterTest is Test {
         router.reportTrade(BTC_MARKET_ID, LucidTypes.BUY_YES, 1e6);
     }
 
+    // ── venue-wide upkeep ─────────────────────────────────────────────────────
+    //
+    // DreamDEX's upkeep calls are permissionless and effectively nobody makes them. This router is
+    // already awake for every market the venue creates, so with a keeper attached it wakes up for
+    // all of them rather than only for the ones its own desks took a position in. Without one it
+    // behaves exactly as it did before, and pays for exactly what its desks asked for.
+
+    function test_no_keeper_means_unchanged_scheduling() public {
+        assertEq(router.keeper(), address(0), "no keeper by default");
+        _newDesk(false, 1 ether);
+
+        _fireBtc();
+
+        assertEq(precompile.subscriptionCount(), 1, "no one-shot for a market nobody wanted");
+        assertEq(router.pendingAt(DUE_MS).length, 0, "nothing queued");
+        assertEq(router.scheduleIdAt(DUE_MS), 0, "no one-shot recorded");
+    }
+
+    function test_with_a_keeper_every_venue_market_gets_a_oneshot() public {
+        MockKeeperForRouter keeper = _attachKeeper();
+
+        // No desks at all: these two windows are pure public good.
+        _fireBtc();
+        _fireEth();
+
+        assertEq(precompile.subscriptionCount(), 2, "venue subscription plus one shared one-shot");
+        assertEq(router.scheduleIdAt(DUE_MS), 2, "the one-shot is recorded");
+
+        bytes32[] memory due = router.pendingAt(DUE_MS);
+        assertEq(due.length, 2, "both markets queued for upkeep");
+        assertEq(due[0], BTC_MARKET_ID, "BTC");
+        assertEq(due[1], ETH_MARKET_ID, "ETH");
+        assertEq(keeper.keepCalls(), 0, "nothing kept until the window closes");
+    }
+
+    /// @dev The whole point of the keeper: it reaches markets this protocol has no stake in.
+    function test_keeper_is_called_for_a_market_no_desk_held() public {
+        MockKeeperForRouter keeper = _attachKeeper();
+
+        _fireBtc();
+        assertEq(router.interestedIn(BTC_MARKET_ID).length, 0, "no desk holds this window");
+
+        vm.warp(EXPIRY + 5);
+        _fireSchedule(DUE_MS);
+
+        assertEq(keeper.keepCalls(), 1, "upkeep ran anyway");
+        assertEq(keeper.lastMarketId(), BTC_MARKET_ID, "for the venue's market");
+        assertEq(keeper.lastMarket(), BTC_MARKET_ADDR, "and it was handed the market contract");
+    }
+
+    /// @dev The upkeep is a favour to the venue, and a favour must never cost the desks that paid
+    /// for the firing their settlement.
+    function test_a_reverting_keeper_does_not_break_settlement() public {
+        MockKeeperForRouter keeper = _attachKeeper();
+        keeper.setRevertOnKeep(true);
+        MockDeskForRouter d = _newDesk(true, 1 ether);
+
+        _fireBtc();
+        assertEq(router.pendingAt(DUE_MS).length, 1, "a served market is queued exactly once");
+
+        vm.warp(EXPIRY + 5);
+        vm.expectEmit(true, true, false, true, address(router));
+        emit LucidRouter.Skipped(address(keeper), BTC_MARKET_ID, "KEEPER_FAILED");
+        _fireSchedule(DUE_MS);
+
+        assertEq(d.settlementCalls(), 1, "the desk still settled");
+        assertEq(keeper.keepCalls(), 0, "and the keeper recorded nothing it did not do");
+    }
+
+    function test_only_owner_can_set_keeper() public {
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        router.setKeeper(address(1));
+
+        assertEq(router.keeper(), address(0), "unchanged");
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────────
 
     function _newDesk(bool wants, uint256 credit) internal returns (MockDeskForRouter d) {
@@ -634,6 +736,14 @@ contract LucidRouterTest is Test {
             router.setFactory(address(factory));
         }
         factory.link(leader, follower, scaleBps);
+    }
+
+    /// @dev Attaches the venue-wide upkeep runner, which is what widens the router's scheduling
+    /// from "markets a desk holds" to "every market on the venue".
+    function _attachKeeper() internal returns (MockKeeperForRouter keeper) {
+        keeper = new MockKeeperForRouter();
+        vm.prank(owner);
+        router.setKeeper(address(keeper));
     }
 
     function _verdict(uint16 probUpBps) internal pure returns (LucidTypes.Verdict memory) {

@@ -19,6 +19,14 @@ interface IFactoryView {
     function scaleOf(address leader, address follower) external view returns (uint16);
 }
 
+/// @notice The slice of `LucidKeeper` this contract drives: one call, and nothing else.
+/// @dev Declared locally rather than imported for the same reason as `IFactoryView`. The keeper
+/// runs upkeep on behalf of the entire venue, including markets this protocol has no stake in; the
+/// router must be able to call it without taking on a dependency it would then have to trust.
+interface ILucidKeeper {
+    function keep(LucidTypes.MarketInfo calldata m) external;
+}
+
 /// @title LucidRouter
 /// @notice The protocol's single subscriber to Somnia's on-chain reactivity, and the only contract
 /// that ever talks to the precompile at `0x0100`.
@@ -86,6 +94,12 @@ contract LucidRouter is SomniaEventHandler, Ownable {
     /// @notice A follower may mirror at most the leader's own size.
     uint16 public constant MAX_SCALE_BPS = 10_000;
 
+    /// @notice Gas stipend for the venue-wide upkeep pass over one settled market.
+    /// @dev The keeper makes up to five external calls into contracts this protocol does not own.
+    /// It is a public good, not a priority: it runs after every desk in the firing has been
+    /// settled, and it is capped so it can never spend what those desks paid for.
+    uint256 public constant KEEPER_GAS = 1_500_000;
+
     /// @dev How many settled windows of per-asset history are kept as committee evidence.
     /// Matches `PromptLib.MAX_OUTCOMES`; older windows stop being informative quickly.
     uint256 internal constant MAX_RECENT = 5;
@@ -126,6 +140,13 @@ contract LucidRouter is SomniaEventHandler, Ownable {
 
     /// @notice The desk factory, and the source of truth for the copy-trade graph.
     address public factory;
+
+    /// @notice The venue-wide upkeep runner, or zero to serve only this protocol's own desks.
+    /// @dev Attaching a keeper widens what the router pays for: with one set, every market on the
+    /// venue gets a settlement wake-up, not just the ones a desk took a position in. That is the
+    /// point — DreamDEX's upkeep calls are permissionless and effectively nobody runs them, and
+    /// this router is already awake for every market the venue creates.
+    address public keeper;
 
     /// @notice Prepaid desk credit held by this contract. Not the operator's money.
     uint256 public totalGasCredit;
@@ -194,6 +215,7 @@ contract LucidRouter is SomniaEventHandler, Ownable {
     event TradeReported(address indexed desk, bytes32 indexed marketId, uint8 kind, uint256 stake);
     event BrainUpdated(address brain);
     event FactoryUpdated(address factory);
+    event KeeperSet(address keeper);
     event Swept(address indexed to, uint256 amount);
 
     /// @param owner_ The operator that arms the venue and tunes the wiring.
@@ -256,6 +278,16 @@ contract LucidRouter is SomniaEventHandler, Ownable {
     function setFactory(address factory_) external onlyOwner {
         factory = factory_;
         emit FactoryUpdated(factory_);
+    }
+
+    /// @notice Attach the venue-wide upkeep runner, or detach it.
+    /// @dev With a keeper attached the router schedules a settlement wake-up for every market on
+    /// the venue rather than only for markets a desk holds, and pays for those wake-ups out of the
+    /// operator's own float. Detaching it restores the narrower behaviour immediately.
+    /// @param keeper_ The keeper address, or zero to stop running upkeep for the venue.
+    function setKeeper(address keeper_) external onlyOwner {
+        keeper = keeper_;
+        emit KeeperSet(keeper_);
     }
 
     /// @notice Recover the operator's own float.
@@ -513,23 +545,35 @@ contract LucidRouter is SomniaEventHandler, Ownable {
             return;
         }
 
+        bool scheduled = _serveDesks(m, tsMillis);
+
+        // Venue-wide upkeep needs the router to be awake after this window closes, and nothing else
+        // — so a market no desk wanted still gets a one-shot, but only when a keeper is attached to
+        // make use of it. With no keeper the router pays for exactly what its desks asked for.
+        if (!scheduled && keeper != address(0)) _scheduleSettlement(m.marketId, tsMillis);
+    }
+
+    /// @dev The desks' half of a new market: who wants it, who pays for the committee, and the
+    /// settlement wake-up their positions oblige the router to book.
+    /// @return scheduled Whether the settlement one-shot for this market was already handled here.
+    function _serveDesks(LucidTypes.MarketInfo memory m, uint256 tsMillis) private returns (bool scheduled) {
         address[] memory candidates = _candidates(m);
-        if (candidates.length == 0) return;
+        if (candidates.length == 0) return false;
 
         (bool quoted, uint256 fee) = _quote();
         if (!quoted) {
             emit Skipped(address(0), m.marketId, "NO_BRAIN");
-            return;
+            return false;
         }
         // The bond is not spendable float. Dipping below it would silently disarm every
         // subscription this router owns, including the settlement wake-ups already promised.
         if (address(this).balance < SUBSCRIPTION_FLOOR + fee) {
             emit Skipped(address(0), m.marketId, "ROUTER_FLOAT");
-            return;
+            return false;
         }
 
         (address[] memory payers, uint256 share) = _resolvePayers(m.marketId, candidates, fee);
-        if (payers.length == 0) return;
+        if (payers.length == 0) return false;
 
         // The committee is shown the same two pieces of evidence a desk will later be judged
         // against: what the book thinks right now, and how this asset's recent windows resolved.
@@ -542,7 +586,7 @@ contract LucidRouter is SomniaEventHandler, Ownable {
             emit VerdictRequested(m.marketId, fee, payers.length);
         } catch {
             emit Skipped(address(0), m.marketId, "VERDICT_REQUEST_FAILED");
-            return;
+            return false;
         }
 
         // The list is rebuilt rather than appended to, so it always describes this firing's fan-out
@@ -554,6 +598,7 @@ contract LucidRouter is SomniaEventHandler, Ownable {
         }
 
         _scheduleSettlement(m.marketId, tsMillis);
+        return true;
     }
 
     /// @dev Armed desks that want this market, capped at `MAX_FANOUT` considered. A desk whose
@@ -668,6 +713,7 @@ contract LucidRouter is SomniaEventHandler, Ownable {
             }
 
             delete _interested[marketId];
+            _keep(m);
             _recordOutcome(m);
         }
 
@@ -675,6 +721,24 @@ contract LucidRouter is SomniaEventHandler, Ownable {
         // The chain removes a one-shot once it has fired, so the slot must be freed rather than
         // left pointing at a dead id: a later window closing at the same millisecond needs a new one.
         delete scheduleIdAt[tsMillis];
+    }
+
+    /// @dev Runs DreamDEX's permissionless upkeep for a settled window, for the good of the whole
+    /// venue rather than of this protocol.
+    ///
+    /// It comes after the desks have been settled, because the desks paid for this firing and the
+    /// upkeep did not, and before the outcome is recorded, because finalizing a market is what
+    /// makes its payout numerators readable in the first place. Both the `code.length` guard and
+    /// the `try` are needed: the keeper is a separate deployment that an operator can re-point, and
+    /// a handler that reverts loses every desk's settlement, not just the upkeep.
+    function _keep(LucidTypes.MarketInfo memory m) private {
+        address k = keeper;
+        if (k == address(0) || k.code.length == 0) return;
+
+        try ILucidKeeper(k).keep{gas: KEEPER_GAS}(m) {}
+        catch {
+            emit Skipped(k, m.marketId, "KEEPER_FAILED");
+        }
     }
 
     /// @dev Remembers how a window actually resolved, as evidence for the next committee prompt.
