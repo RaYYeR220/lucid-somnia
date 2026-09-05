@@ -1,5 +1,7 @@
 # deps / build
 node_modules/
+contracts/lib/forge-std/
+contracts/lib/openzeppelin-contracts/
 contracts/out/
 contracts/cache/
 contracts/broadcast/
