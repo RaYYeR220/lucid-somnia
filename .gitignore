@@ -1,8 +1,7 @@
 # deps / build
 node_modules/
-contracts/lib/forge-std/
-contracts/lib/openzeppelin-contracts/
-contracts/lib/solady/
+contracts/lib/*
+!contracts/lib/somnia-reactivity/
 contracts/out/
 contracts/out-*/
 contracts/cache/
@@ -17,20 +16,12 @@ kit/dist/
 .env.*
 !.env.example
 
-# local notes & scratch
-.remember/
-MEMORY.md
-.claude/
-docs/superpowers/
-*-internal/
+# local scratch
+scratch/
 *-backup*
 *.bundle
-scratch/
-BRIEF.md
-ALTERNATIVES.md
 
-# spikes & design exploration (working artifacts, not product)
-contracts/src/spike/
+# design exploration, not product
 ui-prototypes/
 mockups/
 design-ref/
