@@ -1,0 +1,37 @@
+# deps / build
+node_modules/
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+web/.next/
+web/out/
+kit/dist/
+*.tsbuildinfo
+
+# secrets
+.env
+.env.*
+!.env.example
+
+# local notes & scratch
+.remember/
+MEMORY.md
+.claude/
+docs/superpowers/
+*-internal/
+*-backup*
+*.bundle
+scratch/
+BRIEF.md
+ALTERNATIVES.md
+
+# spikes & design exploration (working artifacts, not product)
+contracts/src/spike/
+ui-prototypes/
+mockups/
+design-ref/
+variants/
+
+# os
+.DS_Store
+Thumbs.db

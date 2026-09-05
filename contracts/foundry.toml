@@ -1,0 +1,19 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+solc = "0.8.30"
+optimizer = true
+optimizer_runs = 200
+via_ir = false
+evm_version = "cancun"
+remappings = [
+  "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+  "@somnia/reactivity/=lib/somnia-reactivity/",
+  "forge-std/=lib/forge-std/src/",
+]
+fs_permissions = [{ access = "read-write", path = "./" }]
+
+[rpc_endpoints]
+somnia_testnet = "https://api.infra.testnet.somnia.network"
+somnia = "https://api.infra.mainnet.somnia.network"
