@@ -228,6 +228,61 @@ contract LucidBrainTest is Test {
         brain.setCommittee(0, 0);
     }
 
+    // -- recovering the float -------------------------------------------------
+    //
+    // One verdict costs 0.213 STT, and on this testnet that float is genuinely scarce. A brain
+    // that could only ever be funded would burn it the moment the prompt was retired or the
+    // deployment replaced, so the money has to be able to come back out.
+
+    function test_only_owner_can_sweep() public {
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        brain.sweep(stranger, 1 ether);
+
+        assertEq(address(brain).balance, 10 ether, "the float is untouched");
+        assertEq(stranger.balance, 0, "and nothing left the contract");
+    }
+
+    function test_sweep_moves_the_float() public {
+        address to = makeAddr("treasury");
+
+        vm.expectEmit(true, false, false, true, address(brain));
+        emit LucidBrain.Swept(to, 4 ether);
+        vm.prank(owner);
+        brain.sweep(to, 4 ether);
+
+        assertEq(to.balance, 4 ether, "recovered");
+        assertEq(address(brain).balance, 6 ether, "the remainder stays with the committee");
+
+        // A withdrawal, not a teardown: what is left must still buy verdicts.
+        _request();
+        assertEq(platform.requestCount(), 1, "the brain still works after a partial sweep");
+        assertEq(platform.lastRequest().value, 0.213 ether, "and still pays the full quote");
+    }
+
+    function test_sweep_reverts_when_over_balance() public {
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(LucidBrain.Underfunded.selector, 10 ether + 1, 10 ether));
+        brain.sweep(owner, 10 ether + 1);
+
+        assertEq(address(brain).balance, 10 ether, "a refused sweep moves nothing");
+
+        // The whole balance is allowed. Nothing here is anybody else's money: the platform takes
+        // its deposit at request time, so there is no prepaid credit to protect.
+        vm.prank(owner);
+        brain.sweep(owner, 10 ether);
+        assertEq(address(brain).balance, 0, "the float can be emptied");
+        assertEq(owner.balance, 10 ether, "and all of it arrives");
+    }
+
+    function test_sweep_rejects_the_zero_address() public {
+        vm.prank(owner);
+        vm.expectRevert(LucidBrain.ZeroAddress.selector);
+        brain.sweep(address(0), 1 ether);
+
+        assertEq(address(brain).balance, 10 ether, "a fat-fingered recipient must not burn the float");
+    }
+
     // -- helpers --------------------------------------------------------------
 
     function _market() internal view returns (LucidTypes.MarketInfo memory m) {

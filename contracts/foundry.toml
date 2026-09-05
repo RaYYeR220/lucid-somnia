@@ -14,6 +14,19 @@ remappings = [
 ]
 fs_permissions = [{ access = "read-write", path = "./" }]
 
+# Seeds are pinned so a run is reproducible for anyone reviewing this repository.
+# The invariant suite asserts that its own generator actually reached the branch under
+# test; an unlucky unpinned campaign can miss it and report a failure that says nothing
+# about the code.
+[profile.default.fuzz]
+runs = 256
+seed = "0x4c55434944"
+
+[profile.default.invariant]
+runs = 128
+depth = 256
+fail_on_revert = true
+
 [rpc_endpoints]
 somnia_testnet = "https://api.infra.testnet.somnia.network"
 somnia = "https://api.infra.mainnet.somnia.network"

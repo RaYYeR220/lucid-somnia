@@ -76,6 +76,10 @@ contract LucidBrain is ILucidBrain, IAgentConsumer, Ownable {
     error UnknownRequest(uint256 requestId);
     /// @notice The agent platform address is required at construction.
     error ZeroPlatform();
+    /// @notice A required address argument was zero.
+    error ZeroAddress();
+    /// @notice The sweep recipient rejected the transfer.
+    error SweepFailed();
 
     event VerdictRequested(
         bytes32 indexed marketId, uint256 indexed requestId, uint8 size, uint8 threshold, uint256 deposit
@@ -95,6 +99,7 @@ contract LucidBrain is ILucidBrain, IAgentConsumer, Ownable {
     event PromptUpdated(string system);
     event CommitteeUpdated(uint8 size, uint8 threshold);
     event RouterUpdated(address router);
+    event Swept(address indexed to, uint256 amount);
 
     /// @param owner_ The address allowed to tune the prompt, committee and router.
     /// @param platform_ Somnia's agent platform for this chain.
@@ -243,6 +248,24 @@ contract LucidBrain is ILucidBrain, IAgentConsumer, Ownable {
     function setRouter(address router_) external onlyOwner {
         router = router_;
         emit RouterUpdated(router_);
+    }
+
+    /// @notice Recover the committee float this contract holds.
+    /// @dev One verdict costs 0.213 SOMI at the default committee size, and on testnet that float is
+    /// genuinely scarce — a brain that can only be funded is a brain whose float is destroyed the
+    /// moment the prompt is retired or the deployment is replaced. Nothing here is anybody else's
+    /// money: the platform takes its deposit at request time, so whatever is left is the operator's.
+    /// @param to Recipient of the swept float.
+    /// @param amount How much to send, at most the current balance.
+    function sweep(address to, uint256 amount) external onlyOwner {
+        if (to == address(0)) revert ZeroAddress();
+
+        uint256 balance = address(this).balance;
+        if (amount > balance) revert Underfunded(amount, balance);
+
+        (bool ok,) = to.call{value: amount}("");
+        if (!ok) revert SweepFailed();
+        emit Swept(to, amount);
     }
 
     /// @dev deposit = platform floor for this committee size + the per-validator reward.

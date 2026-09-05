@@ -68,6 +68,41 @@ contract MockKeeperForRouter {
     }
 }
 
+/// @notice The slice of `LucidRelay` the router drives: one call, and nothing else.
+/// @dev Kept here for the same reason as `MockKeeperForRouter`. The relay is an ownerless public
+/// good that redeems exits their owners signed in advance; the router only nudges it, so it must
+/// be able to do that without being able to break when the relay misbehaves.
+contract MockRelayForRouter {
+    error RelayIsDown();
+
+    uint256 public relayCalls;
+    bytes32 public lastMarketId;
+    uint256 public lastMax;
+    bool public revertOnRelay;
+
+    /// @dev Sampled at call time. A redemption reverts until the market is finalized, and
+    /// finalizing it is the keeper's first call — so "the relay ran after the keeper" is a real
+    /// property, not a detail, and this is what lets a test pin it.
+    MockKeeperForRouter public witness;
+    uint256 public keepsWhenRelayed;
+
+    function setRevertOnRelay(bool on) external {
+        revertOnRelay = on;
+    }
+
+    function watch(MockKeeperForRouter keeper) external {
+        witness = keeper;
+    }
+
+    function relayUpTo(bytes32 marketId, uint256 max) external {
+        if (revertOnRelay) revert RelayIsDown();
+        ++relayCalls;
+        lastMarketId = marketId;
+        lastMax = max;
+        if (address(witness) != address(0)) keepsWhenRelayed = witness.keepCalls();
+    }
+}
+
 /// @title LucidRouterTest
 /// @notice Exercises the one contract that talks to Somnia's reactivity precompile.
 ///
@@ -712,6 +747,98 @@ contract LucidRouterTest is Test {
         assertEq(router.keeper(), address(0), "unchanged");
     }
 
+    // ── pre-signed exits ──────────────────────────────────────────────────────
+    //
+    // A winning position on DreamDEX does not pay itself out, and the venue's own web app
+    // auto-claims only for its own users. The relay holds exits their owners signed in advance and
+    // needs somebody awake at settlement to run them; this router already is. It is attached the
+    // same way the keeper is, and detaching it must leave the router exactly as it was.
+
+    function test_no_relay_leaves_settlement_unchanged() public {
+        assertEq(router.relay(), address(0), "no relay by default");
+        MockDeskForRouter d = _newDesk(true, 1 ether);
+
+        _fireBtc();
+        vm.warp(EXPIRY + 5);
+        _fireSchedule(DUE_MS);
+
+        assertEq(d.settlementCalls(), 1, "the desk settled exactly as it always has");
+        assertEq(d.lastSettledMarketId(), BTC_MARKET_ID, "for its market");
+        assertEq(router.interestedIn(BTC_MARKET_ID).length, 0, "positions closed out");
+        assertEq(router.pendingAt(DUE_MS).length, 0, "the queue drained");
+        assertEq(router.scheduleIdAt(DUE_MS), 0, "the one-shot slot was freed");
+        assertEq(precompile.subscriptionCount(), 2, "and no extra subscription was taken out");
+    }
+
+    function test_relay_is_drained_at_settlement() public {
+        MockKeeperForRouter keeper = _attachKeeper();
+        MockRelayForRouter exits = _attachRelay();
+        exits.watch(keeper);
+        MockDeskForRouter d = _newDesk(true, 1 ether);
+
+        _fireBtc();
+        assertEq(exits.relayCalls(), 0, "nothing is redeemed before the window closes");
+
+        vm.warp(EXPIRY + 5);
+        _fireSchedule(DUE_MS);
+
+        assertEq(exits.relayCalls(), 1, "the exits were drained for the settled window");
+        assertEq(exits.lastMarketId(), BTC_MARKET_ID, "for this market and no other");
+        assertEq(exits.lastMax(), router.RELAY_BATCH(), "in a bounded batch, never the whole queue");
+        assertEq(exits.keepsWhenRelayed(), 1, "and only after the keeper finalized the market");
+        assertEq(d.settlementCalls(), 1, "the desk that paid for the firing still settled");
+    }
+
+    /// @dev The relay is a favour to whoever queued an exit, and a favour must never cost the desks
+    /// that paid for this firing their settlement.
+    function test_a_reverting_relay_does_not_break_settlement() public {
+        MockRelayForRouter exits = _attachRelay();
+        exits.setRevertOnRelay(true);
+        MockDeskForRouter d = _newDesk(true, 1 ether);
+
+        _fireBtc();
+
+        vm.warp(EXPIRY + 5);
+        vm.expectEmit(true, true, false, true, address(router));
+        emit LucidRouter.Skipped(address(exits), BTC_MARKET_ID, "RELAY_FAILED");
+        _fireSchedule(DUE_MS);
+
+        assertEq(d.settlementCalls(), 1, "the desk still settled");
+        assertEq(exits.relayCalls(), 0, "and the relay recorded nothing it did not do");
+
+        // The other half of the guard, and the one `try` cannot cover: an address with no code.
+        // The compiler's own `extcodesize` check raises outside the `catch`, so a relay that was
+        // never deployed has to be refused before the call rather than caught after it.
+        vm.warp(TRADING_START);
+        vm.prank(owner);
+        router.setRelay(stranger);
+
+        _fireEth();
+        vm.warp(EXPIRY + 5);
+        _fireSchedule(DUE_MS);
+
+        assertEq(d.settlementCalls(), 2, "an EOA relay is passed over and settlement is unharmed");
+        assertEq(d.lastSettledMarketId(), ETH_MARKET_ID, "the second window");
+    }
+
+    function test_only_owner_can_set_relay() public {
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        router.setRelay(address(1));
+
+        assertEq(router.relay(), address(0), "unchanged");
+
+        vm.expectEmit(false, false, false, true, address(router));
+        emit LucidRouter.RelaySet(address(1));
+        vm.prank(owner);
+        router.setRelay(address(1));
+        assertEq(router.relay(), address(1), "the operator may attach one");
+
+        vm.prank(owner);
+        router.setRelay(address(0));
+        assertEq(router.relay(), address(0), "and detach it again");
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────────
 
     function _newDesk(bool wants, uint256 credit) internal returns (MockDeskForRouter d) {
@@ -744,6 +871,13 @@ contract LucidRouterTest is Test {
         keeper = new MockKeeperForRouter();
         vm.prank(owner);
         router.setKeeper(address(keeper));
+    }
+
+    /// @dev Attaches the auto-redeem relay woken after a window settles.
+    function _attachRelay() internal returns (MockRelayForRouter exits) {
+        exits = new MockRelayForRouter();
+        vm.prank(owner);
+        router.setRelay(address(exits));
     }
 
     function _verdict(uint16 probUpBps) internal pure returns (LucidTypes.Verdict memory) {

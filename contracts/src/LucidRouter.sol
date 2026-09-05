@@ -27,6 +27,15 @@ interface ILucidKeeper {
     function keep(LucidTypes.MarketInfo calldata m) external;
 }
 
+/// @notice The slice of `LucidRelay` this contract drives: one call, and nothing else.
+/// @dev Declared locally rather than imported for the same reason as `ILucidKeeper`. The relay is
+/// an ownerless public good that serves any address on any venue, so the router must be able to
+/// nudge it without taking on its implementation — including the EIP-712 machinery it carries,
+/// which this contract has no business knowing about.
+interface ILucidRelay {
+    function relayUpTo(bytes32 marketId, uint256 max) external;
+}
+
 /// @title LucidRouter
 /// @notice The protocol's single subscriber to Somnia's on-chain reactivity, and the only contract
 /// that ever talks to the precompile at `0x0100`.
@@ -100,6 +109,19 @@ contract LucidRouter is SomniaEventHandler, Ownable {
     /// settled, and it is capped so it can never spend what those desks paid for.
     uint256 public constant KEEPER_GAS = 1_500_000;
 
+    /// @notice Gas stipend for draining one market's pre-signed exits after it settles.
+    /// @dev Redemption is a token transfer per entry on a venue contract this protocol does not
+    /// own, so the batch below is the expensive tenant of a settlement firing. It is still capped:
+    /// the desks paid for this firing, and an auto-redeem that starved them would be a worse deal
+    /// than no auto-redeem at all.
+    uint256 public constant RELAY_GAS = 4_000_000;
+
+    /// @notice How many pre-signed exits one settlement firing redeems.
+    /// @dev The relay's own queue holds up to 64, which was measured at roughly 16.5M gas — twice
+    /// what a handler is given. Sixteen fits inside `RELAY_GAS`, and the remainder stays queued for
+    /// anyone to finish, because relaying is permissionless.
+    uint256 public constant RELAY_BATCH = 16;
+
     /// @dev How many settled windows of per-asset history are kept as committee evidence.
     /// Matches `PromptLib.MAX_OUTCOMES`; older windows stop being informative quickly.
     uint256 internal constant MAX_RECENT = 5;
@@ -147,6 +169,12 @@ contract LucidRouter is SomniaEventHandler, Ownable {
     /// point — DreamDEX's upkeep calls are permissionless and effectively nobody runs them, and
     /// this router is already awake for every market the venue creates.
     address public keeper;
+
+    /// @notice The auto-redeem relay woken after a window settles, or zero to leave exits alone.
+    /// @dev A winning position on DreamDEX does not pay itself out, and only the venue's own web app
+    /// auto-claims — for its own users. The relay holds exits their owners signed in advance, and it
+    /// needs somebody awake at settlement to run them. This router already is.
+    address public relay;
 
     /// @notice Prepaid desk credit held by this contract. Not the operator's money.
     uint256 public totalGasCredit;
@@ -216,6 +244,7 @@ contract LucidRouter is SomniaEventHandler, Ownable {
     event BrainUpdated(address brain);
     event FactoryUpdated(address factory);
     event KeeperSet(address keeper);
+    event RelaySet(address relay);
     event Swept(address indexed to, uint256 amount);
 
     /// @param owner_ The operator that arms the venue and tunes the wiring.
@@ -288,6 +317,17 @@ contract LucidRouter is SomniaEventHandler, Ownable {
     function setKeeper(address keeper_) external onlyOwner {
         keeper = keeper_;
         emit KeeperSet(keeper_);
+    }
+
+    /// @notice Attach the auto-redeem relay woken at settlement, or detach it.
+    /// @dev The relay is ownerless and permissionless, so attaching one takes on no counterparty:
+    /// the worst it can do is spend `RELAY_GAS` of a firing the router was making anyway. Detaching
+    /// it restores the previous behaviour immediately, and leaves the queued exits for anyone else
+    /// to drain.
+    /// @param relay_ The relay address, or zero to stop redeeming exits for the venue.
+    function setRelay(address relay_) external onlyOwner {
+        relay = relay_;
+        emit RelaySet(relay_);
     }
 
     /// @notice Recover the operator's own float.
@@ -714,6 +754,7 @@ contract LucidRouter is SomniaEventHandler, Ownable {
 
             delete _interested[marketId];
             _keep(m);
+            _relayExits(marketId);
             _recordOutcome(m);
         }
 
@@ -738,6 +779,26 @@ contract LucidRouter is SomniaEventHandler, Ownable {
         try ILucidKeeper(k).keep{gas: KEEPER_GAS}(m) {}
         catch {
             emit Skipped(k, m.marketId, "KEEPER_FAILED");
+        }
+    }
+
+    /// @dev Redeems the exits their owners signed in advance for a window that has just closed.
+    ///
+    /// It runs after `_keep`, and that ordering is the whole thing: a redemption reverts until the
+    /// market is finalized, and finalizing it is the first call the keeper makes. Running the relay
+    /// first would produce a queue of `RelayFailed` events and redeem nothing.
+    ///
+    /// Guarded and wrapped for the same two reasons as the keeper. The relay is a separate
+    /// deployment an operator can re-point, and `try` alone does not survive an address with no
+    /// code — the `extcodesize` check runs outside the `catch` and would take the whole firing,
+    /// including every desk's settlement, down with it.
+    function _relayExits(bytes32 marketId) private {
+        address r = relay;
+        if (r == address(0) || r.code.length == 0) return;
+
+        try ILucidRelay(r).relayUpTo{gas: RELAY_GAS}(marketId, RELAY_BATCH) {}
+        catch {
+            emit Skipped(r, marketId, "RELAY_FAILED");
         }
     }
 

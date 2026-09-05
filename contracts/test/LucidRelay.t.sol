@@ -283,6 +283,103 @@ contract LucidRelayTest is Test {
         assertEq(relay.pendingCount(bytes32(uint256(0xBEEF))), 1);
     }
 
+    // ── bounded draining ──────────────────────────────────────────────────────
+    //
+    // A full 64-entry queue measured at roughly 16.5M gas, more than a reactivity handler is
+    // given. `relayUpTo` is what lets a caller working inside a fixed budget take the part of the
+    // backlog it can actually pay for and leave the rest for the next caller. Entries come off the
+    // END of the queue, so removal is a bare `pop()` and no survivor has to be moved.
+
+    function test_relayUpTo_drains_only_the_requested_count() public {
+        _submit(ALICE_PK, _auth(alice, 0, 500e6, 1));
+        _submit(BOB_PK, _auth(bob, 1, 600e6, 1));
+
+        uint256 carolPk = 0xC0FFEE;
+        address carol = vm.addr(carolPk);
+        _submit(carolPk, _auth(carol, 0, 700e6, 1));
+
+        relay.relayUpTo(MARKET_ID, 2);
+
+        assertEq(module.callCount(), 2, "exactly what was asked for, and no more");
+        assertEq(module.callAt(0).owner, bob, "the two taken are the ones at the end");
+        assertEq(module.callAt(1).owner, carol);
+        assertEq(relay.relayedCount(), 2);
+        assertEq(relay.failedCount(), 0);
+        assertEq(relay.pendingCount(MARKET_ID), 1, "the queue shrank by exactly two");
+    }
+
+    function test_relayUpTo_leaves_the_rest_pending() public {
+        _submit(ALICE_PK, _auth(alice, 0, 500e6, 1));
+        _submit(BOB_PK, _auth(bob, 1, 600e6, 4));
+
+        relay.relayUpTo(MARKET_ID, 1);
+
+        // The survivor must come back whole. A half-kept authorization is worse than none: the
+        // owner is told their exit is queued and it would fail on the module.
+        LucidRelay.Authorization[] memory pending = relay.pendingFor(MARKET_ID);
+        assertEq(pending.length, 1, "one survivor");
+        assertEq(pending[0].owner, alice, "and it is the entry that was not taken");
+        assertEq(pending[0].outcomeIdx, 0);
+        assertEq(pending[0].amount, 500e6);
+        assertEq(pending[0].nonce, 1);
+        assertEq(relay.pendingSignatureFor(MARKET_ID, 0).length, 65, "its signature survived with it");
+
+        // A later pass finishes the job, which is the whole reason to drain in batches.
+        relay.relayUpTo(MARKET_ID, 1);
+        assertEq(module.callCount(), 2, "both were redeemed in the end");
+        assertEq(module.callAt(1).owner, alice);
+        assertEq(module.callAt(1).amount, 500e6, "with the arguments it was submitted under");
+        assertEq(relay.pendingCount(MARKET_ID), 0, "and the queue is empty");
+    }
+
+    function test_relayUpTo_zero_is_a_noop() public {
+        _submit(ALICE_PK, _auth(alice, 0, 500e6, 1));
+
+        relay.relayUpTo(MARKET_ID, 0);
+
+        assertEq(module.callCount(), 0, "nothing was redeemed");
+        assertEq(relay.relayedCount(), 0, "and nothing was counted as redeemed");
+        assertEq(relay.failedCount(), 0, "a batch nobody asked for is not a failure either");
+        assertEq(relay.pendingCount(MARKET_ID), 1, "the queue is exactly as it was");
+        assertEq(relay.pendingFor(MARKET_ID)[0].owner, alice);
+    }
+
+    /// @dev `relay` is `relayUpTo` with no ceiling, so on a queue that fits the two must be
+    /// indistinguishable: same module calls in the same order, same counters, same empty queue.
+    function test_relay_is_equivalent_to_draining_everything() public {
+        _submit(ALICE_PK, _auth(alice, 0, 500e6, 1));
+        _submit(BOB_PK, _auth(bob, 1, 700e6, 1));
+
+        uint256 carolPk = 0xC0FFEE;
+        address carol = vm.addr(carolPk);
+        _submit(carolPk, _auth(carol, 0, 900e6, 1));
+
+        module.setFailsFor(bob, true);
+        relay.relayUpTo(MARKET_ID, type(uint256).max);
+
+        assertEq(module.callCount(), 2, "the healthy two went through");
+        assertEq(module.callAt(0).owner, alice, "in submission order, exactly as `relay` does it");
+        assertEq(module.callAt(1).owner, carol);
+        assertEq(relay.relayedCount(), 2);
+        assertEq(relay.failedCount(), 1, "and the failure is still reported, never fabricated");
+        assertEq(relay.pendingCount(MARKET_ID), 0, "the queue is cleared either way");
+
+        // A ceiling above the queue length is the same thing, not an error.
+        bytes32 second = bytes32(uint256(0xFEED));
+        LucidRelay.Authorization memory a = _auth(alice, 0, 100e6, 2);
+        a.marketId = second;
+        _submit(ALICE_PK, a);
+
+        relay.relayUpTo(second, 500);
+        assertEq(relay.pendingCount(second), 0, "an oversized `max` drains the lot");
+        assertEq(relay.relayedCount(), 3);
+
+        // And on an empty queue neither entry point has anything to do.
+        relay.relayUpTo(second, type(uint256).max);
+        relay.relay(second);
+        assertEq(module.callCount(), 3, "no double redemption from either door");
+    }
+
     // ── cancellation ──────────────────────────────────────────────────────────
 
     function test_only_owner_can_cancel() public {

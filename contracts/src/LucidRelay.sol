@@ -159,34 +159,19 @@ contract LucidRelay {
     /// success is worse than a visible failure.
     /// @param marketId The market whose queue to drain.
     function relay(bytes32 marketId) external notWhileRelaying {
-        _relaying = 1;
+        _drain(marketId, type(uint256).max);
+    }
 
-        Pending[] storage queue = _queue[marketId];
-        uint256 n = queue.length;
-
-        for (uint256 i; i < n; ++i) {
-            Authorization memory a = queue[i].auth;
-            bytes memory sig = queue[i].signature;
-
-            try MODULE.redeemFor(
-                a.owner, a.nonce, a.deadline, sig, a.operatorId, a.venueId, a.marketId, a.outcomeIdx, a.amount
-            ) {
-                unchecked {
-                    ++relayedCount;
-                }
-                emit Relayed(a.owner, a.marketId, a.outcomeIdx, a.amount);
-            } catch (bytes memory reason) {
-                unchecked {
-                    ++failedCount;
-                }
-                emit RelayFailed(a.owner, a.marketId, reason);
-            }
-        }
-
-        // Cleared whatever happened: a relayed nonce is spent on the module, and a failed one is
-        // already reported. Leaving either behind would only produce repeat attempts nobody reads.
-        delete _queue[marketId];
-        _relaying = 0;
+    /// @notice Execute at most `max` pending redemptions for one settled market. Callable by anyone.
+    /// @dev A full 64-entry queue measured at roughly 16.5M gas, which is more than a reactivity
+    /// handler is given — so a caller that runs under a fixed budget needs to be able to say how
+    /// much of the backlog it can afford. What is left stays queued for the next call, and because
+    /// relaying is permissionless anyone may finish the job.
+    /// @param marketId The market whose queue to drain.
+    /// @param max How many entries to take. Zero is a no-op; anything at or above the queue length
+    /// drains it completely.
+    function relayUpTo(bytes32 marketId, uint256 max) external notWhileRelaying {
+        _drain(marketId, max);
     }
 
     /// @notice Withdraw one of your own queued authorizations before it is relayed.
@@ -267,6 +252,57 @@ contract LucidRelay {
     function DOMAIN_SEPARATOR() public view returns (bytes32) {
         // Rebuilt after a chain split so signatures cannot be replayed across forks.
         return block.chainid == _CACHED_CHAIN_ID ? _CACHED_DOMAIN_SEPARATOR : _buildDomainSeparator();
+    }
+
+    /// @dev The body both relay entry points share.
+    ///
+    /// The entries taken are the ones at the END of the array. Removing the tail is a bare `pop()`;
+    /// draining the front would mean either shifting every survivor down or repeating the
+    /// swap-and-pop bookkeeping `cancel` has to do, and both are pure cost for no benefit — order
+    /// carries no meaning here, every entry redeems an independent position. Within that slice the
+    /// entries are still walked front to back, so a full drain does exactly what it always did, in
+    /// the order it always did it.
+    ///
+    /// The queue is only shortened after the loop. Nothing can observe the intermediate state: the
+    /// relay lock rejects every mutating entry point for the duration, so an owner's `redeemFor`
+    /// callback cannot reach back in and cancel an entry this loop has already spent.
+    function _drain(bytes32 marketId, uint256 max) private {
+        _relaying = 1;
+
+        Pending[] storage queue = _queue[marketId];
+        uint256 n = queue.length;
+        uint256 count = max < n ? max : n;
+
+        for (uint256 i = n - count; i < n; ++i) {
+            Authorization memory a = queue[i].auth;
+            bytes memory sig = queue[i].signature;
+
+            try MODULE.redeemFor(
+                a.owner, a.nonce, a.deadline, sig, a.operatorId, a.venueId, a.marketId, a.outcomeIdx, a.amount
+            ) {
+                unchecked {
+                    ++relayedCount;
+                }
+                emit Relayed(a.owner, a.marketId, a.outcomeIdx, a.amount);
+            } catch (bytes memory reason) {
+                unchecked {
+                    ++failedCount;
+                }
+                emit RelayFailed(a.owner, a.marketId, reason);
+            }
+        }
+
+        // Cleared whatever happened: a relayed nonce is spent on the module, and a failed one is
+        // already reported. Leaving either behind would only produce repeat attempts nobody reads.
+        if (count == n) {
+            delete _queue[marketId];
+        } else {
+            for (uint256 i; i < count; ++i) {
+                queue.pop();
+            }
+        }
+
+        _relaying = 0;
     }
 
     function _buildDomainSeparator() private view returns (bytes32) {
