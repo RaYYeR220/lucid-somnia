@@ -35,8 +35,14 @@ contract LucidBrainStageTest is Test {
     uint256 internal constant STAGE1 = FLOOR_3 + 0.03 ether * 3;
     uint256 internal constant STAGE2 = FLOOR_3 + 0.07 ether * 3;
 
-    /// @dev Seeded latencies of 60s each give (60 + 60) * 2 + 30.
-    uint256 internal constant SEEDED_SLACK = 270;
+    /// @dev What a brain that has measured nothing asks of a window. Neither stage has been
+    /// observed, so neither charges anything, and `requiredSlack` lands on its own floor:
+    /// clamp(0 * 2 + 30, MIN_SLACK, MAX_SLACK) = 90.
+    uint256 internal constant FRESH_SLACK = 90;
+
+    /// @dev The seed each EMA starts from, in seconds, from the traced round trip. It is the EMA's
+    /// prior, not a toll charged against the window: until a stage completes it is never billed.
+    uint64 internal constant SEED = 5;
 
     uint64 internal start;
 
@@ -462,10 +468,48 @@ contract LucidBrainStageTest is Test {
 
     // ── the deadline guard ────────────────────────────────────────────────────
 
-    function test_required_slack_starts_conservative() public view {
-        assertEq(brain.feedLatencyEma(), 60, "seeded pessimistic, not optimistic");
-        assertEq(brain.verdictLatencyEma(), 60);
-        assertEq(brain.requiredSlack(), SEEDED_SLACK, "(60 + 60) * 2 + 30");
+    /// @dev The deadlock, stated as an assertion. A brain fresh out of the constructor has measured
+    /// nothing, so it charges the window nothing and asks only for the venue's own floor. The
+    /// seeded value it used to ask for — 270 seconds — is more than the 150 a 300-second window has
+    /// left at its halfway point, which is where the router asks, so every wake-up refused and no
+    /// stage ever ran to move an average. Sixteen consecutive `TOO_LATE` refusals in production.
+    function test_a_fresh_brain_asks_only_for_the_floor() public view {
+        assertFalse(brain.feedObserved(), "nothing has completed yet");
+        assertFalse(brain.verdictObserved());
+        assertEq(brain.feedLatencyEma(), SEED, "the seed is the average's prior");
+        assertEq(brain.verdictLatencyEma(), SEED);
+
+        assertEq(brain.requiredSlack(), FRESH_SLACK, "and an unmeasured stage is not billed for");
+        assertEq(brain.requiredSlack(), brain.MIN_SLACK(), "which is exactly the floor");
+        assertLt(brain.requiredSlack(), 150, "the halfway point of a 300s window, the case that failed");
+    }
+
+    /// @dev The live case, replayed: a 300-second window seen at its halfway point.
+    function test_a_fresh_brain_takes_the_window_that_used_to_be_refused() public {
+        uint256 floatBefore = address(brain).balance;
+
+        uint256 id = _requestPrice(_market(start + 150));
+
+        assertGt(id, 0, "the router gets a request id, not a refusal");
+        assertEq(platform.requestCount(), 1, "and the price fetch actually went out");
+        assertEq(platform.requestAt(0).callbackSelector, IAgentPriceConsumer.handlePrice.selector);
+        assertLt(address(brain).balance, floatBefore, "stage one was paid for");
+        assertEq(router.calls(), 0, "no refusal was delivered, because there was none");
+    }
+
+    /// @dev What the traced network actually looks like: both stages inside about a second. The
+    /// requirement stays where it started, and both stages now say so for themselves.
+    function test_one_fast_round_trip_leaves_the_requirement_on_the_floor() public {
+        uint256 priceId = _requestPrice(_market(start + 900));
+
+        vm.warp(start + 1);
+        _deliverPrices(priceId, _three(SPOT, SPOT, SPOT));
+        _deliverScores(platform.idAt(platform.requestCount() - 1), _threeScores(51, 52, 53));
+
+        assertTrue(brain.feedObserved(), "the price stage has been measured");
+        assertTrue(brain.verdictObserved(), "and so has the verdict stage");
+        assertEq(brain.requiredSlack(), FRESH_SLACK, "a fast chain cannot talk it below the venue's floor");
+        assertTrue(brain.verdictOf(MARKET).ok, "and the verdict is tradeable, which is the point");
     }
 
     function test_required_slack_grows_as_the_committees_slow_down() public {
@@ -474,18 +518,79 @@ contract LucidBrainStageTest is Test {
         // A price that took two hundred seconds.
         vm.warp(start + 200);
         _deliverPrices(priceId, _three(SPOT, SPOT, SPOT));
-        // (60 * 3 + 200) / 4 = 95.
-        assertEq(brain.feedLatencyEma(), 95, "the average walks toward what was observed");
-        assertEq(brain.requiredSlack(), (95 + 60) * 2 + 30);
+        // (5 * 3 + 200) / 4 = 53.
+        assertEq(brain.feedLatencyEma(), 53, "the average walks toward what was observed");
+        assertEq(brain.requiredSlack(), 53 * 2 + 30, "the verdict stage is still unmeasured and still free");
 
         // Then an inference that took three hundred more.
         uint256 verdictId = platform.idAt(platform.requestCount() - 1);
         vm.warp(start + 500);
         _deliverScores(verdictId, _threeScores(51, 52, 53));
-        // (60 * 3 + 300) / 4 = 120.
-        assertEq(brain.verdictLatencyEma(), 120);
-        assertEq(brain.requiredSlack(), (95 + 120) * 2 + 30, "both stages count, twice over, plus 30s to trade");
-        assertGt(brain.requiredSlack(), SEEDED_SLACK, "a slower network buys fewer windows, on its own");
+        // (5 * 3 + 300) / 4 = 78.
+        assertEq(brain.verdictLatencyEma(), 78);
+        assertEq(brain.requiredSlack(), (53 + 78) * 2 + 30, "both stages count, twice over, plus 30s to trade");
+        assertGt(brain.requiredSlack(), FRESH_SLACK, "a slower network buys fewer windows, on its own");
+    }
+
+    /// @dev The guard is optimistic only while it is ignorant. Once both stages have been measured
+    /// at two hundred seconds each, the window that a fresh brain took is refused — which is the
+    /// half of the fix that must survive: a self-calibrating guard that only ever loosens is not a
+    /// guard.
+    function test_a_measured_slow_chain_refuses_the_window_a_fresh_brain_took() public {
+        _observeBothStagesAt(200);
+
+        // (5 * 3 + 200) / 4 = 53 on each stage.
+        uint256 expected = (53 + 53) * 2 + 30;
+        assertEq(brain.requiredSlack(), expected, "clamp((ema + ema) * 2 + 30, 90, 600)");
+        assertGt(brain.requiredSlack(), 150, "the window it used to take is now out of reach");
+
+        uint64 now_ = uint64(block.timestamp);
+        uint256 requestsBefore = platform.requestCount();
+        vm.expectEmit(true, false, false, true, address(brain));
+        emit LucidBrain.WindowTooTight(MARKET, 150, expected);
+        vm.prank(owner);
+        uint256 id = brain.requestVerdict(MARKET, _market(now_ + 150), 5000, new uint16[](0));
+
+        assertEq(id, 0, "measured slow means measured slow");
+        assertEq(platform.requestCount(), requestsBefore, "and nothing was spent finding that out");
+    }
+
+    /// @dev The class of bug, not the instance: a self-calibrating guard must never be able to
+    /// prevent its own calibration. An EMA moves only when its stage completes, so a stage that
+    /// refuses on the strength of a number nobody measured refuses forever. Both halves of that are
+    /// asserted here — the guard at request time and the guard between the two stages.
+    function test_an_unobserved_stage_cannot_veto_its_own_first_measurement() public {
+        // Nothing measured: the requirement is the floor, whatever the seed happens to be.
+        assertFalse(brain.feedObserved());
+        assertFalse(brain.verdictObserved());
+        assertEq(brain.requiredSlack(), brain.MIN_SLACK(), "an unmeasured stage contributes its floor, not its seed");
+
+        // Now measure only the price stage, and measure it slow: four hundred seconds.
+        uint256 priceId = _requestPrice(_market(start + 3000));
+        vm.warp(start + 400);
+        _deliverPrices(priceId, _three(SPOT, SPOT, SPOT));
+        // (5 * 3 + 400) / 4 = 103.
+        assertEq(brain.feedLatencyEma(), 103);
+        assertTrue(brain.feedObserved(), "one stage is now measured");
+        assertFalse(brain.verdictObserved(), "the other still is not");
+        assertEq(brain.requiredSlack(), 103 * 2 + 30, "and a slow neighbour does not get charged to it");
+
+        // That inference is left unanswered on purpose: the verdict stage must still be a stage
+        // that has never completed while the next window is judged.
+
+        // A window that clears the (now slow) request-time guard, where the price then eats all but
+        // thirty-five seconds of it. An unmeasured verdict stage charges zero and keeps only the
+        // thirty seconds of execution room, so its first measurement happens. Charge it the seed
+        // instead and this is where the second stage would never run, and never be measured.
+        uint64 expiry = uint64(block.timestamp) + 300;
+        priceId = _requestPrice(_market(expiry));
+        uint256 requestsBefore = platform.requestCount();
+        vm.warp(expiry - 35);
+        _deliverPrices(priceId, _three(SPOT, SPOT, SPOT));
+
+        assertEq(platform.requestCount(), requestsBefore + 1, "the inference went out on a window the seed would ban");
+        _deliverScores(platform.idAt(platform.requestCount() - 1), _threeScores(51, 52, 53));
+        assertTrue(brain.verdictObserved(), "and the verdict stage finally has a measurement of its own");
     }
 
     function test_required_slack_is_clamped_at_both_ends() public {
@@ -510,11 +615,13 @@ contract LucidBrainStageTest is Test {
     function test_a_window_that_is_already_too_tight_is_refused_before_anything_is_spent() public {
         uint256 floatBefore = address(brain).balance;
 
-        // Ninety seconds left against a 270-second requirement.
+        // Sixty seconds left against the ninety-second floor. The floor is a floor and not an
+        // invitation: below it the venue rejects the order anyway, so a verdict bought here could
+        // not be traded even if the committee answered in the same block.
         vm.expectEmit(true, false, false, true, address(brain));
-        emit LucidBrain.WindowTooTight(MARKET, 90, SEEDED_SLACK);
+        emit LucidBrain.WindowTooTight(MARKET, 60, FRESH_SLACK);
         vm.prank(owner);
-        uint256 id = brain.requestVerdict(MARKET, _market(start + 90), 5000, new uint16[](0));
+        uint256 id = brain.requestVerdict(MARKET, _market(start + 60), 5000, new uint16[](0));
 
         assertEq(id, 0, "nothing was requested, and the caller can see that");
         assertEq(platform.requestCount(), 0, "not even the cheap stage");
@@ -539,15 +646,42 @@ contract LucidBrainStageTest is Test {
     }
 
     function test_a_window_that_ran_out_mid_flight_aborts_before_the_expensive_stage() public {
+        // A chain that has actually been measured slow: 200 seconds a stage, so the inference is
+        // known to need 53 * 2 + 30 = 136 and the check below is arithmetic on an observation
+        // rather than on a seed.
+        _observeBothStagesAt(200);
+        uint256 requestsBefore = platform.requestCount();
+        uint256 callsBefore = router.calls();
+
+        uint64 expiry = uint64(block.timestamp) + 400;
+        uint256 priceId = _requestPrice(_market(expiry));
+        uint256 floatAfterStageOne = address(brain).balance;
+        assertEq(platform.requestCount(), requestsBefore + 1, "the cheap stage did go out");
+
+        // The price took 290 of the window's 400 seconds. 110 left against the 136 the inference is
+        // still expected to need. Saving this deposit is the entire reason the check lives here.
+        vm.warp(expiry - 110);
+        vm.expectEmit(true, false, false, true, address(brain));
+        emit LucidBrain.LateAbort(MARKET, 110, 136);
+        _deliverPrices(priceId, _three(SPOT, SPOT, SPOT));
+
+        assertEq(platform.requestCount(), requestsBefore + 1, "the inference was never requested");
+        assertEq(address(brain).balance, floatAfterStageOne, "and never paid for");
+        assertFalse(brain.verdictOf(MARKET).ok);
+        assertEq(router.calls(), callsBefore + 1, "the desk is told the window got away");
+    }
+
+    /// @dev The same guard on a brain that has measured nothing. Charging an unmeasured stage zero
+    /// is not the same as removing the check: the thirty seconds of execution room are unconditional,
+    /// so a window with twenty left still keeps its inference deposit.
+    function test_a_fresh_brain_still_aborts_when_the_window_has_no_room_left() public {
         uint256 priceId = _requestPrice(_market(start + 400));
         uint256 floatAfterStageOne = address(brain).balance;
         assertEq(floatAfterStageOne, 10 ether - STAGE1);
 
-        // The price took 290 of the window's 400 seconds. 110 left against the 150 the inference
-        // is still expected to need. Saving this deposit is the entire reason the check lives here.
-        vm.warp(start + 290);
+        vm.warp(start + 380);
         vm.expectEmit(true, false, false, true, address(brain));
-        emit LucidBrain.LateAbort(MARKET, 110, 150);
+        emit LucidBrain.LateAbort(MARKET, 20, 30);
         _deliverPrices(priceId, _three(SPOT, SPOT, SPOT));
 
         assertEq(platform.requestCount(), 1, "the inference was never requested");
@@ -615,14 +749,15 @@ contract LucidBrainStageTest is Test {
         _deliverPrices(_requestPrice(_market(start + 900)), _three(0, 0, 0));
         assertEq(router.calls(), ++expected, "price unusable");
 
-        // 4. The window ran out while the price was in flight.
+        // 4. The window ran out while the price was in flight, leaving less than the execution room
+        //    the second stage needs even at zero measured latency.
         uint256 late = _requestPrice(_market(start + 400));
-        vm.warp(start + 300);
+        vm.warp(start + 395);
         _deliverPrices(late, _three(SPOT, SPOT, SPOT));
         assertEq(router.calls(), ++expected, "late abort");
 
         // 5. The verdict itself came back after expiry.
-        vm.warp(start + 300);
+        vm.warp(start + 400);
         uint64 expiry = uint64(block.timestamp) + 900;
         uint256 priceId = _requestPrice(_market(expiry));
         _deliverPrices(priceId, _three(SPOT, SPOT, SPOT));
@@ -877,6 +1012,24 @@ contract LucidBrainStageTest is Test {
     function _requestPriceWithBook(LucidTypes.MarketInfo memory m, uint256 pBookBps) internal returns (uint256 id) {
         vm.prank(owner);
         id = brain.requestVerdict(MARKET, m, pBookBps, new uint16[](0));
+    }
+
+    /// @dev Runs one whole window in which each stage takes `secs` seconds, so both averages are
+    /// measurements rather than priors. The window is sized well clear of the requirement the run
+    /// itself creates, because a helper that gets refused would measure nothing.
+    function _observeBothStagesAt(uint64 secs) internal {
+        uint64 expiry = uint64(block.timestamp) + secs * 4 + 600;
+        uint256 priceId = _requestPrice(_market(expiry));
+
+        vm.warp(block.timestamp + secs);
+        _deliverPrices(priceId, _three(SPOT, SPOT, SPOT));
+
+        uint256 verdictId = platform.idAt(platform.requestCount() - 1);
+        vm.warp(block.timestamp + secs);
+        _deliverScores(verdictId, _threeScores(51, 52, 53));
+
+        assertTrue(brain.feedObserved(), "the helper must actually have measured stage one");
+        assertTrue(brain.verdictObserved(), "and stage two");
     }
 
     /// @dev A whole window answered in the same block, which is what the fast end of the live

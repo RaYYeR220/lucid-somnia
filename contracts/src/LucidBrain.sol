@@ -184,18 +184,36 @@ contract LucidBrain is ILucidBrain, IAgentConsumer, IAgentPriceConsumer, Ownable
     /// every window the venue rolls, and the brain would quietly stop working while looking healthy.
     uint256 public constant MAX_SLACK = 600;
 
-    /// @notice The latency each stage is assumed to take before it has ever been observed.
-    /// @dev Sixty seconds each. The live committee has answered in about a second and has also
-    /// taken forty, and the cost of the two errors is not symmetric: assuming it is fast buys a
-    /// verdict that expires before it can be used, assuming it is slow only skips a window. So the
-    /// seed is deliberately pessimistic and the measurements walk it down.
-    uint64 internal constant SEED_LATENCY = 60;
+    /// @notice The prior each stage's moving average starts from, in seconds.
+    /// @dev Five seconds each, and that number is a measurement rather than a guess. Traced on
+    /// Shannon (chain 50312) on 2026-09-06, a whole run — `PriceRequested`, `PriceReceived`,
+    /// `VerdictRequested`, `VerdictReceived` — landed inside roughly twelve blocks at the network's
+    /// ~100ms cadence, so both committees together closed in about one second. Five per stage is
+    /// therefore a fivefold margin over what was actually observed while still leaving
+    /// `requiredSlack()` at its `MIN_SLACK` floor, which is where the venue's own rule already
+    /// puts it.
+    ///
+    /// The previous seed was sixty seconds each, chosen without a measurement, and it is what took
+    /// the brain off the air: `requiredSlack()` came out at 270s, the router asks at the halfway
+    /// point of a 300s window, and 150s never clears 270s. Sixteen consecutive wake-ups refused
+    /// with `TOO_LATE` across twenty-five minutes against a router that was working correctly.
+    /// Do not round this back up to a comfortable-looking number without a trace to back it.
+    uint64 internal constant SEED_LATENCY = 5;
 
     /// @notice Observed round-trip of the price stage, in seconds, as an exponential moving average.
     uint64 public feedLatencyEma;
 
+    /// @notice Whether the price stage has ever completed and moved `feedLatencyEma`.
+    /// @dev Read it alongside `requiredSlack()` to see why a window was refused: a false here means
+    /// the average above is still the seed and has never been told anything about this chain.
+    /// Declared next to the average it qualifies so the two share a slot and are written together.
+    bool public feedObserved;
+
     /// @notice Observed round-trip of the verdict stage, in seconds, as an exponential moving average.
     uint64 public verdictLatencyEma;
+
+    /// @notice Whether the verdict stage has ever completed and moved `verdictLatencyEma`.
+    bool public verdictObserved;
 
     // ─────────────────────────────────────────────────────────────────────────
     // Wiring
@@ -472,9 +490,15 @@ contract LucidBrain is ILucidBrain, IAgentConsumer, IAgentPriceConsumer, Ownable
     /// It is self-calibrating on purpose: a fixed constant would either refuse every window on a
     /// slow day or buy unusable verdicts on a fast one, and which of those is happening is exactly
     /// what the contract can measure and a deployer cannot guess.
+    ///
+    /// A stage that has never completed contributes nothing here — see `_stageLatency`. Until it
+    /// has been measured there is no measurement to be self-calibrating about, and charging a guess
+    /// against the window is what let a seed lock the brain out of ever taking one.
     /// @return The required remaining seconds, between `MIN_SLACK` and `MAX_SLACK`.
     function requiredSlack() public view returns (uint256) {
-        uint256 needed = (uint256(feedLatencyEma) + uint256(verdictLatencyEma)) * 2 + 30;
+        uint256 feed = _stageLatency(feedLatencyEma, feedObserved);
+        uint256 verdict = _stageLatency(verdictLatencyEma, verdictObserved);
+        uint256 needed = (feed + verdict) * 2 + 30;
         if (needed < MIN_SLACK) return MIN_SLACK;
         if (needed > MAX_SLACK) return MAX_SLACK;
         return needed;
@@ -642,6 +666,10 @@ contract LucidBrain is ILucidBrain, IAgentConsumer, IAgentPriceConsumer, Ownable
         delete _pendingPrice[requestId];
 
         feedLatencyEma = _observe(1, feedLatencyEma, p.requestedAt);
+        // The stage completed, so from here its average is a measurement and is charged as one.
+        // Shares a slot with the average, so this rides along on a word the line above already
+        // dirtied rather than buying a second one.
+        feedObserved = true;
 
         PriceTally memory t;
         if (status == IAgentRequester.ResponseStatus.Success) {
@@ -661,7 +689,13 @@ contract LucidBrain is ILucidBrain, IAgentConsumer, IAgentPriceConsumer, Ownable
         // Only the second stage is still ahead, so only the second stage's latency is charged
         // against what remains. Re-checking here rather than trusting the check at request time is
         // what saves the inference deposit: the price fetch may have taken the whole budget.
-        uint256 needed = uint256(verdictLatencyEma) * 2 + 30;
+        //
+        // This is the verdict stage's own gate, and therefore the second place a guess could veto
+        // the measurement that would correct it: refuse here and `handleResponse` never runs, so
+        // `verdictLatencyEma` never moves. Same rule as `requiredSlack()`, same reason — an
+        // unmeasured stage charges zero, and the thirty seconds of execution room still stand as
+        // the floor no window gets under.
+        uint256 needed = _stageLatency(verdictLatencyEma, verdictObserved) * 2 + 30;
         uint256 secondsLeft = p.expiry > block.timestamp ? p.expiry - block.timestamp : 0;
         if (secondsLeft < needed) {
             _refuse(p.marketId, requestId);
@@ -708,6 +742,9 @@ contract LucidBrain is ILucidBrain, IAgentConsumer, IAgentPriceConsumer, Ownable
         delete _pendingVerdict[requestId];
 
         verdictLatencyEma = _observe(2, verdictLatencyEma, pv.requestedAt);
+        // Set even when the committee's answer is unusable or late: what was measured is the round
+        // trip, and a late verdict is the single most informative sample the guard can get.
+        verdictObserved = true;
 
         int256[] memory scores;
         int256 median;
@@ -1000,6 +1037,34 @@ contract LucidBrain is ILucidBrain, IAgentConsumer, IAgentPriceConsumer, Ownable
             // beats reverting: a revert here would roll the verdict back and lose it entirely.
             emit RouterCallFailed(marketId, requestId);
         }
+    }
+
+    /// @dev What one stage is allowed to charge against a window's remaining seconds.
+    ///
+    /// The property this exists to hold: **a self-calibrating guard must never be able to prevent
+    /// its own calibration.** Every EMA here moves only when its stage actually completes, so a
+    /// stage that is being refused is a stage that is never measured, and a seed that refuses is a
+    /// seed that is never corrected. That is a fixed point, not a slow convergence — the brain sits
+    /// at its opening guess forever while looking perfectly healthy, which is exactly what happened
+    /// in production. Seeding closer to the truth (see `SEED_LATENCY`) fixes the instance; this
+    /// fixes the class, at any cadence and on any day.
+    ///
+    /// So an unmeasured stage contributes its floor — zero — and the guards' own floors do the
+    /// rest: `requiredSlack()` still clamps to `MIN_SLACK`, and the stage-two check in
+    /// `handlePrice` still keeps its thirty seconds of execution room. The brain therefore always
+    /// attempts at least one window that clears `MIN_SLACK`, and one such window is all it needs to
+    /// stop guessing. Zero is also not a special case in disguise: it is precisely where both EMAs
+    /// converge on the live network, so an unobserved stage behaves like the fast steady state the
+    /// contract already runs in, and no new spend path is opened that calibration would not reach
+    /// anyway.
+    ///
+    /// Once observed the EMA is charged in full, so a genuinely slow chain still tightens the
+    /// guard, still refuses windows it cannot finish, and still ratchets up to `MAX_SLACK`.
+    /// @param ema The stage's moving average, in seconds.
+    /// @param observed Whether that average has ever been moved by a completed stage.
+    /// @return The seconds this stage may demand of the window.
+    function _stageLatency(uint64 ema, bool observed) internal pure returns (uint256) {
+        return observed ? uint256(ema) : 0;
     }
 
     /// @dev Folds one observation into a stage's moving average: `ema = (ema * 3 + observed) / 4`.
