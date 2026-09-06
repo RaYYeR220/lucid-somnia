@@ -88,7 +88,7 @@ Stated plainly, because the absence of a claim is easy to miss.
 - **We do not claim the strategy is profitable.** Neither `AiEdge` nor `Maker` has been run long
   enough, or at enough size, for a P&L number to mean anything. There is no backtest in this
   repository presented as evidence of returns, and there is no returns figure anywhere in it.
-- **We do not claim the committee has predictive edge beyond what [EVAL.md](EVAL.md) reports.**
+- **We do not claim the committee has predictive edge beyond what [EVAL.md](eval/EVAL.md) reports.**
   The harness is pre-registered, read-only, and published whatever it found, including a negative
   result. Read it before assuming anything about accuracy or calibration.
 - **We do not claim mainnet readiness.** This is Shannon testnet only, with faucet tUSDC. Several

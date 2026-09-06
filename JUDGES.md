@@ -202,7 +202,7 @@ like a result and is not one.
 
 It prints Brier score, directional accuracy with an exact binomial p-value, a calibration table, and
 two negative controls on the identical sample: a constant 50% forecaster and 20,000 coin-flip twins.
-Whatever it says is what [EVAL.md](EVAL.md) reports, including where that is a negative result.
+Whatever it says is what [EVAL.md](eval/EVAL.md) reports, including where that is a negative result.
 
 ---
 

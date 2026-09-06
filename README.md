@@ -315,7 +315,7 @@ Three more, smaller:
   Beyond that the tail is skipped by name, not silently dropped.
 - `redeemFor` with a contract signature (EIP-1271) has never been tested on Shannon, so `LucidRelay`
   is a pre-signed-EOA-exit relay in practice. See [CLAIMS.md](CLAIMS.md).
-- The committee's measured behaviour is whatever [EVAL.md](EVAL.md) says it is, including where
+- The committee's measured behaviour is whatever [EVAL.md](eval/EVAL.md) says it is, including where
   that is a negative result. This repository does not claim edge it has not measured.
 
 ---
@@ -334,7 +334,7 @@ Three more, smaller:
 - [JUDGES.md](JUDGES.md) — review this repository in five minutes, with no wallet and no key.
 - [CLAIMS.md](CLAIMS.md) — every claim made here, with its evidence tier and how to check it.
 - [MOCKS.md](MOCKS.md) — exactly where the line between real and simulated runs.
-- [EVAL.md](EVAL.md) — what the committee actually scored, and against which controls.
+- [EVAL.md](eval/EVAL.md) — what the committee actually scored, and against which controls.
 - [SDK_FEEDBACK.md](SDK_FEEDBACK.md) — three blocking issues, seven sharp edges and three
   documentation gaps found building this, each with a reproduction.
 - [kit/README.md](kit/README.md) — client and CLI reference.
