@@ -36,6 +36,16 @@ interface ILucidRelay {
     function relayUpTo(bytes32 marketId, uint256 max) external;
 }
 
+/// @notice The slice of `LucidSeries` this contract drives: two hooks, and nothing else.
+/// @dev Declared locally rather than imported for the same reason as `ILucidKeeper`. The series
+/// contract rolls this protocol's own short-cadence windows when the venue's creator runs out of
+/// float and stops rolling its own — it spends money on an external venue deployment, and the
+/// router must be able to wake it without taking on one line of that decision.
+interface ILucidSeries {
+    function onVenueMarket(LucidTypes.MarketInfo calldata m) external;
+    function onTick(LucidTypes.MarketInfo calldata m) external;
+}
+
 /// @title LucidRouter
 /// @notice The protocol's single subscriber to Somnia's on-chain reactivity, and the only contract
 /// that ever talks to the precompile at `0x0100`.
@@ -146,6 +156,13 @@ contract LucidRouter is SomniaEventHandler, Ownable {
     /// anyone to finish, because relaying is permissionless.
     uint256 public constant RELAY_BATCH = 16;
 
+    /// @notice Ceiling on the gas stipend for the own-series roll considered after a window settles.
+    /// @dev A live `triggerRoll` measured 61.6M gas on Shannon — by far the largest single call this
+    /// router makes, and the reason `HANDLER_GAS_LIMIT` is 100M rather than something tighter. The
+    /// ceiling sits above the measurement because a roll cut off mid-flight is charged for in full
+    /// and rolls nothing, while headroom that is never touched costs nothing at all.
+    uint256 public constant SERIES_GAS = 70_000_000;
+
     /// @dev How many settled windows of per-asset history are kept as committee evidence.
     /// Matches `PromptLib.MAX_OUTCOMES`; older windows stop being informative quickly.
     uint256 internal constant MAX_RECENT = 5;
@@ -199,6 +216,15 @@ contract LucidRouter is SomniaEventHandler, Ownable {
     /// auto-claims — for its own users. The relay holds exits their owners signed in advance, and it
     /// needs somebody awake at settlement to run them. This router already is.
     address public relay;
+
+    /// @notice The own-series roller woken on venue markets and at settlement, or zero to depend
+    /// entirely on the venue's own scheduler.
+    /// @dev DreamDEX's short-cadence market creation stops when the creator the SDK advertises runs
+    /// out of float, and it has. With a series attached this router feeds that contract the two
+    /// facts it needs — that the venue is still creating markets, and that a window just closed —
+    /// and it decides for itself whether to roll one of ours. Detaching it restores the previous
+    /// behaviour immediately.
+    address public series;
 
     /// @notice Prepaid desk credit held by this contract. Not the operator's money.
     uint256 public totalGasCredit;
@@ -269,6 +295,7 @@ contract LucidRouter is SomniaEventHandler, Ownable {
     event FactoryUpdated(address factory);
     event KeeperSet(address keeper);
     event RelaySet(address relay);
+    event SeriesSet(address series);
     event Swept(address indexed to, uint256 amount);
 
     /// @param owner_ The operator that arms the venue and tunes the wiring.
@@ -352,6 +379,17 @@ contract LucidRouter is SomniaEventHandler, Ownable {
     function setRelay(address relay_) external onlyOwner {
         relay = relay_;
         emit RelaySet(relay_);
+    }
+
+    /// @notice Attach the own-series roller, or detach it.
+    /// @dev Attaching one does not by itself spend anything: the series contract ships in failover,
+    /// where it rolls only once the venue has stopped producing windows of the cadence it watches,
+    /// and it holds its own daily cap and float floor. The router's exposure is bounded by
+    /// `SERIES_GAS` of a firing it was making anyway.
+    /// @param series_ The series address, or zero to depend entirely on the venue's scheduler.
+    function setSeries(address series_) external onlyOwner {
+        series = series_;
+        emit SeriesSet(series_);
     }
 
     /// @notice Recover the operator's own float.
@@ -617,6 +655,11 @@ contract LucidRouter is SomniaEventHandler, Ownable {
         _markets[m.marketId] = m;
         emit MarketSeen(m.marketId, m.intervalSec, m.assetKey);
 
+        // Before the expiry check, deliberately. A window this router is too late to serve is still
+        // proof that the venue's own scheduler is alive, and that is the single fact the series
+        // contract needs in order to keep standing down.
+        _seriesSaw(m);
+
         // Scheduling a wake-up is only possible strictly in the future, and a window we cannot wake
         // up for is a window we must not pay a committee to price.
         uint256 tsMillis = (uint256(m.expiry) + SETTLEMENT_DELAY) * 1000;
@@ -850,6 +893,10 @@ contract LucidRouter is SomniaEventHandler, Ownable {
             _keep(m);
             _relayExits(marketId);
             _recordOutcome(m);
+            // Last, because it is the most expensive tenant of a settlement firing by an order of
+            // magnitude and the firing was not paid for by it. The desks that paid, the venue-wide
+            // upkeep and the pre-signed exits all get their gas first.
+            _tickSeries(m);
         }
 
         delete _dueAt[tsMillis];
@@ -905,6 +952,50 @@ contract LucidRouter is SomniaEventHandler, Ownable {
         try ILucidRelay(r).relayUpTo{gas: gasFor}(marketId, RELAY_BATCH) {}
         catch {
             emit Skipped(r, marketId, "RELAY_FAILED");
+        }
+    }
+
+    /// @dev Tells the own-series roller that the venue created a market, which is the only evidence
+    /// its scheduler is still running.
+    ///
+    /// Guarded and wrapped for the same two reasons as the keeper and the relay: the series is a
+    /// separate deployment an operator can re-point, and `try` alone does not survive an address
+    /// with no code — the `extcodesize` check runs outside the `catch` and would take the whole
+    /// firing down with it.
+    function _seriesSaw(LucidTypes.MarketInfo memory m) private {
+        address s = series;
+        if (s == address(0) || s.code.length == 0) return;
+
+        uint256 gasFor = _stipend(SERIES_GAS);
+        if (gasFor == 0) {
+            emit Skipped(s, m.marketId, "NO_GAS");
+            return;
+        }
+
+        try ILucidSeries(s).onVenueMarket{gas: gasFor}(m) {}
+        catch {
+            emit Skipped(s, m.marketId, "SERIES_FAILED");
+        }
+    }
+
+    /// @dev Gives the own-series roller the chance to roll one of this protocol's own windows.
+    ///
+    /// The stipend is the largest this router hands out, because a live `triggerRoll` measured
+    /// 61.6M gas. It is still a stipend and not the whole frame: the series is the last thing
+    /// considered in a settlement firing, and it may not take the gas the desks paid for.
+    function _tickSeries(LucidTypes.MarketInfo memory m) private {
+        address s = series;
+        if (s == address(0) || s.code.length == 0) return;
+
+        uint256 gasFor = _stipend(SERIES_GAS);
+        if (gasFor == 0) {
+            emit Skipped(s, m.marketId, "NO_GAS");
+            return;
+        }
+
+        try ILucidSeries(s).onTick{gas: gasFor}(m) {}
+        catch {
+            emit Skipped(s, m.marketId, "SERIES_FAILED");
         }
     }
 

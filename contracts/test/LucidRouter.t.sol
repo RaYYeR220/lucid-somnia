@@ -105,6 +105,45 @@ contract MockRelayForRouter {
     }
 }
 
+/// @notice The slice of `LucidSeries` the router drives: two hooks, and nothing else.
+/// @dev Kept here for the same reason as `MockKeeperForRouter`. The series contract rolls this
+/// protocol's own windows when the venue's creator runs out of float and stops rolling its own; the
+/// router only feeds it two facts, so it must be able to do that without being able to break when
+/// the series misbehaves.
+contract MockSeriesForRouter {
+    error SeriesIsDown();
+
+    uint256 public venueMarketCalls;
+    uint256 public tickCalls;
+    bytes32 public lastVenueMarketId;
+    uint32 public lastVenueInterval;
+    bytes32 public lastTickMarketId;
+
+    /// @dev Sampled inside the callee's frame. A live `triggerRoll` measured 61.6M gas, so whether
+    /// the router actually hands over that much is a property rather than a detail.
+    uint256 public lastTickGas;
+
+    bool public revertOnCall;
+
+    function setRevertOnCall(bool on) external {
+        revertOnCall = on;
+    }
+
+    function onVenueMarket(LucidTypes.MarketInfo calldata m) external {
+        if (revertOnCall) revert SeriesIsDown();
+        ++venueMarketCalls;
+        lastVenueMarketId = m.marketId;
+        lastVenueInterval = m.intervalSec;
+    }
+
+    function onTick(LucidTypes.MarketInfo calldata m) external {
+        if (revertOnCall) revert SeriesIsDown();
+        lastTickGas = gasleft();
+        ++tickCalls;
+        lastTickMarketId = m.marketId;
+    }
+}
+
 /// @notice A brain that refuses the way the real one refuses: quietly, and without reverting.
 /// @dev Kept here rather than in `test/mocks/` because it exists for exactly one property, and it
 /// is a property of `LucidBrain`'s contract rather than of any mock. `requestVerdict` returns zero
@@ -956,6 +995,119 @@ contract LucidRouterTest is Test {
         assertEq(router.relay(), address(0), "and detach it again");
     }
 
+    // -- own-series rolling ---------------------------------------------------
+    //
+    // DreamDEX's short-cadence market creation stops when the creator the SDK advertises runs out
+    // of float, and it has. The series contract rolls a window of this protocol's own when that
+    // happens; the router's whole part in it is to hand over two facts -- the venue created a
+    // market, and a window just closed -- and to survive whatever the series does with them.
+
+    function test_no_series_leaves_scheduling_and_settlement_unchanged() public {
+        assertEq(router.series(), address(0), "no series by default");
+        MockDeskForRouter d = _newDesk(true, 1 ether);
+
+        _fireBtc();
+        assertEq(precompile.subscriptionCount(), 2, "the venue subscription and one settlement one-shot");
+        assertEq(router.pendingAt(DUE_MS).length, 1, "queued exactly as before");
+
+        vm.warp(EXPIRY + 5);
+        _fireSchedule(DUE_MS);
+
+        assertEq(d.settlementCalls(), 1, "the desk settled exactly as it always has");
+        assertEq(d.lastSettledMarketId(), BTC_MARKET_ID, "for its market");
+        assertEq(router.pendingAt(DUE_MS).length, 0, "the queue drained");
+        assertEq(router.scheduleIdAt(DUE_MS), 0, "the one-shot slot was freed");
+        assertEq(precompile.subscriptionCount(), 2, "and no extra subscription was taken out");
+    }
+
+    function test_both_series_hooks_are_driven() public {
+        MockSeriesForRouter s = _attachSeries();
+        MockDeskForRouter d = _newDesk(true, 1 ether);
+
+        _fireBtc();
+        assertEq(s.venueMarketCalls(), 1, "a venue market is the only evidence its scheduler is alive");
+        assertEq(s.lastVenueMarketId(), BTC_MARKET_ID, "for the window the venue created");
+        assertEq(s.lastVenueInterval(), 60, "carrying the cadence it was rolled at");
+        assertEq(s.tickCalls(), 0, "and nothing ticks before the window closes");
+
+        vm.warp(EXPIRY + 5);
+        _fireSchedule(DUE_MS);
+
+        assertEq(s.tickCalls(), 1, "the settlement schedule is the roll's clock");
+        assertEq(s.lastTickMarketId(), BTC_MARKET_ID, "for the settled window");
+        assertEq(d.settlementCalls(), 1, "and the desk that paid for the firing still settled");
+        assertGe(s.lastTickGas(), 61_600_000, "handed enough gas for the 61.6M a live roll measured");
+    }
+
+    /// @dev Pins where the heartbeat is taken. A window this router is too late to serve is still
+    /// proof that the venue's own scheduler is running, and the series must be told so -- otherwise
+    /// a venue that is healthy but slightly ahead of us would read as an outage.
+    function test_series_sees_a_market_the_router_is_too_late_to_serve() public {
+        MockSeriesForRouter s = _attachSeries();
+        _newDesk(true, 1 ether);
+
+        vm.warp(EXPIRY + 60);
+
+        vm.expectEmit(true, true, false, true, address(router));
+        emit LucidRouter.Skipped(address(0), BTC_MARKET_ID, "EXPIRED");
+        _fireBtc();
+
+        assertEq(s.venueMarketCalls(), 1, "the heartbeat is taken before the window is judged");
+        assertEq(router.pendingAt(DUE_MS).length, 0, "and the window itself is still declined");
+    }
+
+    /// @dev The series spends real money on a venue deployment this router does not own, so it is
+    /// the collaborator most likely to break -- and it must never cost the desks that paid for this
+    /// firing their settlement.
+    function test_a_reverting_series_does_not_break_settlement() public {
+        MockSeriesForRouter s = _attachSeries();
+        s.setRevertOnCall(true);
+        MockDeskForRouter d = _newDesk(true, 1 ether);
+
+        vm.expectEmit(true, true, false, true, address(router));
+        emit LucidRouter.Skipped(address(s), BTC_MARKET_ID, "SERIES_FAILED");
+        _fireBtc();
+        assertEq(router.pendingAt(DUE_MS).length, 1, "the market was served regardless");
+
+        vm.warp(EXPIRY + 5);
+        vm.expectEmit(true, true, false, true, address(router));
+        emit LucidRouter.Skipped(address(s), BTC_MARKET_ID, "SERIES_FAILED");
+        _fireSchedule(DUE_MS);
+
+        assertEq(d.settlementCalls(), 1, "the desk still settled");
+        assertEq(s.tickCalls(), 0, "and the series recorded nothing it did not do");
+
+        // The other half of the guard, and the one `try` cannot cover: an address with no code.
+        vm.warp(TRADING_START);
+        vm.prank(owner);
+        router.setSeries(stranger);
+
+        _fireEth();
+        vm.warp(EXPIRY + 5);
+        _fireSchedule(DUE_MS);
+
+        assertEq(d.settlementCalls(), 2, "an EOA series is passed over and settlement is unharmed");
+        assertEq(d.lastSettledMarketId(), ETH_MARKET_ID, "the second window");
+    }
+
+    function test_only_owner_can_set_series() public {
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        router.setSeries(address(1));
+
+        assertEq(router.series(), address(0), "unchanged");
+
+        vm.expectEmit(false, false, false, true, address(router));
+        emit LucidRouter.SeriesSet(address(1));
+        vm.prank(owner);
+        router.setSeries(address(1));
+        assertEq(router.series(), address(1), "the operator may attach one");
+
+        vm.prank(owner);
+        router.setSeries(address(0));
+        assertEq(router.series(), address(0), "and detach it again");
+    }
+
     // ── adaptive gas stipends ─────────────────────────────────────────────────
     //
     // The bug these pin was found live on Shannon. The router handed every desk a flat
@@ -1177,6 +1329,13 @@ contract LucidRouterTest is Test {
         exits = new MockRelayForRouter();
         vm.prank(owner);
         router.setRelay(address(exits));
+    }
+
+    /// @dev Attaches the own-series roller fed on venue markets and at settlement.
+    function _attachSeries() internal returns (MockSeriesForRouter s) {
+        s = new MockSeriesForRouter();
+        vm.prank(owner);
+        router.setSeries(address(s));
     }
 
     function _verdict(uint16 probUpBps) internal pure returns (LucidTypes.Verdict memory) {
