@@ -624,13 +624,12 @@ contract LucidDeskTest is Test {
     }
 
     function test_a_maker_quotes_both_sides_at_zero_percent() public {
-        LucidTypes.Policy memory p = _makerPolicy();
-        // A maker on an empty book is handed a placeholder book of zero, so a 0% verdict measures
-        // no edge and the mandate's own minimum would veto the window before it is ever priced.
-        // The subject here is the price, not the gate.
-        p.minEdgeBps = 0;
+        // The mandate's 200 bps edge floor stands here. A maker on an empty book is handed a
+        // placeholder book of zero, so a 0% verdict measures no distance from it — and a desk that
+        // quotes both sides was never trading that distance, so the floor has nothing to say about
+        // this window. `PolicyLib` scopes the floor to the strategy it belongs to.
         vm.prank(owner);
-        desk.setPolicy(p);
+        desk.setPolicy(_makerPolicy());
 
         _driveNoBook(MARKET_A, 0);
 

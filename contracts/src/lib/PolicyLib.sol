@@ -50,6 +50,8 @@ library PolicyLib {
     /// state is read before the verdict so a halted desk reports why it is halted rather than
     /// blaming the committee. `NoBook` was appended to the enum but inserted into this sequence
     /// just before `LowEdge`, because it is the precondition of that check rather than a new one.
+    /// Both of those checks weigh a committee against a market price, so both belong to the
+    /// strategy that takes a side on that comparison; every other check here applies to any desk.
     /// @param p The owner mandate.
     /// @param s The desk risk accounting.
     /// @param m The market window being traded.
@@ -93,9 +95,24 @@ library PolicyLib {
             return LucidTypes.Refusal.NoBook;
         }
 
-        uint256 pAi = v.probUpBps;
-        uint256 edge = pAi > pBookBps ? pAi - pBookBps : pBookBps - pAi;
-        if (edge < p.minEdgeBps) return LucidTypes.Refusal.LowEdge;
+        // `minEdgeBps` asks one question: is the committee far enough from the market to be worth
+        // taking a side? That is the whole of what `AiEdge` is — it crosses the spread because it
+        // believes the book is wrong, and a disagreement too small to pay for the crossing is not
+        // a trade worth opening.
+        //
+        // A `Maker` is not answering that question. It quotes both sides and earns the spread it
+        // charges, so it has no direction and is never betting on the committee beating the market;
+        // its profit is the gap between its own two legs, which the committee's confidence does not
+        // widen or narrow. Held to the edge test it is punished for the case it is best at: an
+        // undecided committee sits on top of the market, measures near-zero edge and is vetoed at
+        // 50%, precisely when standing on both sides earns the most. And on the empty book a maker
+        // exists to quote there is no market probability to be distant from at all, so the
+        // placeholder the router passes would decide the window on a number nobody quoted.
+        if (p.strategy != uint8(LucidTypes.Strategy.Maker)) {
+            uint256 pAi = v.probUpBps;
+            uint256 edge = pAi > pBookBps ? pAi - pBookBps : pBookBps - pAi;
+            if (edge < p.minEdgeBps) return LucidTypes.Refusal.LowEdge;
+        }
 
         if (stake > p.maxStakePerWindow) return LucidTypes.Refusal.CapExceeded;
         // Safe to widen and add: the cap check above bounds `stake` by a uint64.

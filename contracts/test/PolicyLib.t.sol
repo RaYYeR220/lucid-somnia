@@ -89,6 +89,17 @@ contract PolicyLibTest is Test {
         });
     }
 
+    /// The same mandate run by a maker, with an edge floor no measurable edge could ever clear.
+    /// The widest distance on a 0..10000 scale is 10000, so an `AiEdge` desk holding this policy
+    /// refuses every window there is. Every maker test below therefore proves two things at once:
+    /// the dial it breaks still fires, and the edge test that would otherwise have masked it does
+    /// not apply to a strategy that quotes both sides.
+    function _makerPolicy() internal pure returns (LucidTypes.Policy memory p) {
+        p = _policy();
+        p.strategy = uint8(LucidTypes.Strategy.Maker);
+        p.minEdgeBps = 10_001;
+    }
+
     function _state() internal pure returns (LucidTypes.DeskState memory s) {
         s = LucidTypes.DeskState({
             dayKey: NOW / 1 days,
@@ -426,15 +437,156 @@ contract PolicyLibTest is Test {
         );
     }
 
-    /// The pre-filter runs before the book is ever read, so it cannot and must not know about it.
-    /// A maker with an empty book has to reach the committee at all, or the exemption in `gate`
-    /// would never be exercised.
+    /// The pre-filter runs before the book is ever read and before the committee has answered, so
+    /// it cannot and must not know about either. That is also why it has no edge test to scope: an
+    /// edge is a distance from a verdict that does not exist yet at this point. Both strategies
+    /// have to reach the committee at all, or the exemptions in `gate` would never be exercised.
     function test_preCheck_is_indifferent_to_the_strategy() public view {
         LucidTypes.Policy memory maker = _policy();
         maker.strategy = uint8(LucidTypes.Strategy.Maker);
 
         _expect(harness.preCheck(_policy(), _state(), _market(), NOW), LucidTypes.Refusal.None);
         _expect(harness.preCheck(maker, _state(), _market(), NOW), LucidTypes.Refusal.None);
+    }
+
+    /// An edge floor no window could clear stops neither strategy from being worth a verdict, which
+    /// is the same statement as "the pre-filter holds no edge test".
+    function test_preCheck_never_applies_an_edge_floor() public view {
+        LucidTypes.Policy memory edge = _makerPolicy();
+        edge.strategy = uint8(LucidTypes.Strategy.AiEdge);
+
+        _expect(harness.preCheck(_makerPolicy(), _state(), _market(), NOW), LucidTypes.Refusal.None);
+        _expect(harness.preCheck(edge, _state(), _market(), NOW), LucidTypes.Refusal.None);
+    }
+
+    // -- the edge floor belongs to the strategy that takes a side ---------------
+    //
+    // `minEdgeBps` is the owner saying "only act when the committee disagrees with the market by at
+    // least this much". That is a rule about crossing a spread because you believe the book is
+    // wrong, which is the whole of what `AiEdge` does. A maker quotes both sides and earns the
+    // spread it charges: it has no direction, so there is nothing for the committee to be right
+    // about, and its profit is the gap between its own two legs rather than a distance from anyone
+    // else's price. Applied to a maker the rule inverts — it vetoes hardest at an undecided
+    // committee sitting on top of the market, which is when standing on both sides pays the most.
+
+    /// A verdict exactly at the market: zero edge, an unclearable floor, and the best window a
+    /// maker gets. Nothing here is a reason for a two-sided quote to stand down.
+    function test_a_maker_ignores_the_minimum_edge() public view {
+        LucidTypes.Verdict memory v = _verdict();
+        v.probUpBps = 5000;
+        _expect(_gate(_makerPolicy(), _state(), _market(), v, 5000, 10e6, 1000e6), LucidTypes.Refusal.None);
+    }
+
+    /// The same mandate handed to the strategy the rule was written for, so the difference is the
+    /// strategy and nothing else.
+    function test_an_edge_desk_with_the_same_mandate_refuses_a_zero_edge() public view {
+        LucidTypes.Policy memory p = _makerPolicy();
+        p.strategy = uint8(LucidTypes.Strategy.AiEdge);
+
+        LucidTypes.Verdict memory v = _verdict();
+        v.probUpBps = 5000;
+        _expect(_gate(p, _state(), _market(), v, 5000, 10e6, 1000e6), LucidTypes.Refusal.LowEdge);
+    }
+
+    /// The live case the maker desk runs all day, and the one the old gate could only reach with a
+    /// mandate of zero. No side of the book quoted, so the router hands the gate a placeholder of
+    /// zero; a 0% verdict then measures no distance from it. Neither number is a market price, and
+    /// a maker was never trading on the distance between them.
+    function test_a_maker_at_zero_percent_on_an_unobserved_book_passes() public view {
+        LucidTypes.Verdict memory v = _verdict();
+        v.probUpBps = 0;
+        _expect(_gateBook(_makerPolicy(), _state(), v, 0, false, 10e6, 1000e6), LucidTypes.Refusal.None);
+    }
+
+    /// The same window at the same numbers for a desk that does trade the distance: with no book
+    /// there is no distance, and the placeholder is not allowed to stand in for one.
+    function test_an_edge_desk_at_zero_percent_on_an_unobserved_book_refuses() public view {
+        LucidTypes.Policy memory p = _makerPolicy();
+        p.strategy = uint8(LucidTypes.Strategy.AiEdge);
+
+        LucidTypes.Verdict memory v = _verdict();
+        v.probUpBps = 0;
+        _expect(_gateBook(p, _state(), v, 0, false, 10e6, 1000e6), LucidTypes.Refusal.NoBook);
+    }
+
+    // -- a maker is exempt from the edge floor and from nothing else ------------
+    //
+    // Every policy below carries the unclearable floor, so any of these that came back `LowEdge`
+    // would mean the gate had stopped enforcing the dial the test is actually about.
+
+    function test_a_maker_still_refuses_when_disarmed() public view {
+        LucidTypes.Policy memory p = _makerPolicy();
+        p.armed = false;
+        _expect(_gate(p, _state(), _market(), _verdict(), 5000, 10e6, 1000e6), LucidTypes.Refusal.NotArmed);
+    }
+
+    function test_a_maker_still_refuses_an_unlisted_asset() public view {
+        LucidTypes.Policy memory p = _makerPolicy();
+        p.allowedAssets = BIT_ETH;
+        _expect(_gate(p, _state(), _market(), _verdict(), 5000, 10e6, 1000e6), LucidTypes.Refusal.AssetNotAllowed);
+    }
+
+    function test_a_maker_still_refuses_an_unlisted_cadence() public view {
+        LucidTypes.Policy memory p = _makerPolicy();
+        p.allowedCadences = 2; // 5m only, and the fixture window is 1m
+        _expect(_gate(p, _state(), _market(), _verdict(), 5000, 10e6, 1000e6), LucidTypes.Refusal.CadenceNotAllowed);
+    }
+
+    function test_a_maker_still_refuses_a_window_that_closes_too_soon() public view {
+        LucidTypes.MarketInfo memory m = _market();
+        m.expiry = NOW + LucidTypes.MIN_WINDOW_SLACK - 1;
+        _expect(_gate(_makerPolicy(), _state(), m, _verdict(), 5000, 10e6, 1000e6), LucidTypes.Refusal.WindowTooShort);
+    }
+
+    function test_a_maker_still_refuses_when_every_open_slot_is_used() public view {
+        LucidTypes.DeskState memory s = _state();
+        s.openMarkets = 5;
+        _expect(_gate(_makerPolicy(), s, _market(), _verdict(), 5000, 10e6, 1000e6), LucidTypes.Refusal.MaxOpenReached);
+    }
+
+    function test_a_maker_still_halts_on_a_losing_streak() public view {
+        LucidTypes.DeskState memory s = _state();
+        s.consecutiveLosses = 3;
+        _expect(_gate(_makerPolicy(), s, _market(), _verdict(), 5000, 10e6, 1000e6), LucidTypes.Refusal.RiskHalt);
+    }
+
+    function test_a_maker_still_halts_below_the_drawdown_floor() public view {
+        _expect(_gate(_makerPolicy(), _state(), _market(), _verdict(), 5000, 10e6, 799e6), LucidTypes.Refusal.RiskHalt);
+    }
+
+    function test_a_maker_still_refuses_when_the_committee_did_not_answer() public view {
+        LucidTypes.Verdict memory v = _verdict();
+        v.ok = false;
+        _expect(_gate(_makerPolicy(), _state(), _market(), v, 5000, 10e6, 1000e6), LucidTypes.Refusal.AiUnavailable);
+    }
+
+    function test_a_maker_still_refuses_an_out_of_range_probability() public view {
+        LucidTypes.Verdict memory v = _verdict();
+        v.probUpBps = 10_001;
+        _expect(_gate(_makerPolicy(), _state(), _market(), v, 5000, 10e6, 1000e6), LucidTypes.Refusal.AiMalformed);
+    }
+
+    function test_a_maker_still_refuses_over_the_window_cap() public view {
+        LucidTypes.Verdict memory v = _verdict();
+        v.probUpBps = 5000;
+        _expect(_gate(_makerPolicy(), _state(), _market(), v, 5000, 100e6 + 1, 1000e6), LucidTypes.Refusal.CapExceeded);
+    }
+
+    function test_a_maker_still_refuses_over_the_daily_budget() public view {
+        LucidTypes.DeskState memory s = _state();
+        s.spentToday = 950e6;
+        LucidTypes.Verdict memory v = _verdict();
+        v.probUpBps = 5000;
+        _expect(_gate(_makerPolicy(), s, _market(), v, 5000, 51e6, 1000e6), LucidTypes.Refusal.DailyBudgetExceeded);
+    }
+
+    /// Where the edge test used to sit, the next real check now answers. Lifting a refusal out of
+    /// the sequence must not move any of the ones around it, so the reason a maker hears here is
+    /// the one `AiEdge` would have heard had it cleared the floor.
+    function test_a_maker_falls_from_the_ai_checks_straight_to_the_cap() public view {
+        LucidTypes.Verdict memory v = _verdict();
+        v.probUpBps = 5000; // an `AiEdge` desk on this mandate stops at `LowEdge`
+        _expect(_gate(_makerPolicy(), _state(), _market(), v, 5000, 999e6, 1000e6), LucidTypes.Refusal.CapExceeded);
     }
 
     // -- the wire format -------------------------------------------------------

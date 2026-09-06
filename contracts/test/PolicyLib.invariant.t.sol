@@ -27,7 +27,10 @@ contract PolicyGateHandler is StdUtils {
     bool public sawUnclearedSpend;
     bool public sawEdgeTradeWithoutBook;
     bool public sawMakerRefusedForNoBook;
+    bool public sawMakerRefusedForLowEdge;
+    bool public sawEdgeDeskTradingBelowItsFloor;
     uint256 public unobservedMakerPasses;
+    uint256 public makerPassesBelowItsFloor;
 
     constructor(PolicyHarness harness_) {
         HARNESS = harness_;
@@ -109,6 +112,10 @@ contract PolicyGateHandler is StdUtils {
         // This is the half of the property a refusal-only check would miss.
         if (isMaker && r == LucidTypes.Refusal.NoBook) sawMakerRefusedForNoBook = true;
 
+        // Nor does a maker take a side, so how far the committee sits from the market is not a
+        // fact about whether its two-sided quote is worth posting.
+        if (isMaker && r == LucidTypes.Refusal.LowEdge) sawMakerRefusedForLowEdge = true;
+
         if (r != LucidTypes.Refusal.None) return;
         plausiblePasses++;
         if (!bookObserved) {
@@ -154,7 +161,9 @@ contract PolicyGateHandler is StdUtils {
     /// This is the branch the `NoBook` refusal must never reach, and it is driven here directly
     /// rather than left to a one-in-four draw inside `fuzzPlausible`. An exemption that no campaign
     /// ever exercises proves exactly as little as a missing one, and a guard that depends on the
-    /// generator getting lucky reports the generator rather than the code.
+    /// generator getting lucky reports the generator rather than the code. The mandate carries an
+    /// unclearable edge floor as well, so this entry point covers a window nobody quoted AND a
+    /// verdict the floor would reject — the pair of facts that describe every live maker window.
     function fuzzMakerNoBook(uint64 cap, uint64 budget, uint64 spent, uint256 stake, uint256 nowTs)
         external
     {
@@ -162,6 +171,14 @@ contract PolicyGateHandler is StdUtils {
         stake = bound(stake, 1, type(uint64).max);
 
         gateCalls++;
+
+        // The second thing a maker is exempt from, driven off the same draw rather than from a new
+        // target of its own. The fuzzer splits a fixed call budget evenly across targets, so an
+        // extra entry point silently starves the ones already here until a coverage guard
+        // elsewhere in this file stops being reachable. This runs before the block below, which
+        // returns early whenever the mandate refuses.
+        _floorPair(uint256(keccak256(abi.encode(cap, budget, spent, stake, nowTs))), nowTs);
+
         // Built inline for the same reason as `fuzzChaos`: the frame has no room for named locals.
         try HARNESS.gate(
             _cleanMakerPolicy(cap, budget),
@@ -175,11 +192,69 @@ contract PolicyGateHandler is StdUtils {
             nowTs
         ) returns (LucidTypes.Refusal r) {
             if (r == LucidTypes.Refusal.NoBook) sawMakerRefusedForNoBook = true;
+            if (r == LucidTypes.Refusal.LowEdge) sawMakerRefusedForLowEdge = true;
             if (r != LucidTypes.Refusal.None) return;
 
             unobservedMakerPasses++;
             if (stake > cap) sawCapBreach = true;
             if (uint256(spent) + stake > budget) sawBudgetBreach = true;
+        } catch {
+            sawRevert = true;
+        }
+    }
+
+    /// @dev One window put to a maker and to an edge desk holding the same unclearable floor. The
+    /// two mandates differ in a single byte, which is what makes the pair say anything: the maker
+    /// has to clear the window and the edge desk has to be refused it, so whatever they disagree
+    /// about is the strategy and nothing else.
+    function _floorPair(uint256 seed, uint256 nowTs) private {
+        // The widest distance two probabilities can hold on a 0..10000 scale is 10000, so any floor
+        // above that is one no verdict and no book can ever satisfy.
+        uint16 floor_ = uint16(10_001 + _word(seed, 27) % (uint256(type(uint16).max) - 10_000));
+        uint16 pAi = uint16(_word(seed, 28) % (uint256(LucidTypes.BPS) + 1));
+        uint256 pBookBps = _word(seed, 29) % (uint256(LucidTypes.BPS) + 1);
+
+        _makerFloorGate(floor_, pAi, pBookBps, nowTs);
+        _edgeDeskFloorGate(floor_, pAi, pBookBps, nowTs);
+    }
+
+    /// @dev Split out, and every input built inline, for the same reason as `_plausibleGate`.
+    function _makerFloorGate(uint16 floor_, uint16 probUpBps, uint256 pBookBps, uint256 nowTs) private {
+        try HARNESS.gate(
+            _floorPolicy(floor_, LucidTypes.Strategy.Maker),
+            _cleanState(0, nowTs),
+            _market(0, 0, _u64(nowTs + 300)),
+            _verdict(probUpBps, true),
+            pBookBps,
+            true,
+            1,
+            0,
+            nowTs
+        ) returns (LucidTypes.Refusal r) {
+            if (r == LucidTypes.Refusal.LowEdge) sawMakerRefusedForLowEdge = true;
+            if (r == LucidTypes.Refusal.None) makerPassesBelowItsFloor++;
+        } catch {
+            sawRevert = true;
+        }
+    }
+
+    /// @dev The mirror. Nothing else in this mandate can refuse — the desk is armed, the asset and
+    /// cadence are listed, the window is long, the state is clean, the committee answered in range
+    /// and the stake is one unit of a whole budget — so a desk that trades on edge and cannot reach
+    /// its own floor has exactly one thing left to say.
+    function _edgeDeskFloorGate(uint16 floor_, uint16 probUpBps, uint256 pBookBps, uint256 nowTs) private {
+        try HARNESS.gate(
+            _floorPolicy(floor_, LucidTypes.Strategy.AiEdge),
+            _cleanState(0, nowTs),
+            _market(0, 0, _u64(nowTs + 300)),
+            _verdict(probUpBps, true),
+            pBookBps,
+            true,
+            1,
+            0,
+            nowTs
+        ) returns (LucidTypes.Refusal r) {
+            if (r != LucidTypes.Refusal.LowEdge) sawEdgeDeskTradingBelowItsFloor = true;
         } catch {
             sawRevert = true;
         }
@@ -279,10 +354,26 @@ contract PolicyGateHandler is StdUtils {
         });
     }
 
-    /// @dev The same clean mandate, run by the strategy that needs no counterparty.
+    /// @dev The same clean mandate, run by the strategy that needs no counterparty. Its edge floor
+    /// is set past the widest distance any two probabilities can hold, so the window it is handed
+    /// is one no `AiEdge` desk could ever be permitted — a book nobody quoted and a verdict too
+    /// close to it to pay for crossing. Both of those are ordinary days for a two-sided quote.
     function _cleanMakerPolicy(uint64 cap, uint64 budget) private pure returns (LucidTypes.Policy memory p) {
         p = _cleanPolicy(cap, budget);
         p.strategy = uint8(LucidTypes.Strategy.Maker);
+        p.minEdgeBps = type(uint16).max;
+    }
+
+    /// @dev A clean mandate carrying a given edge floor, run by a named strategy. The two callers
+    /// differ only in that name, so whatever they disagree about is the strategy and nothing else.
+    function _floorPolicy(uint16 floor_, LucidTypes.Strategy strategy)
+        private
+        pure
+        returns (LucidTypes.Policy memory p)
+    {
+        p = _cleanPolicy(100e6, 1000e6);
+        p.minEdgeBps = floor_;
+        p.strategy = uint8(strategy);
     }
 
     function _cleanState(uint64 spentToday, uint256 nowTs) private pure returns (LucidTypes.DeskState memory s) {
@@ -382,6 +473,21 @@ contract PolicyLibInvariantTest is Test {
         assertFalse(handler.sawMakerRefusedForNoBook(), "a maker was refused for having no book to quote against");
     }
 
+    /// The same rule one step further on. An edge floor is the owner saying "only cross the spread
+    /// when the committee is this far from the market", which is a rule about taking a side. A
+    /// maker takes neither side; it quotes both and earns the gap between its own legs, and the
+    /// window it wants most — an undecided committee sitting on top of the market — is the one that
+    /// measures the least edge. Whatever the inputs, that is never why a maker stands down.
+    function invariant_makerIsNeverRefusedForALowEdge() public view {
+        assertFalse(handler.sawMakerRefusedForLowEdge(), "a maker was refused for an edge it does not trade on");
+    }
+
+    /// And the exemption is scoped to the strategy that earned it: a desk that does take a side
+    /// still has to clear the floor its owner set before it crosses anything.
+    function invariant_anEdgeDeskStillAnswersToItsOwnFloor() public view {
+        assertFalse(handler.sawEdgeDeskTradingBelowItsFloor(), "an edge desk cleared a floor no window could satisfy");
+    }
+
     function invariant_rollDayAlwaysLandsOnToday() public view {
         assertFalse(handler.sawStaleDayKey(), "rollDay left a stale day key");
     }
@@ -400,6 +506,11 @@ contract PolicyLibInvariantTest is Test {
             handler.unobservedMakerPasses(),
             0,
             "no maker ever cleared the gate on an empty book, so the exemption proves nothing"
+        );
+        assertGt(
+            handler.makerPassesBelowItsFloor(),
+            0,
+            "no maker ever cleared the gate under an edge floor it could not reach, so the exemption proves nothing"
         );
     }
 }
