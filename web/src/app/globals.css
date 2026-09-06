@@ -1,0 +1,204 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================================================
+   Tokens. Lifted from the chosen direction, unchanged.
+   ========================================================================== */
+:root {
+  --bg: #f8fafc;
+  --surface: #ffffff;
+  --slate-50: #f8fafc;
+  --slate-100: #f1f5f9;
+
+  /*
+   * The grey ramp is shifted one step darker than the source comp at the two quietest levels.
+   * `#94a3b8` on this ground measures 2.45:1, and it carries labels, units and meta throughout —
+   * text people are meant to read, not decoration. Every level below now clears 4.5:1 on white,
+   * on the page ground and on the slate fill, and the ramp keeps its four distinct steps.
+   */
+  --ink: #0f172a;
+  --ink-2: #1e293b;
+  --ink-3: #475569;
+  --ink-4: #526176;
+  --ink-5: #64748b;
+  /* The same quiet grey, lifted for the dark bands where the ramp runs the other way. */
+  --ink-on-dark: #8494ab;
+
+  --line: #e2e8f0;
+  --line-2: #cbd5e1;
+
+  --indigo: #4f46e5;
+  --violet: #7c3aed;
+  --indigo-soft: #eef0fe;
+
+  /* Deepened from #059669: the badge sets this on its own tint, where the original read 3.58:1. */
+  --emerald: #047857;
+  --emerald-soft: #ecfdf5;
+
+  --rose: #be123c;
+  --rose-soft: #fff1f3;
+  --rose-line: #fbcfd8;
+
+  --amber: #b45309;
+  --amber-soft: #fffbeb;
+
+  /* Deepened from #0891b2, for the same reason. */
+  --cyan: #0e7490;
+
+  --night: #0f172a;
+  --night-2: #1e293b;
+  --night-3: #111c2f;
+
+  --r1: 8px;
+  --r2: 12px;
+  --r3: 16px;
+  --r4: 24px;
+
+  --sh-c: 0 1px 2px rgba(15, 23, 42, 0.04), 0 12px 32px -18px rgba(79, 70, 229, 0.28);
+  --sh-h: 0 2px 4px rgba(15, 23, 42, 0.05), 0 22px 48px -22px rgba(79, 70, 229, 0.42);
+
+  /* The one commitment this design makes: a single light look, painted explicitly. */
+  color-scheme: light;
+}
+
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--ink-2);
+    font-size: 16px;
+    line-height: 1.6;
+    letter-spacing: -0.008em;
+    font-variant-numeric: tabular-nums;
+    -webkit-font-smoothing: antialiased;
+    /* No horizontal scroll at any width; wide content scrolls inside its own container. */
+    overflow-x: clip;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    color: var(--ink);
+    font-weight: 700;
+    letter-spacing: -0.035em;
+    line-height: 1.1;
+    text-wrap: balance;
+  }
+
+  /* One focus treatment, everywhere, and it is never removed. */
+  :focus-visible {
+    outline: 2px solid var(--indigo);
+    outline-offset: 3px;
+    border-radius: 6px;
+  }
+
+  ::selection {
+    background: #ddd9fe;
+    color: var(--ink);
+  }
+
+  svg {
+    display: block;
+  }
+
+  /* Anchored headings clear the sticky header. */
+  [id] {
+    scroll-margin-top: 96px;
+  }
+}
+
+@layer components {
+  /* The gutter clears a notch or a rounded corner on a landscape phone. */
+  .wrap {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding-left: max(20px, env(safe-area-inset-left));
+    padding-right: max(20px, env(safe-area-inset-right));
+  }
+
+  @media (min-width: 640px) {
+    .wrap {
+      padding-left: max(24px, env(safe-area-inset-left));
+      padding-right: max(24px, env(safe-area-inset-right));
+    }
+  }
+
+  /* Code plates on the dark ground, as in the source page. */
+  .plate {
+    background: var(--night);
+    border-radius: var(--r2);
+    padding: 14px 16px;
+    overflow-x: auto;
+  }
+
+  .plate code {
+    font-size: 12.5px;
+    line-height: 1.7;
+    color: #c7d2fe;
+    white-space: pre;
+    display: block;
+    font-weight: 500;
+    font-family: inherit;
+  }
+
+  .plate .kw {
+    color: #a5b4fc;
+    font-weight: 700;
+  }
+
+  .plate .st {
+    color: #6ee7b7;
+  }
+
+  .plate .cm {
+    color: #7c89a8;
+  }
+}
+
+/* Skeletons: a single shimmer, defined once, disabled with everything else below. */
+.skeleton {
+  position: relative;
+  overflow: hidden;
+  background: var(--slate-100);
+  border-radius: 6px;
+}
+
+.skeleton::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.85), transparent);
+  animation: shimmer 1.4s infinite;
+}
+
+@keyframes shimmer {
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+/* Motion is decoration here; under a reduced-motion preference there is none of it. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .skeleton::after {
+    display: none;
+  }
+}

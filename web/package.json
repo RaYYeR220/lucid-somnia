@@ -1,0 +1,29 @@
+{
+  "name": "lucid-web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Lucid \u2014 the read-only front end for autonomous DreamDEX Event Contract desks on Somnia.",
+  "scripts": {
+    "sync-chain": "node scripts/sync-chain.mjs",
+    "dev": "npm run sync-chain && next dev",
+    "build": "npm run sync-chain && next build",
+    "start": "npx serve out",
+    "typecheck": "tsc --noEmit",
+    "verify": "node scripts/verify-reads.mjs"
+  },
+  "dependencies": {
+    "next": "15.1.6",
+    "react": "19.0.0",
+    "react-dom": "19.0.0",
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.17",
+    "typescript": "^5.7.0"
+  }
+}
