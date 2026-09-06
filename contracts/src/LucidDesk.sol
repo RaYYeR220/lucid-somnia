@@ -290,14 +290,9 @@ contract LucidDesk is ILucidDesk {
         // handler, and the two values must describe the same instant anyway.
         uint256 free = _free();
         uint256 equity_ = free + openNotional;
-        // Sizing is by disagreement with the book, so an unobserved book has nothing to disagree
-        // with. `Maker` is the only strategy that reaches the venue from here without a book, and
-        // it quotes around the committee's own fair value rather than around a spread it measured,
-        // so its conviction is the committee's distance from an even split.
-        uint256 edgeBps = bookObserved
-            ? _absDiff(v.probUpBps, pBookBps)
-            : _absDiff(v.probUpBps, LucidTypes.BPS / 2);
-        uint256 intended = _intendedStake(equity_, edgeBps);
+        // Each strategy sizes on the thing that actually governs it. See `_intendedStake`: the two
+        // formulas are different on purpose and unifying them is a money bug.
+        uint256 intended = _intendedStake(equity_, v.probUpBps, pBookBps, bookObserved);
 
         LucidTypes.Refusal r =
             PolicyLib.gate(_policy, s, m, v, pBookBps, bookObserved, intended, equity_, block.timestamp);
@@ -315,6 +310,8 @@ contract LucidDesk is ILucidDesk {
         if (_policy.strategy == uint8(LucidTypes.Strategy.Maker)) {
             _make(m, stake, v.probUpBps, bookField);
         } else {
+            // Comparing against `pBookBps` is only meaningful because the gate has already refused
+            // an `AiEdge` window with no book: past this line the book is a price somebody quoted.
             uint8 kind = v.probUpBps > pBookBps ? LucidTypes.BUY_YES : LucidTypes.BUY_NO;
             _take(m, kind, stake, v.probUpBps, bookField);
         }
@@ -490,6 +487,12 @@ contract LucidDesk is ILucidDesk {
             return _refuse(m.marketId, LucidTypes.Refusal.InsufficientFunds, pAi, pBook);
         }
 
+        // Priced BEFORE the collateral moves. A pair of quotes that cannot be posted sanely is a
+        // reason not to mint at all: minting first would leave the desk sitting on an unquoted set
+        // for the rest of the window, having spent the whole window's mandate to do nothing.
+        (bool okQuotes, uint256 bid, uint256 ask) = _quotePair(pAi, bp.tick);
+        if (!okQuotes) return _refuse(m.marketId, LucidTypes.Refusal.VenueRejected, pAi, pBook);
+
         uint256 before = _free();
         try IBinaryPool(m.pool).mintSet(address(this), address(this), size) {}
         catch {
@@ -500,15 +503,55 @@ contract LucidDesk is ILucidDesk {
         // otherwise settlement would find legs it has no cost basis for.
         _book(m.marketId, _spentSince(before), stake);
 
-        uint256 fair = uint256(pAi) * LucidTypes.ONE / LucidTypes.BPS;
-        uint256 ask = _clampPrice(_ceilTo(fair + SPREAD, bp.tick), bp.tick);
-        // The NO quote is `(ONE - fair) + SPREAD` in NO terms; the venue wants the YES side of it.
-        uint256 bid = _clampPrice(_ceilTo(fair > SPREAD ? fair - SPREAD : 0, bp.tick), bp.tick);
-
         // POST_ONLY reverts `PostOnlyWouldCross` on the venue, so a leg that cannot rest must not
         // take the other leg down with it: half a quote still earns.
         _rest(m, LucidTypes.SELL_YES, ask, size, pAi, pBook);
         _rest(m, LucidTypes.SELL_NO, bid, size, pAi, pBook);
+    }
+
+    /// @dev Both maker legs, in the YES prices the venue quotes, arranged around the committee's
+    /// fair value.
+    ///
+    /// The desk sells YES at `fair + SPREAD` and NO at `(ONE - fair) + SPREAD` in NO terms; the
+    /// venue quotes the YES side of every kind, so that NO leg is submitted as `fair - SPREAD`.
+    /// The pair is therefore only worth resting while `bid < ask`, and the gap between them IS the
+    /// profit: a complete set costs exactly `ONE` to mint and pays exactly `ONE` back, so a crossed
+    /// or equal pair sells it for what it cost or less. That is a guaranteed loss wearing the
+    /// costume of a quote, and it must never be posted.
+    ///
+    /// Both boundaries are live: the committee answers 100% and 0% on real windows, and at those
+    /// answers `fair` lands on or past the edge of the venue's `0 < price < ONE` range. Clamping
+    /// alone would pin one leg to the edge and let the other meet or cross it, so the pinned leg
+    /// keeps the boundary and the free leg steps one tick away from it, into the interior. With
+    /// the venue's real tick that never triggers — at 100% the legs come out at `ONE - tick` and
+    /// `fair - SPREAD`, still a full spread apart — it is the coarse-tick case that would
+    /// otherwise produce nonsense. When even a one-tick gap will not fit inside the legal range,
+    /// there is no sane quote to make and the caller refuses instead of posting one anyway.
+    ///
+    /// @return ok False when no ordered pair fits inside the venue's price range.
+    /// @return bid The NO leg, expressed on the YES side. Strictly inside `(0, ONE)` and strictly
+    /// below `ask`.
+    /// @return ask The YES leg. Strictly inside `(0, ONE)`.
+    function _quotePair(uint16 pAi, uint256 tick) private pure returns (bool ok, uint256 bid, uint256 ask) {
+        uint256 fair = uint256(pAi) * LucidTypes.ONE / LucidTypes.BPS;
+
+        ask = _clampPrice(_ceilTo(fair + SPREAD, tick), tick);
+        bid = _clampPrice(_ceilTo(fair > SPREAD ? fair - SPREAD : 0, tick), tick);
+
+        if (bid >= ask) {
+            // One of the two was pinned by the clamp. Whichever it was keeps its boundary, because
+            // that boundary is the best price the venue will accept in the direction the committee
+            // is pointing; the other leg gives up a tick.
+            if (ask == LucidTypes.ONE - tick) {
+                bid = ask > tick ? ask - tick : 0;
+            } else {
+                ask = bid + tick;
+            }
+        }
+
+        // Strictly inside the range and strictly ordered, or nothing at all.
+        if (bid < tick || ask > LucidTypes.ONE - tick || bid >= ask) return (false, 0, 0);
+        return (true, bid, ask);
     }
 
     /// @dev One resting maker leg, reported honestly whichever way it goes.
@@ -650,13 +693,42 @@ contract LucidDesk is ILucidDesk {
 
     // -- accounting ------------------------------------------------------------
 
-    /// @dev Size by conviction and let the mandate veto. The stake is deliberately NOT clipped to
-    /// the cap before the gate sees it: a cap that quietly shrank the order would trade every
-    /// time and could never be observed refusing, and the refusal is the point of this contract.
-    /// A 38-point disagreement between the committee and the book stakes 38% of equity; a
-    /// 3-point one stakes 3%.
-    function _intendedStake(uint256 equity_, uint256 edgeBps) private pure returns (uint256) {
-        return equity_ * edgeBps / LucidTypes.BPS;
+    /// @dev What this window is worth before the mandate gets its veto. The stake is deliberately
+    /// NOT clipped to the cap here: a cap that quietly shrank the order would trade every time and
+    /// could never be observed refusing, and the refusal is the point of this contract.
+    ///
+    /// The two strategies size on different quantities, and unifying them is a money bug rather
+    /// than a tidy-up.
+    ///
+    /// `AiEdge` crosses the book in ONE direction, so its size is its conviction: the distance
+    /// between what the committee believes and what the market is charging. A 38-point
+    /// disagreement stakes 38% of equity; a 3-point one stakes 3%.
+    ///
+    /// `Maker` quotes BOTH sides. It mints a complete set and rests a sell on each leg, so it has
+    /// no direction to be convinced about and it earns the spread it charges rather than the call
+    /// it made. How far the committee sits from the market is therefore not a measure of how much
+    /// to quote — and a two-sided quote sized by conviction shrinks to nothing exactly when the
+    /// committee is undecided, which is when standing on both sides is worth the most. It sizes on
+    /// the mandate instead: the owner already said how much of this desk may stand in one window,
+    /// and that number is the quote. The caller then clamps it to collateral actually on hand,
+    /// which is a fact about money rather than a silent edit of the mandate.
+    ///
+    /// The unobserved book never enters the arithmetic. `pBookBps` is a probability only while
+    /// `bookObserved` says so; otherwise it is a placeholder for a value that does not exist —
+    /// today a zero from the router, historically `LucidTypes.BOOK_UNOBSERVED`. A value that
+    /// encodes ABSENCE must never be an arithmetic input: subtracting the 65535 sentinel from a
+    /// 5100 verdict produced a 60435 bps "edge" and sized six times equity against a window nobody
+    /// had quoted. `PolicyLib` already refuses `AiEdge` on an unobserved book with `NoBook`, so
+    /// the guarded branch is unreachable from that gate; it sizes zero rather than guessing, so a
+    /// future caller that does reach it refuses instead of inventing a disagreement.
+    function _intendedStake(uint256 equity_, uint16 probUpBps, uint256 pBookBps, bool bookObserved)
+        private
+        view
+        returns (uint256)
+    {
+        if (_policy.strategy == uint8(LucidTypes.Strategy.Maker)) return _policy.maxStakePerWindow;
+        if (!bookObserved) return 0;
+        return equity_ * _absDiff(probUpBps, pBookBps) / LucidTypes.BPS;
     }
 
     /// @dev Record what a window actually cost and charge the mandated stake against the budget.

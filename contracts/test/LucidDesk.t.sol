@@ -345,6 +345,29 @@ contract LucidDeskTest is Test {
         assertEq(outcome.balanceOf(address(desk), NO_ID), o.quantity);
     }
 
+    /// An `AiEdge` desk crosses the book in one direction, so its size IS its conviction and the
+    /// two numbers below are the formula, pinned. This is the path a maker must never be
+    /// "unified" back into: the same two windows sized on the mandate would stake 50 tUSDC each.
+    function test_an_edge_desk_on_an_observed_book_is_sized_by_conviction() public {
+        // 88.00% against a book at 50.00% is a 38-point disagreement, and this desk has 100 tUSDC.
+        _drive(MARKET_A, 8800, 5000);
+        assertEq(desk.state().spentToday, 38e6, "38 points of edge stakes 38% of equity");
+        assertLe(FUNDING - usdc.balanceOf(address(desk)), 38e6, "escrow exceeded the mandated stake");
+
+        // Opening a position does not change equity — it moves collateral into `openNotional` at
+        // cost — so the second window scales off the same 100 tUSDC.
+        assertEq(desk.equity(), FUNDING);
+
+        // 53.00% against the same book is 3 points, and stakes a proportional 3 tUSDC.
+        _drive(MARKET_B, 5300, 5000);
+        assertEq(desk.state().spentToday, 41e6, "3 points of edge stakes 3% of equity");
+        assertEq(pool.orderCount(), 2);
+
+        uint256 second = pool.orderAt(1).quantity * pool.orderAt(1).price / LucidTypes.ONE;
+        assertLe(second, 3e6, "the second window escrowed more than its conviction");
+        assertGt(second, 3e6 - 1e3, "and it must be sized on the edge, not rounded away");
+    }
+
     function test_price_is_tick_aligned_and_below_one() public {
         pool.setLevel(false, 999_500, 1_000e6);
         _drive(MARKET_A, 8800, 5000);
@@ -378,6 +401,9 @@ contract LucidDeskTest is Test {
 
     // -- making a market -------------------------------------------------------
 
+    /// A maker quotes both sides, so it is sized by the mandate rather than by conviction: the
+    /// 10-point gap between this verdict and this book is not a statement about how much of the
+    /// desk should be standing in the market, and the owner's per-window cap is.
     function test_maker_mints_a_set_and_rests_both_legs() public {
         vm.prank(owner);
         desk.setPolicy(_makerPolicy());
@@ -385,24 +411,24 @@ contract LucidDeskTest is Test {
         _drive(MARKET_A, 6000, 5000);
 
         assertEq(pool.mintSetCalls(), 1, "a maker needs no counterparty, only a complete set");
-        assertEq(pool.lastMintSetAmount(), 10e6);
+        assertEq(pool.lastMintSetAmount(), 50e6, "the mandate sizes the quote, not the disagreement");
         assertEq(pool.orderCount(), 2);
 
         MockBinaryPool.Order memory yes = pool.orderAt(0);
         assertEq(yes.kind, LucidTypes.SELL_YES);
         assertEq(yes.orderType, LucidTypes.ORDER_POST_ONLY);
         assertEq(yes.price, 620_000, "fair plus the spread");
-        assertEq(yes.quantity, 10e6);
+        assertEq(yes.quantity, 50e6);
 
         MockBinaryPool.Order memory no = pool.orderAt(1);
         assertEq(no.kind, LucidTypes.SELL_NO);
         assertEq(no.orderType, LucidTypes.ORDER_POST_ONLY);
         assertEq(no.price, 580_000, "the NO quote, converted to the YES side the venue wants");
-        assertEq(no.quantity, 10e6);
+        assertEq(no.quantity, 50e6);
 
-        assertEq(outcome.balanceOf(address(desk), YES_ID), 10e6);
-        assertEq(outcome.balanceOf(address(desk), NO_ID), 10e6);
-        assertEq(desk.state().spentToday, 10e6);
+        assertEq(outcome.balanceOf(address(desk), YES_ID), 50e6);
+        assertEq(outcome.balanceOf(address(desk), NO_ID), 50e6);
+        assertEq(desk.state().spentToday, 50e6);
         assertEq(desk.state().openMarkets, 1);
     }
 
@@ -474,6 +500,11 @@ contract LucidDeskTest is Test {
     /// The whole reason `Maker` exists. It mints a complete set and rests both legs, which needs no
     /// counterparty at all — an empty book is the state it was built for, and refusing it here
     /// would delete the one strategy that works on this venue's usual book.
+    ///
+    /// It is sized by the mandate. There is no book to disagree with, so there is no conviction to
+    /// size on, and every stand-in for the missing number is arithmetic on a value that means "no
+    /// value": the live desk multiplied its equity by `|6000 - 65535|` and refused itself
+    /// `CapExceeded` on every window it ever saw.
     function test_a_maker_mints_and_rests_both_legs_on_an_unobserved_book() public {
         vm.prank(owner);
         desk.setPolicy(_makerPolicy());
@@ -481,40 +512,164 @@ contract LucidDeskTest is Test {
         _driveNoBook(MARKET_A, 6000);
 
         assertEq(pool.mintSetCalls(), 1, "a maker needs no counterparty, only a complete set");
-        assertEq(pool.lastMintSetAmount(), 10e6);
+        assertEq(pool.lastMintSetAmount(), 50e6, "the whole window mandate, exactly");
         assertEq(pool.orderCount(), 2, "both legs rest");
 
         MockBinaryPool.Order memory yes = pool.orderAt(0);
         assertEq(yes.kind, LucidTypes.SELL_YES);
         assertEq(yes.orderType, LucidTypes.ORDER_POST_ONLY);
         assertEq(yes.price, 620_000, "quoted around the committee's fair value, not around a book");
-        assertEq(yes.quantity, 10e6);
+        assertEq(yes.quantity, 50e6);
 
         MockBinaryPool.Order memory no = pool.orderAt(1);
         assertEq(no.kind, LucidTypes.SELL_NO);
         assertEq(no.orderType, LucidTypes.ORDER_POST_ONLY);
         assertEq(no.price, 580_000, "the NO quote, converted to the YES side the venue wants");
-        assertEq(no.quantity, 10e6);
+        assertEq(no.quantity, 50e6);
 
-        assertEq(outcome.balanceOf(address(desk), YES_ID), 10e6);
-        assertEq(outcome.balanceOf(address(desk), NO_ID), 10e6);
-        assertEq(desk.state().spentToday, 10e6, "sized exactly as it is against a quoted 50/50 book");
+        assertEq(outcome.balanceOf(address(desk), YES_ID), 50e6);
+        assertEq(outcome.balanceOf(address(desk), NO_ID), 50e6);
+        assertEq(desk.state().spentToday, 50e6, "the mandate is the size");
         assertEq(desk.state().openMarkets, 1);
+
+        // The sentinel spelled out: equity times `|probUp - BOOK_UNOBSERVED|` is six times the
+        // whole desk, which is the number that produced every live refusal.
+        uint256 sentinelSized = FUNDING * (uint256(type(uint16).max) - 6000) / LucidTypes.BPS;
+        assertGt(sentinelSized, FUNDING, "the bug being pinned: a sentinel sizes above equity");
+        assertEq(pool.lastMintSetAmount(), desk.policy().maxStakePerWindow, "and it is not what sized this");
     }
 
-    /// A maker on an empty book is not exempt from the mandate, only from needing a quote.
-    function test_a_maker_on_an_unobserved_book_still_obeys_the_window_cap() public {
+    /// The exact window the live desk refused `InsufficientFunds` on: a committee that is on the
+    /// fence. Conviction sizing stakes zero there, which is precisely backwards for a strategy
+    /// that earns a spread rather than a call — an undecided committee is when standing on both
+    /// sides is worth the most.
+    function test_a_maker_quotes_an_undecided_committee_instead_of_staking_nothing() public {
+        vm.prank(owner);
+        desk.setPolicy(_makerPolicy());
+
+        _driveNoBook(MARKET_A, 5000);
+
+        assertEq(pool.mintSetCalls(), 1, "an even verdict is a reason to quote, not a reason to stop");
+        assertEq(pool.lastMintSetAmount(), 50e6);
+        assertEq(pool.orderCount(), 2);
+        assertEq(pool.orderAt(0).price, 520_000, "fair plus the spread");
+        assertEq(pool.orderAt(1).price, 480_000, "fair minus the spread, on the YES side");
+    }
+
+    /// A maker on an empty book is not exempt from the mandate, only from needing a quote. The cap
+    /// is now the size rather than a veto over it, so what has to hold is that the desk never
+    /// stands for more than the owner allowed — and that the daily budget still refuses out loud.
+    function test_a_maker_on_an_unobserved_book_still_obeys_the_cap_and_the_budget() public {
         LucidTypes.Policy memory p = _makerPolicy();
-        p.maxStakePerWindow = 10e6 - 1;
+        p.maxStakePerWindow = 7e6;
+        p.dailyBudget = 10e6;
         vm.prank(owner);
         desk.setPolicy(p);
 
-        vm.expectEmit(true, false, false, true, address(desk));
-        emit Refused(MARKET_A, LucidTypes.Refusal.CapExceeded, 6000, type(uint16).max);
         _driveNoBook(MARKET_A, 6000);
 
-        assertEq(pool.mintSetCalls(), 0, "the cap is a veto, not a clamp");
-        assertEq(pool.orderCount(), 0);
+        assertEq(pool.lastMintSetAmount(), 7e6, "the window cap, not a bps slice of a 100 tUSDC desk");
+        assertEq(FUNDING - usdc.balanceOf(address(desk)), 7e6, "the venue escrowed more than the cap");
+        assertEq(desk.state().spentToday, 7e6);
+
+        // 7 + 7 does not fit in 10, and the budget is a veto rather than a clamp: the second
+        // window is refused whole rather than quoted small.
+        vm.expectEmit(true, false, false, true, address(desk));
+        emit Refused(MARKET_B, LucidTypes.Refusal.DailyBudgetExceeded, 6000, type(uint16).max);
+        _driveNoBook(MARKET_B, 6000);
+
+        assertEq(pool.mintSetCalls(), 1, "the budget is a veto, not a clamp");
+        assertEq(pool.orderCount(), 2, "and nothing new rested");
+        assertEq(desk.state().spentToday, 7e6);
+    }
+
+    /// Collateral is a fact about money rather than an edit of the mandate, so a desk with less
+    /// than a full window's worth quotes what it actually has instead of refusing itself.
+    function test_a_maker_sizes_on_free_collateral_when_it_is_below_the_cap() public {
+        vm.startPrank(owner);
+        desk.setPolicy(_makerPolicy());
+        desk.withdraw(FUNDING - 20e6);
+        vm.stopPrank();
+
+        _driveNoBook(MARKET_A, 6000);
+
+        assertEq(pool.mintSetCalls(), 1, "a short desk still trades, it just trades smaller");
+        assertEq(pool.lastMintSetAmount(), 20e6, "sized on the collateral actually on hand");
+        assertEq(pool.orderCount(), 2);
+        assertEq(pool.orderAt(0).quantity, 20e6);
+        assertEq(pool.orderAt(1).quantity, 20e6);
+        assertEq(desk.state().spentToday, 20e6, "and the budget is charged what was actually staked");
+    }
+
+    // -- the committee's answers at the boundary -------------------------------
+    //
+    // 100% and 0% are both live answers on this venue. Fair value then sits on or past the edge of
+    // the venue's `0 < price < ONE` range, which is exactly where a clamp can quietly pin one leg
+    // onto the other. A complete set costs `ONE` and pays `ONE`, so the gap between the two quotes
+    // IS the profit: an equal or crossed pair sells the set for what it cost or less.
+
+    function test_a_maker_quotes_both_sides_at_a_hundred_percent() public {
+        vm.prank(owner);
+        desk.setPolicy(_makerPolicy());
+
+        _driveNoBook(MARKET_A, LucidTypes.BPS);
+
+        assertEq(pool.orderCount(), 2, "certainty is still a two-sided quote");
+        uint256 ask = pool.orderAt(0).price;
+        uint256 bid = pool.orderAt(1).price;
+
+        assertEq(ask, LucidTypes.ONE - pool.tickSize(), "fair is past the ceiling, so the ask sits on it");
+        assertEq(bid, 980_000, "and the NO leg keeps its full spread below fair");
+        _assertSaneQuotePair(bid, ask);
+    }
+
+    function test_a_maker_quotes_both_sides_at_zero_percent() public {
+        LucidTypes.Policy memory p = _makerPolicy();
+        // A maker on an empty book is handed a placeholder book of zero, so a 0% verdict measures
+        // no edge and the mandate's own minimum would veto the window before it is ever priced.
+        // The subject here is the price, not the gate.
+        p.minEdgeBps = 0;
+        vm.prank(owner);
+        desk.setPolicy(p);
+
+        _driveNoBook(MARKET_A, 0);
+
+        assertEq(pool.orderCount(), 2, "so is certainty the other way");
+        uint256 ask = pool.orderAt(0).price;
+        uint256 bid = pool.orderAt(1).price;
+
+        assertEq(ask, 20_000, "fair is zero, so the YES leg is the spread itself");
+        assertEq(bid, pool.tickSize(), "and the NO leg sits on the floor rather than under it");
+        _assertSaneQuotePair(bid, ask);
+    }
+
+    /// The refusal branch: a tick coarse enough that no ordered pair fits between the venue's own
+    /// floor and ceiling. There is no sane price to post, so nothing is posted and nothing is
+    /// minted — a set the desk cannot quote is a whole window's mandate spent doing nothing.
+    function test_a_maker_refuses_when_no_ordered_pair_fits_inside_the_range() public {
+        vm.prank(owner);
+        desk.setPolicy(_makerPolicy());
+        // Legal prices are `[tick, ONE - tick]`, which this tick empties out entirely.
+        pool.setBookParams(600_000, 1000, 1000);
+
+        vm.expectEmit(true, false, false, true, address(desk));
+        emit Refused(MARKET_A, LucidTypes.Refusal.VenueRejected, LucidTypes.BPS, type(uint16).max);
+        _driveNoBook(MARKET_A, LucidTypes.BPS);
+
+        assertEq(pool.orderCount(), 0, "no leg may be posted at a nonsense price");
+        assertEq(pool.mintSetCalls(), 0, "and no set is minted that could not be quoted");
+        assertEq(desk.state().spentToday, 0);
+        assertEq(desk.equity(), FUNDING, "no collateral moved");
+    }
+
+    /// @dev Both legs strictly inside the venue's price range and strictly ordered. Equality is a
+    /// failure, not a rounding detail: it sells a complete set for exactly what minting it cost.
+    function _assertSaneQuotePair(uint256 bid, uint256 ask) internal view {
+        assertGt(bid, 0, "a quote at zero is not a price the venue accepts");
+        assertLt(ask, LucidTypes.ONE, "nor is one at a whole contract");
+        assertLt(bid, ask, "the two legs must not meet: the gap between them is the profit");
+        assertEq(ask % pool.tickSize(), 0, "ask is off tick");
+        assertEq(bid % pool.tickSize(), 0, "bid is off tick");
     }
 
     // -- settlement ------------------------------------------------------------
