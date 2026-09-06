@@ -27,6 +27,13 @@ contract LucidBrainTest is Test {
     /// @dev The live floor on Shannon: getAdvancedRequestDeposit(3) = 0.003 STT.
     uint256 internal constant DEPOSIT_FLOOR_3 = 0.003 ether;
 
+    /// @dev A JSON fetch is priced at 0.03 per validator, an inference at 0.07.
+    uint256 internal constant STAGE1_3 = DEPOSIT_FLOOR_3 + 0.03 ether * 3;
+    uint256 internal constant STAGE2_3 = DEPOSIT_FLOOR_3 + 0.07 ether * 3;
+
+    /// @dev 79912.40 against the 79881.85 strike the fixture uses: a real, small, live-looking move.
+    uint256 internal constant SPOT = 7_991_240;
+
     function setUp() public {
         platform = new MockAgentPlatform();
         platform.setDeposit(3, DEPOSIT_FLOOR_3);
@@ -43,17 +50,22 @@ contract LucidBrainTest is Test {
     // -- pricing and request shape --------------------------------------------
 
     function test_quote_matches_formula() public view {
-        // deposit = getAdvancedRequestDeposit(size) + 0.07 STT per validator.
-        assertEq(brain.quote(), DEPOSIT_FLOOR_3 + 0.07 ether * 3);
-        assertEq(brain.quote(), 0.213 ether, "a 3-validator committee costs 0.213 STT");
+        // Each stage is getAdvancedRequestDeposit(size) plus that agent type's per-validator price.
+        assertEq(brain.quoteStage1(), STAGE1_3);
+        assertEq(brain.quoteStage1(), 0.093 ether, "three validators fetching a price");
+        assertEq(brain.quoteStage2(), STAGE2_3);
+        assertEq(brain.quoteStage2(), 0.213 ether, "three validators scoring the window");
+        assertEq(brain.quote(), 0.306 ether, "the router funds both, in one payment");
     }
 
     function test_request_reverts_when_underfunded() public {
         LucidBrain poor = new LucidBrain(owner, address(platform));
         vm.deal(owner, 1 ether);
 
+        // Both stages are checked up front. Buying a price the brain cannot then act on is the
+        // one way this contract could burn float and produce nothing.
         vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(LucidBrain.Underfunded.selector, 0.213 ether, 0.1 ether));
+        vm.expectRevert(abi.encodeWithSelector(LucidBrain.Underfunded.selector, 0.306 ether, 0.1 ether));
         poor.requestVerdict{value: 0.1 ether}(MARKET, _market(), 5000, new uint16[](0));
     }
 
@@ -69,7 +81,7 @@ contract LucidBrainTest is Test {
         assertEq(uint8(r.consensusType), uint8(IAgentRequester.ConsensusType.Threshold));
         assertEq(r.timeout, 300);
         assertEq(r.value, 0.213 ether);
-        assertEq(id, 1000);
+        assertEq(id, 1001, "the inference is the second request; the price fetch was the first");
     }
 
     function test_only_router_or_owner_can_request() public {
@@ -79,7 +91,7 @@ contract LucidBrainTest is Test {
 
         vm.prank(address(router));
         brain.requestVerdict(MARKET, _market(), 5000, new uint16[](0));
-        assertEq(platform.requestCount(), 1);
+        assertEq(platform.requestCount(), 1, "the price fetch goes out; the inference waits for it");
     }
 
     // -- the median -----------------------------------------------------------
@@ -256,8 +268,9 @@ contract LucidBrainTest is Test {
 
         // A withdrawal, not a teardown: what is left must still buy verdicts.
         _request();
-        assertEq(platform.requestCount(), 1, "the brain still works after a partial sweep");
-        assertEq(platform.lastRequest().value, 0.213 ether, "and still pays the full quote");
+        assertEq(platform.requestCount(), 2, "both stages still run after a partial sweep");
+        assertEq(platform.requestAt(0).value, 0.093 ether, "the price fetch is paid in full");
+        assertEq(platform.lastRequest().value, 0.213 ether, "and so is the inference");
     }
 
     function test_sweep_reverts_when_over_balance() public {
@@ -294,9 +307,39 @@ contract LucidBrainTest is Test {
         m.intervalSec = 300;
     }
 
+    /// @dev Runs a window all the way to a pending verdict: the price stage is requested, a
+    /// three-validator price is delivered, and the inference that price unlocks goes out. Returns
+    /// the id the verdict will arrive under, which is what every test below then answers.
     function _request() internal returns (uint256 id) {
+        uint256 priceId = _requestPrice();
+        _deliverPrices(priceId, _prices(SPOT, SPOT, SPOT), IAgentRequester.ResponseStatus.Success);
+        return platform.idAt(platform.requestCount() - 1);
+    }
+
+    /// @dev Stage one only, for tests that care about what happens before the price lands.
+    function _requestPrice() internal returns (uint256 id) {
         vm.prank(owner);
         id = brain.requestVerdict(MARKET, _market(), 5000, new uint16[](0));
+    }
+
+    function _prices(uint256 a, uint256 b, uint256 c) internal pure returns (uint256[] memory p) {
+        p = new uint256[](3);
+        (p[0], p[1], p[2]) = (a, b, c);
+    }
+
+    function _deliverPrices(uint256 id, uint256[] memory prices, IAgentRequester.ResponseStatus status) internal {
+        IAgentRequester.Response[] memory rs = new IAgentRequester.Response[](prices.length);
+        for (uint256 i; i < prices.length; ++i) {
+            rs[i] = IAgentRequester.Response({
+                validator: address(uint160(i + 1)),
+                result: abi.encode(prices[i]),
+                status: IAgentRequester.ResponseStatus.Success,
+                receipt: i + 1,
+                timestamp: block.timestamp,
+                executionCost: 0.03 ether
+            });
+        }
+        platform.deliverPrice(address(brain), id, rs, status);
     }
 
     function _scores(int256 a, int256 b, int256 c) internal pure returns (int256[] memory s) {
