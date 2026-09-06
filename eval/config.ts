@@ -38,7 +38,10 @@ interface DeployedJson {
   brain: string
   router: string
   factory: string
-  demoDesk: string
+  /** Seed desks. Older deployments named a single `demoDesk`; later ones name one per strategy. */
+  demoDesk?: string
+  deskAiEdge?: string
+  deskMaker?: string
 }
 
 export interface Deployment {
@@ -46,7 +49,11 @@ export interface Deployment {
   brain: Address
   router: Address
   factory: Address
-  demoDesk: Address
+  /**
+   * The desks named in `deployed.json`. The factory's own `DeskCreated` log is the real registry;
+   * these are only a floor, so that a desk created before the scan window still counts.
+   */
+  seedDesks: Address[]
 }
 
 export function loadDeployment(): Deployment {
@@ -60,7 +67,9 @@ export function loadDeployment(): Deployment {
     brain: parsed.brain as Address,
     router: parsed.router as Address,
     factory: parsed.factory as Address,
-    demoDesk: parsed.demoDesk as Address,
+    seedDesks: [parsed.demoDesk, parsed.deskAiEdge, parsed.deskMaker]
+      .filter((a): a is string => typeof a === 'string' && a.length > 0)
+      .map((a) => a.toLowerCase() as Address),
   }
 }
 
@@ -87,6 +96,7 @@ export const REFUSAL_NAMES = [
   'VenueRejected',
   'NoCredit',
   'InsufficientFunds',
+  'NoBook',
 ] as const
 
 export type RefusalName = (typeof REFUSAL_NAMES)[number] | 'Unknown'

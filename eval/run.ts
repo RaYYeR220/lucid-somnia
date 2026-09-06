@@ -305,7 +305,7 @@ async function main(): Promise<void> {
   )
   const desks = [
     ...new Set<Address>([
-      deployment.demoDesk.toLowerCase() as Address,
+      ...deployment.seedDesks,
       ...deskCreated.map((log) => log.args.desk.toLowerCase() as Address),
     ]),
   ]
