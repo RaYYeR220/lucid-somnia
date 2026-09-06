@@ -563,6 +563,28 @@ contract LucidDeskTest is Test {
         assertEq(usdc.approvalsBy(address(desk)), 1, "the second window re-approved the same pool");
         assertEq(outcome.operatorGrantsBy(address(desk)), 2);
     }
+
+    /// The venue has been seen finalizing markets with no outcome while its oracle was not
+    /// publishing. That is an unresolved window, not a loss: the position must stay open and the
+    /// loss streak must not move, or an upstream outage walks every desk into its own risk halt.
+    function test_settlement_with_no_outcome_leaves_the_position_open() public {
+        _drive(MARKET_A, 8800, 5000);
+
+        uint8 lossesBefore = desk.state().consecutiveLosses;
+        uint16 openBefore = desk.state().openMarkets;
+        uint256 collateralBefore = usdc.balanceOf(address(desk));
+
+        _settleSetup(0, 0, 0, 0);
+
+        vm.prank(router);
+        desk.onSettlement(_info(MARKET_A));
+
+        assertEq(desk.state().consecutiveLosses, lossesBefore, "an unresolved window is not a loss");
+        assertEq(desk.state().openMarkets, openBefore, "the position must stay open");
+        assertEq(module.redeemCount(), 0, "nothing is redeemable yet");
+        assertEq(usdc.balanceOf(address(desk)), collateralBefore, "no collateral moved");
+    }
+
 }
 
 

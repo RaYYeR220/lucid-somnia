@@ -358,6 +358,13 @@ contract LucidDesk is ILucidDesk {
         }
         if (nums.length < 2) return;
 
+        // An all-zero payout vector is not a loss, it is an unresolved window. The venue has been
+        // observed finalizing markets with no outcome while its oracle was not publishing — for
+        // about an hour, across every market of both assets, before recovering on its own. Booking
+        // that as a total loss would close a position that is still redeemable and, worse, would
+        // walk the desk into its own loss-streak halt on the back of someone else's outage.
+        if (nums[0] == 0 && nums[1] == 0) return;
+
         uint256 before = _free();
         // The winner is the argmax of the payout vector, but a VOIDED window pays both legs half,
         // so the test that matters per leg is a non-zero numerator rather than equality with the
