@@ -1,0 +1,20 @@
+{
+  "name": "lucid-eval",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Read-only, pre-registered scoring harness for the Lucid committee on Somnia Shannon.",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "eval": "tsx run.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
