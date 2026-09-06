@@ -327,12 +327,23 @@ contract LucidBrainTest is Test {
         (p[0], p[1], p[2]) = (a, b, c);
     }
 
+    /// @dev Shaped like a `getPrices` return, because that is what the default feed kind asks for:
+    /// three parallel arrays, one entry each. Three sources and a timestamp of now, so the guards
+    /// pass and these tests stay about what they are about.
+    function _oracleResult(uint256 price) internal view returns (bytes memory) {
+        uint256[] memory p = new uint256[](1);
+        uint8[] memory sources = new uint8[](1);
+        uint64[] memory updated = new uint64[](1);
+        (p[0], sources[0], updated[0]) = (price, 3, uint64(block.timestamp * 1000));
+        return abi.encode(p, sources, updated);
+    }
+
     function _deliverPrices(uint256 id, uint256[] memory prices, IAgentRequester.ResponseStatus status) internal {
         IAgentRequester.Response[] memory rs = new IAgentRequester.Response[](prices.length);
         for (uint256 i; i < prices.length; ++i) {
             rs[i] = IAgentRequester.Response({
                 validator: address(uint160(i + 1)),
-                result: abi.encode(prices[i]),
+                result: _oracleResult(prices[i]),
                 status: IAgentRequester.ResponseStatus.Success,
                 receipt: i + 1,
                 timestamp: block.timestamp,

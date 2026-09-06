@@ -21,6 +21,31 @@ interface IJsonApiAgent {
     function fetchUint(string calldata url, string calldata selector, uint8 decimals) external returns (uint256);
 }
 
+/// @notice The pre-deployed Price Oracle base agent, used only for its function selector when
+/// ABI-encoding the request payload.
+/// @dev Undocumented, and confirmed the same way `IJsonApiAgent` was: `AgentRegistry` at
+/// 0x08D1Fc808f1983d2Ea7B63a28ECD4d8C885Cd02A answers `getAgent(9911223344556677889)` on Shannon
+/// testnet (50312) with the `agents/price-oracle/...json` manifest, whose `name` is "Price Oracle"
+/// and whose ABI carries exactly the signature below. The same call on Somnia mainnet (5031)
+/// reverts with `AgentRegistry: agent not found`, which is why this is a default and not a
+/// constant the deployment is welded to — see `FeedKind` for what that buys.
+///
+/// The manifest also lists `getPricesPacked`, `getPricesSlots` and
+/// `getExchangePrice(string,string,uint8,uint64)`. Only `getPrices` is used here: the packed forms
+/// drop the source count and the timestamp, which are the two fields the guards below exist to
+/// read, and `getExchangePrice` names a single venue, which is the thing a median is for avoiding.
+interface IPriceOracleAgent {
+    /// @param symbols Trading pairs in the agent's own `BASE/QUOTE` form, e.g. `BTC/USDT`.
+    /// @param decimals Fixed-point scale the prices are returned in.
+    /// @return prices The median price across exchanges, one per requested symbol.
+    /// @return numSources How many exchanges that median was taken over.
+    /// @return lastUpdated When each median was last refreshed, as a unix timestamp in
+    /// milliseconds — the sibling `getExchangePrice` names the same field `lastUpdatedMillis`.
+    function getPrices(string[] calldata symbols, uint8 decimals)
+        external
+        returns (uint256[] memory prices, uint8[] memory numSources, uint64[] memory lastUpdated);
+}
+
 /// @notice Callback interface for a consumer of the price stage. Same shape as
 /// `IAgentConsumer.handleResponse`; a distinct selector is what keeps the two stages apart when the
 /// platform calls back.
@@ -45,7 +70,7 @@ interface IAgentPriceConsumer {
 /// question. These windows settle against the price they opened at, so the strike *is* the opening
 /// price; asking whether the close will be above the open, without saying where the price is now,
 /// has exactly one honest answer, and the live committee gave it — 50, 50, 50. Stage one therefore
-/// fetches the spot price through the JSON API Request agent, and only once that lands does stage
+/// fetches the spot price through a price agent, and only once that lands does stage
 /// two ask the LLM committee to price the window with the move-so-far in front of it. Both stages
 /// are validator consensus; nothing in this contract talks to a server the operator runs.
 contract LucidBrain is ILucidBrain, IAgentConsumer, IAgentPriceConsumer, Ownable {
@@ -56,6 +81,31 @@ contract LucidBrain is ILucidBrain, IAgentConsumer, IAgentPriceConsumer, Ownable
     /// @dev Seeds `feedAgentId`. Somnia labels Agents a prototype and reserves the right to move
     /// ids, so this is a default rather than a constant the deployment is welded to.
     uint256 public constant DEFAULT_FEED_AGENT_ID = 13174292974160097713;
+
+    /// @notice The Price Oracle base agent, as registered on Shannon testnet only.
+    /// @dev Seeds `oracleAgentId`, and is a default for a stronger reason than the one above: the
+    /// registry has no entry for this id on mainnet at all. See `FeedKind`.
+    uint256 public constant DEFAULT_ORACLE_AGENT_ID = 9911223344556677889;
+
+    /// @notice How old a Price Oracle median may be before this contract stops calling it a price.
+    /// @dev Sixty seconds, in the milliseconds the agent reports. The shortest window the venue
+    /// rolls is sixty seconds, so a median older than that describes a window that has already
+    /// closed. Tunable, because the agent's own refresh cadence is not a constant of nature.
+    uint64 public constant DEFAULT_MAX_FEED_AGE_MILLIS = 60_000;
+
+    /// @notice How many exchanges a Price Oracle median must be taken over to count as a median.
+    /// @dev Two. One exchange is not a median, it is a single venue wearing a median's name — which
+    /// is precisely the failure mode this feed exists to remove. The agent's own configuration asks
+    /// for three by default, so this floor is deliberately below it: the guard is here to catch a
+    /// degraded reading, not to second-guess the agent when it is healthy.
+    uint8 public constant DEFAULT_MIN_SOURCES = 2;
+
+    /// @notice Gas ceiling on the self-call that decodes one Price Oracle reading.
+    /// @dev A committee response is arbitrary bytes, and `abi.decode` of a dynamic array reads its
+    /// length from those bytes. A hostile length would expand memory until the frame is gone, and a
+    /// `try` that catches an out-of-gas has already lost 63/64 of what the callback needed to finish
+    /// notifying the router. Capping the call is what keeps that a discarded reading.
+    uint256 internal constant DECODE_GAS = 200_000;
 
     /// @notice The platform's reward per validator for an LLM inference, on top of its deposit floor.
     uint256 internal constant LLM_PER_AGENT_COST = 0.07 ether;
@@ -147,8 +197,17 @@ contract LucidBrain is ILucidBrain, IAgentConsumer, IAgentPriceConsumer, Ownable
     /// @notice The router that fans verdicts out to desks.
     address public router;
 
-    /// @notice The JSON API Request agent the price stage is sent to.
+    /// @notice The JSON API Request agent a `JsonApi` feed is sent to.
     uint256 public feedAgentId;
+
+    /// @notice The Price Oracle agent a `PriceOracle` feed is sent to.
+    uint256 public oracleAgentId;
+
+    /// @notice How stale a Price Oracle reading may be, in milliseconds, before it is discarded.
+    uint64 public maxFeedAgeMillis;
+
+    /// @notice How few exchanges a Price Oracle reading may rest on before it is discarded.
+    uint8 public minSources;
 
     /// @notice The committee's standing instruction.
     /// @dev Held in storage, not code, so it can be tuned by transaction. Prompt quality is the one
@@ -168,13 +227,37 @@ contract LucidBrain is ILucidBrain, IAgentConsumer, IAgentPriceConsumer, Ownable
     /// @notice How many of them must answer before the platform finalises the price request.
     uint8 public feedThreshold;
 
+    /// @notice Which committee agent an asset's spot price is fetched with.
+    ///
+    /// @dev `PriceOracle` is the default because it is a strictly better input: a median across
+    /// seven exchanges, with the source count and the refresh time attached, instead of one venue's
+    /// REST endpoint taken on faith. It also removes a failure this protocol has already had to
+    /// design around — a single venue geo-blocking part of a validator set costs a committee member
+    /// on every request, which is why the JSON feed points at Coinbase rather than Binance in the
+    /// first place. A median cannot be geo-blocked out of existence.
+    ///
+    /// @dev `JsonApi` remains because the Price Oracle agent is undocumented and, as of the
+    /// registry read above, exists on Shannon and not on mainnet. Somnia may retire it, move its
+    /// id, or ship it to mainnet under another one; none of those may be allowed to stop this
+    /// protocol pricing a window. So the better feed is the default and the documented one is one
+    /// owner transaction away, per asset, with no redeploy that would orphan a stored verdict.
+    enum FeedKind {
+        PriceOracle,
+        JsonApi
+    }
+
     /// @notice Where one asset's spot price is fetched from.
     /// @dev Storage, never a constant. DreamDEX settles these windows against its own Prophecy
-    /// Oracle, so any public exchange endpoint is a *different* price series: it can lead, lag or
-    /// simply disagree with the number the market resolves on. That basis risk is real and cannot
-    /// be engineered away here — what can be engineered is the ability to repoint the feed the hour
-    /// it starts mattering, without a redeploy that would orphan every stored verdict.
+    /// Oracle, so any external price series is a *different* one: it can lead, lag or simply
+    /// disagree with the number the market resolves on. That basis risk is real and cannot be
+    /// engineered away here — what can be engineered is the ability to repoint the feed the hour it
+    /// starts mattering, without a redeploy that would orphan every stored verdict.
+    /// @dev Both halves are kept side by side rather than in a union, so an asset can carry a live
+    /// `PriceOracle` symbol *and* an armed `JsonApi` endpoint. Falling back is then a one-field
+    /// change made in the minute it is needed, not a configuration written under pressure.
     struct Feed {
+        FeedKind kind;
+        string symbol;
         string url;
         string selector;
         uint8 decimals;
@@ -185,6 +268,12 @@ contract LucidBrain is ILucidBrain, IAgentConsumer, IAgentPriceConsumer, Ownable
     /// @dev Everything stage two needs, carried across the gap between the two callbacks. Only the
     /// three market fields the prompt actually reads are kept, plus the history tail the prompt
     /// renders, because this is written on every request and Somnia charges accordingly.
+    ///
+    /// `feedKind` and `decimals` are snapshots of the feed as it stood when the request went out,
+    /// not lookups against current storage. The owner can repoint a feed while a request is in
+    /// flight, and a `getPrices` response decoded as a bare uint — or a price rescaled by the wrong
+    /// exponent — does not fail loudly. It produces a number, and the committee prices the window
+    /// against it. The two extra bytes fit in the slot `expiry` already opened.
     struct Pending {
         bytes32 marketId;
         bytes32 assetKey;
@@ -193,6 +282,8 @@ contract LucidBrain is ILucidBrain, IAgentConsumer, IAgentPriceConsumer, Ownable
         uint64 requestedAt;
         uint32 pBookBps;
         uint8 outcomeCount;
+        FeedKind feedKind;
+        uint8 decimals;
         uint16[PENDING_OUTCOMES] outcomes;
     }
 
@@ -225,8 +316,11 @@ contract LucidBrain is ILucidBrain, IAgentConsumer, IAgentPriceConsumer, Ownable
     error ZeroAddress();
     /// @notice The sweep recipient rejected the transfer.
     error SweepFailed();
-    /// @notice A feed needs an endpoint, a selector, and a scale this contract can normalise.
+    /// @notice A feed needs whatever its kind is actually fetched with, and a scale this contract
+    /// can normalise: a symbol for `PriceOracle`, an endpoint and a selector for `JsonApi`.
     error BadFeed();
+    /// @notice A reading guard that admits everything admits a stale or single-source price.
+    error BadFeedGuard(uint64 maxAgeMillis, uint8 minSources);
 
     event VerdictRequested(
         bytes32 indexed marketId, uint256 indexed requestId, uint8 size, uint8 threshold, uint256 deposit
@@ -252,6 +346,11 @@ contract LucidBrain is ILucidBrain, IAgentConsumer, IAgentPriceConsumer, Ownable
     );
     /// @notice No usable price came back, so no verdict was bought.
     event PriceUnusable(bytes32 indexed marketId, uint256 indexed requestId);
+    /// @notice Readings the Price Oracle guards threw away, and which guard threw each one away.
+    /// @dev Emitted only when a guard actually fired. A median that quietly thinned out to one
+    /// exchange, or that stopped refreshing, is the exact degradation these guards exist to catch,
+    /// and catching it silently would leave the operator reading a healthy-looking log.
+    event PriceGuardRejected(bytes32 indexed marketId, uint256 indexed requestId, uint8 stale, uint8 thin);
     /// @notice The window was already too short to survive both stages, so nothing was spent.
     event WindowTooTight(bytes32 indexed marketId, uint256 secondsLeft, uint256 requiredSlack);
     /// @notice The price landed, but the window can no longer take the verdict stage.
@@ -268,8 +367,12 @@ contract LucidBrain is ILucidBrain, IAgentConsumer, IAgentPriceConsumer, Ownable
     event PromptUpdated(string system);
     event CommitteeUpdated(uint8 size, uint8 threshold);
     event FeedCommitteeUpdated(uint8 size, uint8 threshold);
-    event FeedUpdated(bytes32 indexed assetKey, string url, string selector, uint8 decimals);
+    event FeedUpdated(
+        bytes32 indexed assetKey, FeedKind kind, string symbol, string url, string selector, uint8 decimals
+    );
     event FeedAgentUpdated(uint256 agentId);
+    event OracleAgentUpdated(uint256 agentId);
+    event FeedGuardsUpdated(uint64 maxFeedAgeMillis, uint8 minSources);
     event RouterUpdated(address router);
     event Swept(address indexed to, uint256 amount);
 
@@ -284,17 +387,39 @@ contract LucidBrain is ILucidBrain, IAgentConsumer, IAgentPriceConsumer, Ownable
         feedCommitteeSize = 3;
         feedThreshold = 2;
         feedAgentId = DEFAULT_FEED_AGENT_ID;
+        oracleAgentId = DEFAULT_ORACLE_AGENT_ID;
+        maxFeedAgeMillis = DEFAULT_MAX_FEED_AGE_MILLIS;
+        minSources = DEFAULT_MIN_SOURCES;
         feedLatencyEma = SEED_LATENCY;
         verdictLatencyEma = SEED_LATENCY;
 
-        // Coinbase rather than the venue's own price feed, which is GraphQL over POST: the JSON API
-        // agent takes a url and a selector and nothing else, so it can only issue a plain GET and a
-        // query that must travel in a request body is unreachable to it. Coinbase over Binance
-        // because validators are spread across jurisdictions and Binance answers some of them with
-        // a geo-block, which costs a committee member on every single request. Two decimals to
-        // match the venue's strike scale.
-        _setFeed(LucidTypes.ASSET_BTC, "https://api.coinbase.com/v2/prices/BTC-USD/spot", "data.amount", 2);
-        _setFeed(LucidTypes.ASSET_ETH, "https://api.coinbase.com/v2/prices/ETH-USD/spot", "data.amount", 2);
+        // Both halves of each asset are seeded, so the fallback is armed rather than merely
+        // possible. `BTC/USDT` and `ETH/USDT` are the agent's own pair spellings, read off the
+        // token list its image ships; a symbol it does not track comes back as a reading with no
+        // sources, which the guards below discard rather than trade on.
+        //
+        // The JSON half points at Coinbase rather than the venue's own price feed, which is GraphQL
+        // over POST: the JSON API agent takes a url and a selector and nothing else, so a query that
+        // must travel in a request body is unreachable to it. Coinbase over Binance because
+        // validators are spread across jurisdictions and Binance answers some of them with a
+        // geo-block, which costs a committee member on every single request. Two decimals on both
+        // halves to match the venue's strike scale.
+        _setFeed(
+            LucidTypes.ASSET_BTC,
+            FeedKind.PriceOracle,
+            "BTC/USDT",
+            "https://api.coinbase.com/v2/prices/BTC-USD/spot",
+            "data.amount",
+            2
+        );
+        _setFeed(
+            LucidTypes.ASSET_ETH,
+            FeedKind.PriceOracle,
+            "ETH/USDT",
+            "https://api.coinbase.com/v2/prices/ETH-USD/spot",
+            "data.amount",
+            2
+        );
     }
 
     /// @notice Accepts the native-currency float the committee is paid from.
@@ -354,10 +479,32 @@ contract LucidBrain is ILucidBrain, IAgentConsumer, IAgentPriceConsumer, Ownable
 
     /// @notice The price feed configured for one asset.
     /// @param assetKey The venue's asset hash, as in `LucidTypes.ASSET_BTC`.
-    /// @return The endpoint, selector and scale stage one will fetch with. An empty url means the
-    /// asset is unconfigured, and windows on it are refused rather than priced blind.
+    /// @return The kind, symbol, endpoint, selector and scale stage one will fetch with. A feed
+    /// missing the field its own kind is fetched by is unconfigured, and windows on it are refused
+    /// rather than priced blind.
     function feedOf(bytes32 assetKey) external view returns (Feed memory) {
         return _feeds[assetKey];
+    }
+
+    /// @notice Decodes one Price Oracle reading out of a raw committee response.
+    /// @dev External, and reached only through `this.`, purely as a revert boundary: `abi.decode`
+    /// reverts on a truncated or malformed response and panics on an empty array, and inside
+    /// `handlePrice` either would take the router notification down along with the bad answer. The
+    /// `try` around this call is what turns a broken reading into a discarded one.
+    /// @param result One validator's raw `getPrices` return data.
+    /// @return price The median for the single symbol that was asked about.
+    /// @return numSources How many exchanges that median was taken over.
+    /// @return lastUpdated When it was last refreshed, as a unix timestamp in milliseconds.
+    function decodeOracleReading(bytes calldata result)
+        external
+        pure
+        returns (uint256 price, uint8 numSources, uint64 lastUpdated)
+    {
+        (uint256[] memory prices, uint8[] memory sources, uint64[] memory updated) =
+            abi.decode(result, (uint256[], uint8[], uint64[]));
+        // One symbol goes out, so one reading comes back. Anything shorter is a runner that
+        // answered without observing the pair it was asked about.
+        return (prices[0], sources[0], updated[0]);
     }
 
     /// @notice Which market a pending verdict request belongs to, or zero once it is answered.
@@ -410,7 +557,7 @@ contract LucidBrain is ILucidBrain, IAgentConsumer, IAgentPriceConsumer, Ownable
         }
 
         Feed memory f = _feeds[m.assetKey];
-        if (bytes(f.url).length == 0) {
+        if (!_configured(f)) {
             // Without a spot price the committee would be asked the unanswerable question again,
             // and would answer 50. Refusing is the honest outcome, and it is loud.
             _refuse(marketId, 0);
@@ -425,10 +572,22 @@ contract LucidBrain is ILucidBrain, IAgentConsumer, IAgentPriceConsumer, Ownable
         uint256 total = deposit + _quoteStage2();
         if (address(this).balance < total) revert Underfunded(total, address(this).balance);
 
-        bytes memory payload = abi.encodeWithSelector(IJsonApiAgent.fetchUint.selector, f.url, f.selector, f.decimals);
+        bytes memory payload;
+        uint256 agentId;
+        if (f.kind == FeedKind.PriceOracle) {
+            // One symbol per request: the brain prices one window at a time, and asking for pairs
+            // it will not read would be paying the committee to carry them.
+            string[] memory symbols = new string[](1);
+            symbols[0] = f.symbol;
+            payload = abi.encodeWithSelector(IPriceOracleAgent.getPrices.selector, symbols, f.decimals);
+            agentId = oracleAgentId;
+        } else {
+            payload = abi.encodeWithSelector(IJsonApiAgent.fetchUint.selector, f.url, f.selector, f.decimals);
+            agentId = feedAgentId;
+        }
 
         requestId = PLATFORM.createAdvancedRequest{value: deposit}(
-            feedAgentId,
+            agentId,
             address(this),
             IAgentPriceConsumer.handlePrice.selector,
             payload,
@@ -442,7 +601,7 @@ contract LucidBrain is ILucidBrain, IAgentConsumer, IAgentPriceConsumer, Ownable
             REQUEST_TIMEOUT
         );
 
-        _storePending(requestId, marketId, m, pBookBps, recentOutcomes);
+        _storePending(requestId, marketId, m, pBookBps, recentOutcomes, f);
         emit PriceRequested(marketId, requestId, m.assetKey, deposit);
     }
 
@@ -470,17 +629,16 @@ contract LucidBrain is ILucidBrain, IAgentConsumer, IAgentPriceConsumer, Ownable
 
         feedLatencyEma = _observe(1, feedLatencyEma, p.requestedAt);
 
-        uint256[] memory prices;
-        uint256 spot;
-        uint8 used;
+        PriceTally memory t;
         if (status == IAgentRequester.ResponseStatus.Success) {
-            (prices, spot, used) = _tallyPrices(responses, p.assetKey, p.strike);
+            t = _tallyPrices(responses, p);
         } else {
-            prices = new uint256[](0);
+            t.prices = new uint256[](0);
         }
-        emit PriceReceived(p.marketId, requestId, spot, used, prices);
+        emit PriceReceived(p.marketId, requestId, t.median, t.used, t.prices);
+        if (t.stale != 0 || t.thin != 0) emit PriceGuardRejected(p.marketId, requestId, t.stale, t.thin);
 
-        if (spot == 0) {
+        if (t.median == 0) {
             _refuse(p.marketId, requestId);
             emit PriceUnusable(p.marketId, requestId);
             return;
@@ -507,7 +665,7 @@ contract LucidBrain is ILucidBrain, IAgentConsumer, IAgentPriceConsumer, Ownable
             return;
         }
 
-        _requestInference(p, spot, deposit);
+        _requestInference(p, t.median, deposit);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -602,28 +760,63 @@ contract LucidBrain is ILucidBrain, IAgentConsumer, IAgentPriceConsumer, Ownable
         emit FeedCommitteeUpdated(size, threshold);
     }
 
-    /// @notice Point one asset at a price endpoint.
-    /// @dev The endpoint is fetched by the validator set, not by this contract, so it must answer a
-    /// plain unauthenticated GET with JSON. See `Feed` for why this is repointable rather than
-    /// fixed: the settlement oracle is the venue's own, and every external feed is a basis bet.
+    /// @notice Point one asset at a price source, and choose which agent reads it.
+    /// @dev Both halves of the feed are written together, so the fallback stays armed: switching an
+    /// asset from `PriceOracle` to `JsonApi` is then a repeat of this call with a different kind
+    /// rather than an endpoint chosen under pressure. The JSON endpoint is fetched by the validator
+    /// set, not by this contract, so it must answer a plain unauthenticated GET with JSON. See
+    /// `FeedKind` for why the undocumented agent is the default, and `Feed` for why any of this is
+    /// repointable rather than fixed.
     /// @param assetKey The venue's asset hash, as in `LucidTypes.ASSET_BTC`.
+    /// @param kind Which agent stage one asks. `PriceOracle` needs `symbol`; `JsonApi` needs `url`
+    /// and `selector`.
+    /// @param symbol The Price Oracle pair, in the agent's own `BASE/QUOTE` form, e.g. `BTC/USDT`.
     /// @param url The endpoint the JSON API agent fetches.
     /// @param selector Dot-notation path to the price inside the response, e.g. `data.amount`.
     /// @param decimals Fixed-point scale the agent should return the value in.
-    function setFeed(bytes32 assetKey, string calldata url, string calldata selector, uint8 decimals)
-        external
-        onlyOwner
-    {
-        _setFeed(assetKey, url, selector, decimals);
+    function setFeed(
+        bytes32 assetKey,
+        FeedKind kind,
+        string calldata symbol,
+        string calldata url,
+        string calldata selector,
+        uint8 decimals
+    ) external onlyOwner {
+        _setFeed(assetKey, kind, symbol, url, selector, decimals);
     }
 
     /// @notice Point the price stage at a different JSON API agent.
     /// @dev Somnia calls the agent platform a prototype and does not guarantee ids across releases.
     /// A wrong id costs a deposit and a timeout, not a redeploy.
-    /// @param agentId The registered agent id to invoke for price fetches.
+    /// @param agentId The registered agent id to invoke for `JsonApi` feeds.
     function setFeedAgent(uint256 agentId) external onlyOwner {
         feedAgentId = agentId;
         emit FeedAgentUpdated(agentId);
+    }
+
+    /// @notice Point the price stage at a different Price Oracle agent.
+    /// @dev Separate from `setFeedAgent` because the two agents answer in different shapes, and one
+    /// setter for both would let an operator repoint a `PriceOracle` feed at the JSON agent with a
+    /// single mistyped id. The registry lists this agent on Shannon and not on mainnet, so a
+    /// mainnet deployment is expected to arrive here — or at `setFeed` with `JsonApi`.
+    /// @param agentId The registered agent id to invoke for `PriceOracle` feeds.
+    function setOracleAgent(uint256 agentId) external onlyOwner {
+        oracleAgentId = agentId;
+        emit OracleAgentUpdated(agentId);
+    }
+
+    /// @notice Tune what counts as a usable Price Oracle reading.
+    /// @dev Read live rather than snapshotted onto the request, unlike the feed kind: the kind
+    /// decides how bytes are *interpreted* and must match the request that produced them, while
+    /// these two decide what this protocol is willing to *trade on*, and tightening them should
+    /// take effect on the answer already in flight.
+    /// @param maxAgeMillis How old a median may be, in milliseconds. Zero would admit anything.
+    /// @param minSources_ How many exchanges it must rest on. Zero would admit a reading with none.
+    function setFeedGuards(uint64 maxAgeMillis, uint8 minSources_) external onlyOwner {
+        if (maxAgeMillis == 0 || minSources_ == 0) revert BadFeedGuard(maxAgeMillis, minSources_);
+        maxFeedAgeMillis = maxAgeMillis;
+        minSources = minSources_;
+        emit FeedGuardsUpdated(maxAgeMillis, minSources_);
     }
 
     /// @notice Point the brain at the router that owns desk fan-out.
@@ -666,12 +859,27 @@ contract LucidBrain is ILucidBrain, IAgentConsumer, IAgentPriceConsumer, Ownable
         return PLATFORM.getAdvancedRequestDeposit(size) + LLM_PER_AGENT_COST * size;
     }
 
-    function _setFeed(bytes32 assetKey, string memory url, string memory selector, uint8 decimals) internal {
-        // An eighteen-decimal ceiling keeps the rescale below from ever overflowing, and an empty
-        // url is how an unconfigured asset is recognised, so it cannot also be a valid setting.
-        if (bytes(url).length == 0 || bytes(selector).length == 0 || decimals > 18) revert BadFeed();
-        _feeds[assetKey] = Feed({url: url, selector: selector, decimals: decimals});
-        emit FeedUpdated(assetKey, url, selector, decimals);
+    function _setFeed(
+        bytes32 assetKey,
+        FeedKind kind,
+        string memory symbol,
+        string memory url,
+        string memory selector,
+        uint8 decimals
+    ) internal {
+        // An eighteen-decimal ceiling keeps the rescale below from ever overflowing.
+        if (decimals > 18) revert BadFeed();
+        // Each kind is validated on the field it is fetched by, and only that field, because the
+        // other half is an armed fallback rather than a requirement. A missing field is how an
+        // unconfigured asset is recognised, so it cannot also be a valid setting.
+        if (kind == FeedKind.PriceOracle) {
+            if (bytes(symbol).length == 0) revert BadFeed();
+        } else if (bytes(url).length == 0 || bytes(selector).length == 0) {
+            revert BadFeed();
+        }
+
+        _feeds[assetKey] = Feed({kind: kind, symbol: symbol, url: url, selector: selector, decimals: decimals});
+        emit FeedUpdated(assetKey, kind, symbol, url, selector, decimals);
     }
 
     /// @dev Records the context stage two will be built from. The prompt reads three market fields
@@ -683,7 +891,8 @@ contract LucidBrain is ILucidBrain, IAgentConsumer, IAgentPriceConsumer, Ownable
         bytes32 marketId,
         LucidTypes.MarketInfo calldata m,
         uint256 pBookBps,
-        uint16[] calldata recentOutcomes
+        uint16[] calldata recentOutcomes,
+        Feed memory f
     ) internal {
         Pending storage p = _pendingPrice[requestId];
         p.marketId = marketId;
@@ -691,6 +900,11 @@ contract LucidBrain is ILucidBrain, IAgentConsumer, IAgentPriceConsumer, Ownable
         p.strike = m.strike;
         p.expiry = m.expiry;
         p.requestedAt = uint64(block.timestamp);
+        // The shape the answer will arrive in, fixed now. Reading it back off storage in the
+        // callback would let a mid-flight repoint decide how a response already in flight is
+        // decoded, and both wrong readings that produces look exactly like prices.
+        p.feedKind = f.kind;
+        p.decimals = f.decimals;
         // Clamped on the way in rather than on the way out, so the stored fact is the one the
         // committee will be shown and a bad book reading cannot widen a storage slot.
         p.pBookBps = uint32(pBookBps > LucidTypes.BPS ? LucidTypes.BPS : pBookBps);
@@ -780,48 +994,129 @@ contract LucidBrain is ILucidBrain, IAgentConsumer, IAgentPriceConsumer, Ownable
     }
 
     /// @dev Reduces the raw price readings to a median, normalised to the venue's hundredths scale.
-    /// `used` counts the readings that survived; a zero median means none did.
-    function _tallyPrices(IAgentRequester.Response[] memory responses, bytes32 assetKey, uint256 strike)
+    /// `used` counts the readings that survived; a zero median means none did, and the caller turns
+    /// that into a refusal rather than into a guess.
+    ///
+    /// The kind and the scale come off the pending request, never off `_feeds`: the owner may have
+    /// repointed the asset since this request went out, and decoding a `getPrices` response as a
+    /// bare uint would not fail — it would produce a number.
+    ///
+    /// `stale` and `thin` count the readings the Price Oracle guards discarded, so the caller can
+    /// say which guard fired rather than reporting a thinner median as if it were the whole thing.
+    function _tallyPrices(IAgentRequester.Response[] memory responses, Pending memory p)
         internal
         view
-        returns (uint256[] memory prices, uint256 median, uint8 used)
+        returns (PriceTally memory t)
     {
-        uint8 decimals = _feeds[assetKey].decimals;
-        uint256 n = responses.length;
-        uint256[] memory raw = new uint256[](n);
-        uint256[] memory usable = new uint256[](n);
+        uint256[] memory raw = new uint256[](responses.length);
+        uint256[] memory usable = new uint256[](responses.length);
         uint256 rawCount;
         uint256 usableCount;
 
         // The window opened at the strike, so the strike is the only reference this contract has
         // for what a plausible price looks like right now, and it is a good one.
-        uint256 low = strike / PRICE_SANITY_MULTIPLE;
-        uint256 high = strike * PRICE_SANITY_MULTIPLE;
+        uint256 low = p.strike / PRICE_SANITY_MULTIPLE;
+        uint256 high = p.strike * PRICE_SANITY_MULTIPLE;
 
-        for (uint256 i; i < n; ++i) {
+        for (uint256 i; i < responses.length; ++i) {
             if (responses[i].status != IAgentRequester.ResponseStatus.Success) continue;
-            // Anything shorter than a word cannot hold a uint256 and would revert the decode,
-            // taking the whole callback and the router notification down with it.
-            if (responses[i].result.length < 32) continue;
 
-            uint256 value = abi.decode(responses[i].result, (uint256));
+            uint256 value;
+            if (p.feedKind == FeedKind.PriceOracle) {
+                Reading memory r = _readOracle(responses[i].result);
+                if (r.isStale) ++t.stale;
+                if (r.isThin) ++t.thin;
+                if (!r.ok) continue;
+                value = r.value;
+            } else {
+                // Anything shorter than a word cannot hold a uint256 and would revert the decode,
+                // taking the whole callback and the router notification down with it.
+                if (responses[i].result.length < 32) continue;
+                value = abi.decode(responses[i].result, (uint256));
+            }
+
             if (value > MAX_RAW_PRICE) continue;
 
-            value = _toHundredths(value, decimals);
+            value = _toHundredths(value, p.decimals);
             raw[rawCount++] = value;
             if (value == 0 || value < low || value > high) continue;
             usable[usableCount++] = value;
         }
 
-        prices = new uint256[](rawCount);
+        t.prices = new uint256[](rawCount);
         for (uint256 i; i < rawCount; ++i) {
-            prices[i] = raw[i];
+            t.prices[i] = raw[i];
         }
 
-        if (usableCount == 0) return (prices, 0, 0);
+        if (usableCount == 0) return t;
 
-        used = uint8(usableCount);
-        median = _medianUint(usable, usableCount);
+        t.used = uint8(usableCount);
+        t.median = _medianUint(usable, usableCount);
+    }
+
+    /// @dev One validator's Price Oracle response, decoded and judged.
+    ///
+    /// A median is only worth preferring to a single endpoint while it is still a median of
+    /// something recent. Both guards are therefore hard rejections rather than warnings: a reading
+    /// that fails one is discarded exactly like a zero, and if every reading is discarded the
+    /// caller refuses the window through the zero-spend path instead of trading on a guess.
+    ///
+    /// @dev The whole reduction of one price committee. A struct rather than a tuple because the
+    /// EVM's stack will not hold this many live values at once without `via_ir`, which this
+    /// project does not compile with.
+    /// @param prices Every reading that decoded, on the venue's scale, discarded ones included.
+    /// @param median The consensus price, or zero when nothing survived.
+    /// @param used How many readings the median was taken over.
+    /// @param stale How many readings the age guard threw away.
+    /// @param thin How many readings the source-count guard threw away.
+    struct PriceTally {
+        uint256[] prices;
+        uint256 median;
+        uint8 used;
+        uint8 stale;
+        uint8 thin;
+    }
+
+    /// @dev Returned as a struct rather than as four values, for the same reason as `PriceTally`.
+    /// @param value The raw median, still on the feed's own scale.
+    /// @param ok Whether the reading survived decoding and both guards.
+    /// @param isStale Whether it was thrown away for age.
+    /// @param isThin Whether it was thrown away for resting on too few exchanges.
+    struct Reading {
+        uint256 value;
+        bool ok;
+        bool isStale;
+        bool isThin;
+    }
+
+    function _readOracle(bytes memory result) internal view returns (Reading memory r) {
+        uint256 sources;
+        uint256 lastUpdated;
+        // Gas-capped, and through `this.` rather than inline, so a malformed or hostile response
+        // costs a discarded reading instead of the whole callback. See `DECODE_GAS`.
+        try this.decodeOracleReading{gas: DECODE_GAS}(result) returns (uint256 price, uint8 n, uint64 updated) {
+            (r.value, sources, lastUpdated) = (price, n, updated);
+        } catch {
+            return Reading({value: 0, ok: false, isStale: false, isThin: false});
+        }
+
+        if (sources < minSources) return Reading({value: 0, ok: false, isStale: false, isThin: true});
+
+        // The agent reports milliseconds. A reading stamped in the future is a clock the chain
+        // cannot arbitrate, so it is treated as fresh rather than as evidence of anything — the
+        // guard exists to catch a feed that stopped, not to referee two clocks.
+        uint256 nowMillis = block.timestamp * 1000;
+        if (nowMillis > lastUpdated && nowMillis - lastUpdated > maxFeedAgeMillis) {
+            return Reading({value: 0, ok: false, isStale: true, isThin: false});
+        }
+
+        r.ok = true;
+    }
+
+    /// @dev Whether a feed carries the one field its own kind is actually fetched by. An asset
+    /// whose feed does not is refused rather than priced blind.
+    function _configured(Feed memory f) internal pure returns (bool) {
+        return f.kind == FeedKind.PriceOracle ? bytes(f.symbol).length != 0 : bytes(f.url).length != 0;
     }
 
     /// @dev Puts a fetched price on the venue's scale. The strike arrives in hundredths of a dollar

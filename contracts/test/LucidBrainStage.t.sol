@@ -3,7 +3,7 @@ pragma solidity 0.8.30;
 
 import {Test} from "forge-std/Test.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {LucidBrain, IJsonApiAgent, IAgentPriceConsumer} from "../src/LucidBrain.sol";
+import {LucidBrain, IJsonApiAgent, IPriceOracleAgent, IAgentPriceConsumer} from "../src/LucidBrain.sol";
 import {IAgentRequester, IAgentConsumer, ILLMInferenceAgent} from "../src/interfaces/IAgentRequester.sol";
 import {LucidTypes} from "../src/types/LucidTypes.sol";
 import {PromptLib} from "../src/lib/PromptLib.sol";
@@ -65,7 +65,8 @@ contract LucidBrainStageTest is Test {
         assertEq(platform.requestCount(), 1, "one request, not two: the inference has nothing to say yet");
 
         MockAgentPlatform.Recorded memory r = platform.requestAt(0);
-        assertEq(r.agentId, brain.DEFAULT_FEED_AGENT_ID(), "the JSON API Request base agent");
+        assertEq(r.agentId, brain.DEFAULT_ORACLE_AGENT_ID(), "the Price Oracle base agent");
+        assertEq(r.agentId, 9911223344556677889, "the id the registry answers to on Shannon");
         assertEq(r.callbackAddress, address(brain));
         assertEq(r.callbackSelector, IAgentPriceConsumer.handlePrice.selector, "its own callback, not the verdict one");
         assertEq(r.subcommitteeSize, 3);
@@ -74,12 +75,45 @@ contract LucidBrainStageTest is Test {
         assertEq(r.value, STAGE1, "a fetch is priced under an inference");
         assertEq(brain.marketOfPriceRequest(priceId), MARKET);
 
-        // And the payload really is fetchUint(url, selector, decimals).
-        assertEq(_selectorOf(r.payload), IJsonApiAgent.fetchUint.selector);
-        (string memory url, string memory sel, uint8 decimals) = abi.decode(_args(r.payload), (string, string, uint8));
-        assertEq(url, "https://api.coinbase.com/v2/prices/BTC-USD/spot");
-        assertEq(sel, "data.amount");
+        // And the payload really is getPrices(symbols, decimals), carrying the configured symbol.
+        assertEq(_selectorOf(r.payload), IPriceOracleAgent.getPrices.selector);
+        (string[] memory symbols, uint8 decimals) = abi.decode(_args(r.payload), (string[], uint8));
+        assertEq(symbols.length, 1, "one window, one symbol");
+        assertEq(symbols[0], "BTC/USDT", "the agent's own pair spelling, off its token list");
         assertEq(decimals, 2, "the venue publishes strikes in hundredths");
+    }
+
+    function test_the_default_feed_kind_is_the_price_oracle_with_the_json_fallback_armed() public view {
+        LucidBrain.Feed memory btc = brain.feedOf(LucidTypes.ASSET_BTC);
+        assertEq(uint8(btc.kind), uint8(LucidBrain.FeedKind.PriceOracle), "a median beats one venue's endpoint");
+        assertEq(btc.symbol, "BTC/USDT");
+        assertEq(btc.decimals, 2);
+        // The documented agent stays configured, so falling back is one owner call and not a
+        // decision about which endpoint to trust made in the middle of an outage.
+        assertEq(btc.url, "https://api.coinbase.com/v2/prices/BTC-USD/spot", "the fallback is armed, not absent");
+        assertEq(btc.selector, "data.amount");
+
+        LucidBrain.Feed memory eth = brain.feedOf(LucidTypes.ASSET_ETH);
+        assertEq(uint8(eth.kind), uint8(LucidBrain.FeedKind.PriceOracle));
+        assertEq(eth.symbol, "ETH/USDT");
+
+        assertEq(brain.oracleAgentId(), 9911223344556677889, "testnet-only, so a default and not a constant");
+        assertEq(brain.feedAgentId(), 13174292974160097713, "the documented agent the fallback uses");
+        assertEq(brain.maxFeedAgeMillis(), 60_000, "a median older than the shortest window is not a price");
+        assertEq(brain.minSources(), 2, "one exchange is not a median");
+    }
+
+    function test_a_getPrices_response_is_decoded_and_element_zero_is_the_price() public {
+        uint256 priceId = _requestPrice(_market(start + 900));
+
+        // Three validators, each answering in the agent's three-array shape.
+        _deliverPrices(priceId, _three(7_991_000, 7_991_240, 7_991_500));
+
+        assertEq(platform.requestCount(), 2, "the inference goes out on the back of the median");
+        assertTrue(
+            _contains(_promptOf(platform.lastRequest().payload), "Spot: 79912.40"),
+            "the middle reading, taken out of element 0 of the arrays"
+        );
     }
 
     function test_stage_two_fires_only_once_the_price_has_landed() public {
@@ -176,6 +210,203 @@ contract LucidBrainStageTest is Test {
         assertEq(platform.requestCount(), 1, "good-looking numbers under a failed status are not evidence");
         assertFalse(brain.verdictOf(MARKET).ok);
         assertEq(router.calls(), 1);
+    }
+
+    // ── the price-oracle guards ───────────────────────────────────────────────
+
+    function test_a_stale_reading_is_discarded_like_a_zero() public {
+        vm.prank(owner);
+        brain.setFeedCommittee(5, 3);
+
+        uint256 priceId = _requestPrice(_market(start + 900));
+
+        uint64 nowMillis = uint64(block.timestamp * 1000);
+        bytes[] memory results = new bytes[](5);
+        // Three medians refreshed a moment ago, and two that stopped refreshing minutes back. The
+        // stale pair would drag the median if age were merely noted rather than acted on.
+        results[0] = _oracleResult(7_991_000, 3, nowMillis - 1_000);
+        results[1] = _oracleResult(7_000_000, 3, nowMillis - 60_001);
+        results[2] = _oracleResult(7_991_240, 3, nowMillis);
+        results[3] = _oracleResult(9_000_000, 3, nowMillis - 600_000);
+        results[4] = _oracleResult(7_991_500, 3, nowMillis - 59_000);
+
+        vm.expectEmit(true, true, false, true, address(brain));
+        emit LucidBrain.PriceGuardRejected(MARKET, priceId, 2, 0);
+        _deliverRawPrices(priceId, results);
+
+        assertTrue(
+            _contains(_promptOf(platform.lastRequest().payload), "Spot: 79912.40"),
+            "the median of the three that were still refreshing"
+        );
+    }
+
+    function test_a_reading_from_too_few_exchanges_is_discarded_like_a_zero() public {
+        vm.prank(owner);
+        brain.setFeedCommittee(5, 3);
+
+        uint256 priceId = _requestPrice(_market(start + 900));
+
+        uint64 nowMillis = uint64(block.timestamp * 1000);
+        bytes[] memory results = new bytes[](5);
+        // A "median" over one exchange is that exchange, and over none it is nothing at all.
+        results[0] = _oracleResult(7_991_000, 3, nowMillis);
+        results[1] = _oracleResult(7_000_000, 1, nowMillis);
+        results[2] = _oracleResult(7_991_240, 2, nowMillis);
+        results[3] = _oracleResult(9_000_000, 0, nowMillis);
+        results[4] = _oracleResult(7_991_500, 7, nowMillis);
+
+        vm.expectEmit(true, true, false, true, address(brain));
+        emit LucidBrain.PriceGuardRejected(MARKET, priceId, 0, 2);
+        _deliverRawPrices(priceId, results);
+
+        assertTrue(
+            _contains(_promptOf(platform.lastRequest().payload), "Spot: 79912.40"),
+            "the median of the readings that were actually medians"
+        );
+    }
+
+    function test_when_every_reading_is_rejected_the_brain_refuses_and_spends_nothing() public {
+        uint256 priceId = _requestPrice(_market(start + 900));
+        uint256 floatBefore = address(brain).balance;
+
+        uint64 nowMillis = uint64(block.timestamp * 1000);
+        bytes[] memory results = new bytes[](3);
+        results[0] = _oracleResult(SPOT, 3, nowMillis - 120_000); // stale
+        results[1] = _oracleResult(SPOT, 1, nowMillis); // thin
+        results[2] = _oracleResult(SPOT, 0, nowMillis - 90_000); // both
+
+        vm.expectEmit(true, true, false, false, address(brain));
+        emit LucidBrain.PriceUnusable(MARKET, priceId);
+        _deliverRawPrices(priceId, results);
+
+        assertEq(platform.requestCount(), 1, "a degraded median is not a price worth an inference");
+        assertEq(address(brain).balance, floatBefore, "and nothing was spent trying");
+        assertFalse(brain.verdictOf(MARKET).ok, "the zero-spend refusal, not a guess");
+        assertEq(router.calls(), 1, "and the desk is still told");
+    }
+
+    /// @dev The guards are the whole reason this feed is safe to prefer, so a response the agent
+    /// could not have produced must not reach the median either. Every one of these decodes to
+    /// nothing usable, and none of them may revert the callback.
+    function test_a_malformed_oracle_response_is_discarded_rather_than_fatal() public {
+        vm.prank(owner);
+        brain.setFeedCommittee(5, 3);
+
+        uint256 priceId = _requestPrice(_market(start + 900));
+
+        bytes[] memory results = new bytes[](5);
+        results[0] = "";
+        results[1] = abi.encode(uint256(7_991_240)); // the JsonApi shape, on the oracle path
+        results[2] = _freshOracleResult(7_991_240);
+        results[3] = abi.encode(new uint256[](0), new uint8[](0), new uint64[](0));
+        results[4] = hex"deadbeef";
+
+        _deliverRawPrices(priceId, results);
+
+        assertEq(platform.requestCount(), 2, "the one honest reading still bought the inference");
+        assertTrue(_contains(_promptOf(platform.lastRequest().payload), "Spot: 79912.40"));
+        assertEq(router.calls(), 0, "nothing refused, so nothing to announce yet");
+    }
+
+    function test_the_guards_are_owner_only_and_must_admit_less_than_everything() public {
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        brain.setFeedGuards(1, 1);
+
+        vm.startPrank(owner);
+        // A zero age bound or a zero source floor is a guard that admits the thing it exists to
+        // catch, which is worse than no guard at all because it reads as one.
+        vm.expectRevert(abi.encodeWithSelector(LucidBrain.BadFeedGuard.selector, uint64(0), uint8(2)));
+        brain.setFeedGuards(0, 2);
+
+        vm.expectRevert(abi.encodeWithSelector(LucidBrain.BadFeedGuard.selector, uint64(60_000), uint8(0)));
+        brain.setFeedGuards(60_000, 0);
+
+        brain.setFeedGuards(5_000, 4);
+        vm.stopPrank();
+
+        assertEq(brain.maxFeedAgeMillis(), 5_000);
+        assertEq(brain.minSources(), 4);
+
+        // And a tightened floor is applied to the next answer, not merely recorded.
+        uint256 priceId = _requestPrice(_market(start + 900));
+        bytes[] memory results = new bytes[](3);
+        for (uint256 i; i < 3; ++i) {
+            results[i] = _oracleResult(SPOT, 3, uint64(block.timestamp * 1000));
+        }
+        _deliverRawPrices(priceId, results);
+
+        assertEq(platform.requestCount(), 1, "three sources no longer clears a floor of four");
+        assertFalse(brain.verdictOf(MARKET).ok);
+    }
+
+    // ── the two kinds ─────────────────────────────────────────────────────────
+
+    function test_a_json_api_feed_still_works_end_to_end() public {
+        _useJsonFeed(
+            LucidTypes.ASSET_BTC, "BTC/USDT", "https://api.coinbase.com/v2/prices/BTC-USD/spot", "data.amount", 2
+        );
+
+        uint256 priceId = _requestPrice(_market(start + 900));
+
+        MockAgentPlatform.Recorded memory r = platform.requestAt(0);
+        assertEq(r.agentId, brain.DEFAULT_FEED_AGENT_ID(), "the documented JSON API Request agent");
+        assertEq(_selectorOf(r.payload), IJsonApiAgent.fetchUint.selector);
+
+        _deliverJsonPrices(priceId, _three(7_991_000, 7_991_240, 7_991_500));
+
+        assertEq(platform.requestCount(), 2, "and the inference follows exactly as before");
+        assertTrue(_contains(_promptOf(platform.lastRequest().payload), "Spot: 79912.40"));
+
+        _deliverScores(platform.idAt(platform.requestCount() - 1), _threeScores(70, 72, 74));
+        LucidTypes.Verdict memory v = brain.verdictOf(MARKET);
+        assertTrue(v.ok, "the fallback produces a tradeable verdict, not a degraded one");
+        assertEq(v.probUpBps, 7200);
+    }
+
+    /// @dev The owner may repoint a feed while a request is in flight, and the two kinds answer in
+    /// shapes that are not merely different — they are silently compatible in the wrong direction.
+    /// A `getPrices` response read as a bare uint decodes to the head of its own ABI offset table,
+    /// which is a number, and the committee would then be shown it as a price. So the decoder reads
+    /// the kind off the request, never off storage.
+    function test_the_kind_is_read_from_the_request_not_from_storage() public {
+        // Out under the oracle kind.
+        uint256 priceId = _requestPrice(_market(start + 900));
+        assertEq(_selectorOf(platform.requestAt(0).payload), IPriceOracleAgent.getPrices.selector);
+
+        // Repointed mid-flight to the JSON fallback.
+        _useJsonFeed(
+            LucidTypes.ASSET_BTC, "BTC/USDT", "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", "price", 8
+        );
+        assertEq(uint8(brain.feedOf(LucidTypes.ASSET_BTC).kind), uint8(LucidBrain.FeedKind.JsonApi), "storage moved");
+
+        // The answer that comes back is still an oracle answer, and is still read as one — at the
+        // scale the request went out with, not the eight the new feed declares.
+        _deliverPrices(priceId, _three(7_991_000, 7_991_240, 7_991_500));
+
+        assertEq(platform.requestCount(), 2, "the reply to the request that was actually made");
+        assertTrue(
+            _contains(_promptOf(platform.lastRequest().payload), "Spot: 79912.40"),
+            "decoded as getPrices at two decimals, which is what was asked for"
+        );
+    }
+
+    /// @dev The mirror image: a JSON request answered after the owner flipped the asset to the
+    /// oracle. A bare uint256 is not a valid `getPrices` return, so reading it under the new kind
+    /// would discard every reading and refuse a window that had a perfectly good price.
+    function test_a_json_request_survives_a_repoint_to_the_oracle() public {
+        _useJsonFeed(
+            LucidTypes.ASSET_BTC, "BTC/USDT", "https://api.coinbase.com/v2/prices/BTC-USD/spot", "data.amount", 2
+        );
+        uint256 priceId = _requestPrice(_market(start + 900));
+
+        vm.prank(owner);
+        brain.setFeed(LucidTypes.ASSET_BTC, LucidBrain.FeedKind.PriceOracle, "BTC/USDT", "", "", 2);
+
+        _deliverJsonPrices(priceId, _three(7_991_000, 7_991_240, 7_991_500));
+
+        assertEq(platform.requestCount(), 2, "the price it fetched is still a price");
+        assertTrue(_contains(_promptOf(platform.lastRequest().payload), "Spot: 79912.40"));
     }
 
     // ── the deadline guard ────────────────────────────────────────────────────
@@ -385,15 +616,19 @@ contract LucidBrainStageTest is Test {
     // ── feeds ─────────────────────────────────────────────────────────────────
 
     function test_a_feed_can_be_repointed_by_the_owner() public {
-        vm.prank(owner);
-        brain.setFeed(LucidTypes.ASSET_BTC, "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", "price", 8);
+        _useJsonFeed(
+            LucidTypes.ASSET_BTC, "BTC/USDT", "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", "price", 8
+        );
 
         LucidBrain.Feed memory f = brain.feedOf(LucidTypes.ASSET_BTC);
+        assertEq(uint8(f.kind), uint8(LucidBrain.FeedKind.JsonApi));
         assertEq(f.url, "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT");
         assertEq(f.selector, "price");
         assertEq(f.decimals, 8);
 
         _requestPrice(_market(start + 900));
+        assertEq(platform.requestAt(0).agentId, brain.feedAgentId(), "and the JSON agent is who gets asked");
+        assertEq(_selectorOf(platform.requestAt(0).payload), IJsonApiAgent.fetchUint.selector);
         (string memory url, string memory sel, uint8 decimals) =
             abi.decode(_args(platform.requestAt(0).payload), (string, string, uint8));
         assertEq(url, "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", "the committee fetches the new one");
@@ -404,55 +639,101 @@ contract LucidBrainStageTest is Test {
     function test_only_the_owner_can_repoint_a_feed() public {
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
-        brain.setFeed(LucidTypes.ASSET_BTC, "https://evil.example/price", "p", 2);
+        brain.setFeed(LucidTypes.ASSET_BTC, LucidBrain.FeedKind.JsonApi, "", "https://evil.example/price", "p", 2);
 
-        assertEq(
-            brain.feedOf(LucidTypes.ASSET_BTC).url,
-            "https://api.coinbase.com/v2/prices/BTC-USD/spot",
-            "the feed every verdict is built on is not open to the street"
-        );
+        LucidBrain.Feed memory f = brain.feedOf(LucidTypes.ASSET_BTC);
+        assertEq(uint8(f.kind), uint8(LucidBrain.FeedKind.PriceOracle), "the kind is not open to the street either");
+        assertEq(f.symbol, "BTC/USDT", "the feed every verdict is built on is not open to the street");
+        assertEq(f.url, "https://api.coinbase.com/v2/prices/BTC-USD/spot");
     }
 
     function test_feeds_are_per_asset() public {
-        assertEq(brain.feedOf(LucidTypes.ASSET_ETH).url, "https://api.coinbase.com/v2/prices/ETH-USD/spot");
+        assertEq(brain.feedOf(LucidTypes.ASSET_ETH).symbol, "ETH/USDT");
 
         vm.prank(owner);
-        brain.setFeed(LucidTypes.ASSET_ETH, "https://api.coinbase.com/v2/prices/ETH-USD/buy", "data.amount", 2);
-
-        assertEq(brain.feedOf(LucidTypes.ASSET_ETH).url, "https://api.coinbase.com/v2/prices/ETH-USD/buy");
-        assertEq(
-            brain.feedOf(LucidTypes.ASSET_BTC).url,
-            "https://api.coinbase.com/v2/prices/BTC-USD/spot",
-            "repointing one asset does not touch another"
+        brain.setFeed(
+            LucidTypes.ASSET_ETH,
+            LucidBrain.FeedKind.PriceOracle,
+            "ETH/USDC",
+            "https://api.coinbase.com/v2/prices/ETH-USD/buy",
+            "data.amount",
+            2
         );
+
+        assertEq(brain.feedOf(LucidTypes.ASSET_ETH).symbol, "ETH/USDC");
+        assertEq(brain.feedOf(LucidTypes.ASSET_ETH).url, "https://api.coinbase.com/v2/prices/ETH-USD/buy");
+        assertEq(brain.feedOf(LucidTypes.ASSET_BTC).symbol, "BTC/USDT", "repointing one asset does not touch another");
     }
 
-    function test_a_feed_must_be_usable() public {
+    /// @dev Each kind is validated against the one field it is actually fetched by, because the
+    /// other half is an armed fallback rather than a requirement. Setting an oracle feed with no
+    /// symbol, or a JSON feed with no endpoint, would leave the asset silently unpriceable.
+    function test_a_feed_must_be_usable_for_the_kind_it_declares() public {
         vm.startPrank(owner);
+
+        // A PriceOracle feed with no symbol has nothing to ask the agent about.
         vm.expectRevert(LucidBrain.BadFeed.selector);
-        brain.setFeed(LucidTypes.ASSET_BTC, "", "data.amount", 2);
+        brain.setFeed(
+            LucidTypes.ASSET_BTC,
+            LucidBrain.FeedKind.PriceOracle,
+            "",
+            "https://api.coinbase.com/v2/prices/BTC-USD/spot",
+            "data.amount",
+            2
+        );
+
+        // A JsonApi feed needs both halves of a fetch, and having a symbol does not substitute.
+        vm.expectRevert(LucidBrain.BadFeed.selector);
+        brain.setFeed(LucidTypes.ASSET_BTC, LucidBrain.FeedKind.JsonApi, "BTC/USDT", "", "data.amount", 2);
 
         vm.expectRevert(LucidBrain.BadFeed.selector);
-        brain.setFeed(LucidTypes.ASSET_BTC, "https://api.coinbase.com/v2/prices/BTC-USD/spot", "", 2);
+        brain.setFeed(
+            LucidTypes.ASSET_BTC,
+            LucidBrain.FeedKind.JsonApi,
+            "BTC/USDT",
+            "https://api.coinbase.com/v2/prices/BTC-USD/spot",
+            "",
+            2
+        );
 
-        // Past eighteen the rescale to the venue's hundredths could overflow a garbage response.
+        // Past eighteen the rescale to the venue's hundredths could overflow a garbage response,
+        // whichever agent produced it.
         vm.expectRevert(LucidBrain.BadFeed.selector);
-        brain.setFeed(LucidTypes.ASSET_BTC, "https://api.coinbase.com/v2/prices/BTC-USD/spot", "data.amount", 19);
+        brain.setFeed(LucidTypes.ASSET_BTC, LucidBrain.FeedKind.PriceOracle, "BTC/USDT", "", "", 19);
+
+        // And the mirror image of each: the field the kind needs is enough on its own.
+        brain.setFeed(LucidTypes.ASSET_BTC, LucidBrain.FeedKind.PriceOracle, "BTC/USDT", "", "", 2);
+        brain.setFeed(LucidTypes.ASSET_BTC, LucidBrain.FeedKind.JsonApi, "", "https://x.example/p", "price", 2);
         vm.stopPrank();
     }
 
     function test_a_feed_on_another_scale_is_normalised_to_the_strike() public {
-        vm.prank(owner);
-        brain.setFeed(LucidTypes.ASSET_BTC, "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", "price", 8);
+        _useJsonFeed(
+            LucidTypes.ASSET_BTC, "BTC/USDT", "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", "price", 8
+        );
 
         uint256 priceId = _requestPrice(_market(start + 900));
         // 79912.40 at eight decimals. Compared against a hundredths strike unconverted, this would
         // read as a market that had moved by a factor of a million.
-        _deliverPrices(priceId, _three(7_991_240_000_000, 7_991_240_000_000, 7_991_240_000_000));
+        _deliverJsonPrices(priceId, _three(7_991_240_000_000, 7_991_240_000_000, 7_991_240_000_000));
 
         string memory prompt = _promptOf(platform.lastRequest().payload);
         assertTrue(_contains(prompt, "Spot: 79912.40"), "the same price, on the venue's scale");
         assertTrue(_contains(prompt, "Distance to strike: +3 bps"), "and a distance that means something");
+    }
+
+    /// @dev The same normalisation on the oracle path, where the scale is what `getPrices` was
+    /// asked to answer in rather than what an endpoint happens to publish.
+    function test_an_oracle_feed_on_another_scale_is_normalised_to_the_strike() public {
+        vm.prank(owner);
+        brain.setFeed(LucidTypes.ASSET_BTC, LucidBrain.FeedKind.PriceOracle, "BTC/USDT", "", "", 8);
+
+        uint256 priceId = _requestPrice(_market(start + 900));
+        (, uint8 decimals) = abi.decode(_args(platform.requestAt(0).payload), (string[], uint8));
+        assertEq(decimals, 8, "the agent is asked for the scale the feed declares");
+
+        _deliverPrices(priceId, _three(7_991_240_000_000, 7_991_240_000_000, 7_991_240_000_000));
+        assertTrue(_contains(_promptOf(platform.lastRequest().payload), "Spot: 79912.40"));
     }
 
     function test_only_the_owner_can_repoint_the_price_agent() public {
@@ -465,6 +746,23 @@ contract LucidBrainStageTest is Test {
         vm.prank(owner);
         brain.setFeedAgent(42);
         assertEq(brain.feedAgentId(), 42, "an id can move without a redeploy that would orphan the verdicts");
+    }
+
+    /// @dev A separate setter from `setFeedAgent`, because the two agents answer in different
+    /// shapes and one mistyped id across a shared setter would point an oracle feed at the JSON
+    /// agent — which returns bytes that decode as nothing, so every window would quietly refuse.
+    function test_only_the_owner_can_repoint_the_oracle_agent() public {
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        brain.setOracleAgent(1);
+
+        vm.prank(owner);
+        brain.setOracleAgent(7);
+        assertEq(brain.oracleAgentId(), 7);
+        assertEq(brain.feedAgentId(), 13174292974160097713, "and the JSON agent is untouched");
+
+        _requestPrice(_market(start + 900));
+        assertEq(platform.requestAt(0).agentId, 7, "the oracle feed follows the oracle id");
     }
 
     function test_only_the_owner_can_resize_the_price_committee() public {
@@ -542,6 +840,22 @@ contract LucidBrainStageTest is Test {
         (s[0], s[1], s[2]) = (a, b, c);
     }
 
+    /// @dev One validator's `getPrices` return: three parallel arrays, one entry each. Named
+    /// arguments everywhere it matters, because the two guards under test both live in fields a
+    /// positional tuple would hide.
+    function _oracleResult(uint256 price, uint8 sources, uint64 updatedMillis) internal pure returns (bytes memory) {
+        uint256[] memory p = new uint256[](1);
+        uint8[] memory n = new uint8[](1);
+        uint64[] memory u = new uint64[](1);
+        (p[0], n[0], u[0]) = (price, sources, updatedMillis);
+        return abi.encode(p, n, u);
+    }
+
+    /// @dev A healthy reading: three exchanges, refreshed this second.
+    function _freshOracleResult(uint256 price) internal view returns (bytes memory) {
+        return _oracleResult(price, 3, uint64(block.timestamp * 1000));
+    }
+
     function _deliverPrices(uint256 id, uint256[] memory prices) internal {
         _deliverPricesWithStatus(id, prices, IAgentRequester.ResponseStatus.Success);
     }
@@ -551,9 +865,37 @@ contract LucidBrainStageTest is Test {
     {
         IAgentRequester.Response[] memory rs = new IAgentRequester.Response[](prices.length);
         for (uint256 i; i < prices.length; ++i) {
-            rs[i] = _response(i, abi.encode(prices[i]));
+            rs[i] = _response(i, _freshOracleResult(prices[i]));
         }
         platform.deliverPrice(address(brain), id, rs, status);
+    }
+
+    /// @dev The `JsonApi` shape: a bare uint256 per validator, which is what `fetchUint` returns.
+    function _deliverJsonPrices(uint256 id, uint256[] memory prices) internal {
+        IAgentRequester.Response[] memory rs = new IAgentRequester.Response[](prices.length);
+        for (uint256 i; i < prices.length; ++i) {
+            rs[i] = _response(i, abi.encode(prices[i]));
+        }
+        platform.deliverPrice(address(brain), id, rs, IAgentRequester.ResponseStatus.Success);
+    }
+
+    /// @dev Delivers raw response bodies, so a test can hand the brain bytes no honest agent would
+    /// ever produce.
+    function _deliverRawPrices(uint256 id, bytes[] memory results) internal {
+        IAgentRequester.Response[] memory rs = new IAgentRequester.Response[](results.length);
+        for (uint256 i; i < results.length; ++i) {
+            rs[i] = _response(i, results[i]);
+        }
+        platform.deliverPrice(address(brain), id, rs, IAgentRequester.ResponseStatus.Success);
+    }
+
+    /// @dev Repoints an asset at the documented JSON fallback, carrying the oracle symbol along so
+    /// the flip is the one field it is meant to be.
+    function _useJsonFeed(bytes32 assetKey, string memory symbol, string memory url, string memory sel, uint8 dec)
+        internal
+    {
+        vm.prank(owner);
+        brain.setFeed(assetKey, LucidBrain.FeedKind.JsonApi, symbol, url, sel, dec);
     }
 
     function _deliverScores(uint256 id, int256[] memory scores) internal {

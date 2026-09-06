@@ -670,12 +670,30 @@ contract LucidRouter is SomniaEventHandler, Ownable {
 
         // Paid before anyone is charged: if the committee cannot be reached, no desk is on the hook
         // and no credit has moved.
-        try ILucidBrain(brain).requestVerdict{value: fee}(m.marketId, m, pBookBps, recent) {
-            emit VerdictRequested(m.marketId, fee, payers.length);
+        uint256 requestId;
+        try ILucidBrain(brain).requestVerdict{value: fee}(m.marketId, m, pBookBps, recent) returns (uint256 id) {
+            requestId = id;
         } catch {
             emit Skipped(address(0), m.marketId, "VERDICT_REQUEST_FAILED");
             return false;
         }
+
+        // Zero is the brain refusing, not the brain failing. It declines a window it cannot price
+        // honestly — too little of it left, no feed for the asset, no float for the second stage —
+        // by storing a refusal and returning zero rather than by reverting, precisely so the desk
+        // gets told why instead of waiting on silence. The `try` above therefore succeeds, and a
+        // router that read only "it did not revert" would debit every desk for a committee call
+        // that was never made and then wake them for a position none of them hold. Charging for
+        // work that did not happen is the same class of error as blaming a callee for a shortfall
+        // that was ours: the log has to name what actually occurred.
+        if (requestId == 0) {
+            for (uint256 i; i < payers.length; ++i) {
+                emit Skipped(payers[i], m.marketId, "NO_VERDICT");
+            }
+            return false;
+        }
+
+        emit VerdictRequested(m.marketId, fee, payers.length);
 
         // The list is rebuilt rather than appended to, so it always describes this firing's fan-out
         // and nothing left over from an earlier one.

@@ -105,6 +105,35 @@ contract MockRelayForRouter {
     }
 }
 
+/// @notice A brain that refuses the way the real one refuses: quietly, and without reverting.
+/// @dev Kept here rather than in `test/mocks/` because it exists for exactly one property, and it
+/// is a property of `LucidBrain`'s contract rather than of any mock. `requestVerdict` returns zero
+/// — window too tight, no feed for the asset, no float for the second stage — instead of reverting,
+/// deliberately, so the desk is told why it stood down rather than left waiting on silence. The
+/// router's `try` therefore *succeeds* on the one path where nothing was bought, which is exactly
+/// how a caller ends up charging for work that never happened.
+contract MockRefusingBrain {
+    uint256 public fee = 0.213 ether;
+    uint256 public requestCount;
+    uint256 public totalReceived;
+
+    function quote() external view returns (uint256) {
+        return fee;
+    }
+
+    function requestVerdict(bytes32, LucidTypes.MarketInfo calldata, uint256, uint16[] calldata)
+        external
+        payable
+        returns (uint256)
+    {
+        ++requestCount;
+        totalReceived += msg.value;
+        return 0;
+    }
+
+    receive() external payable {}
+}
+
 /// @notice A desk that reports the gas budget it was actually handed.
 /// @dev Kept here rather than in `test/mocks/` because it exists for exactly one property: a
 /// stipend is a promise about a number, and the only place that number is observable is inside the
@@ -344,6 +373,69 @@ contract LucidRouterTest is Test {
         address[] memory interested = router.interestedIn(BTC_MARKET_ID);
         assertEq(interested.length, 1, "only the healthy desk");
         assertEq(interested[0], address(good), "the healthy desk");
+    }
+
+    /// @dev The brain refuses by returning zero, not by reverting, so the router's `try` succeeds
+    /// on the one path where nothing was bought. Reading only "it did not revert" would debit every
+    /// desk for a committee call that was never made — and then wake them at settlement for a
+    /// position none of them hold.
+    function test_a_refused_verdict_charges_nobody_and_says_so() public {
+        MockRefusingBrain refusing = new MockRefusingBrain();
+        vm.prank(owner);
+        router.setBrain(address(refusing));
+
+        MockDeskForRouter a = _newDesk(true, 1 ether);
+        MockDeskForRouter b = _newDesk(true, 1 ether);
+
+        vm.recordLogs();
+        _fireBtc();
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        assertEq(refusing.requestCount(), 1, "the brain was asked, and it declined");
+
+        assertEq(router.gasCreditOf(address(a)), 1 ether, "not charged for a request that never went out");
+        assertEq(router.gasCreditOf(address(b)), 1 ether, "not charged either");
+        assertEq(router.totalGasCredit(), 2 ether, "and the credit book agrees");
+
+        assertEq(router.interestedIn(BTC_MARKET_ID).length, 0, "nobody is on the hook for a verdict nobody bought");
+        assertEq(precompile.subscriptionCount(), 1, "and no settlement one-shot was booked for them");
+
+        // Every desk that would have paid is named, because "we decided not to" and "nothing
+        // happened" have to be distinguishable from outside.
+        assertEq(_countReason(logs, address(a), "NO_VERDICT"), 1, "desk a is told why");
+        assertEq(_countReason(logs, address(b), "NO_VERDICT"), 1, "desk b is told why");
+        assertEq(_countSkipped(logs), 2, "and nothing else was skipped for any other reason");
+
+        // A refusal is not a verdict request, and the log must not claim otherwise.
+        assertEq(_countTopic(logs, keccak256("VerdictRequested(bytes32,uint256,uint256)")), 0, "nothing was requested");
+        assertEq(_countTopic(logs, keccak256("Debited(address,bytes32,uint256)")), 0, "and nothing was debited");
+    }
+
+    /// @dev The other half of the same property: a real request id still debits exactly as it did
+    /// before the refusal path existed. A guard that also suppressed the paying case would be the
+    /// more expensive bug.
+    function test_a_granted_verdict_still_debits_exactly_as_before() public {
+        MockDeskForRouter a = _newDesk(true, 1 ether);
+        MockDeskForRouter b = _newDesk(true, 1 ether);
+
+        uint256 fee = brain.fee();
+        uint256 share = _ceilDiv(fee, 2) + router.SETTLEMENT_BUDGET();
+
+        vm.recordLogs();
+        _fireBtc();
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        assertEq(brain.requestCount(), 1, "the mock brain answers with a non-zero id");
+        assertEq(router.gasCreditOf(address(a)), 1 ether - share, "desk a debited its share");
+        assertEq(router.gasCreditOf(address(b)), 1 ether - share, "desk b debited its share");
+        assertEq(router.totalGasCredit(), 2 ether - 2 * share, "and the credit book agrees");
+
+        assertEq(router.interestedIn(BTC_MARKET_ID).length, 2, "both desks are on the hook");
+        assertEq(precompile.subscriptionCount(), 2, "and their settlement wake-up is booked");
+
+        assertEq(_countTopic(logs, keccak256("VerdictRequested(bytes32,uint256,uint256)")), 1, "one request");
+        assertEq(_countReason(logs, address(a), "NO_VERDICT"), 0, "and nobody was told it was refused");
+        assertEq(_countReason(logs, address(b), "NO_VERDICT"), 0);
     }
 
     // ── settlement scheduling ─────────────────────────────────────────────────
@@ -1012,6 +1104,34 @@ contract LucidRouterTest is Test {
             if (logs[i].emitter != address(router)) continue;
             if (logs[i].topics.length == 0 || logs[i].topics[0] != topic0) continue;
             ++count;
+        }
+    }
+
+    /// @dev How many `Skipped` events named one desk with one exact reason. The reason is the whole
+    /// point of the event — a skip that does not say which component declined sends whoever reads
+    /// the log to debug the wrong contract — so a test that only counted skips would not be testing
+    /// it.
+    function _countReason(Vm.Log[] memory logs, address desk, string memory reason)
+        internal
+        view
+        returns (uint256 count)
+    {
+        bytes32 topic0 = keccak256("Skipped(address,bytes32,string)");
+
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].emitter != address(router)) continue;
+            if (logs[i].topics.length < 2 || logs[i].topics[0] != topic0) continue;
+            if (address(uint160(uint256(logs[i].topics[1]))) != desk) continue;
+            if (keccak256(bytes(abi.decode(logs[i].data, (string)))) != keccak256(bytes(reason))) continue;
+            ++count;
+        }
+    }
+
+    /// @dev How many events of one signature the router emitted.
+    function _countTopic(Vm.Log[] memory logs, bytes32 topic0) internal view returns (uint256 count) {
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].emitter != address(router)) continue;
+            if (logs[i].topics.length != 0 && logs[i].topics[0] == topic0) ++count;
         }
     }
 
