@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
-import {ILucidDesk} from "./interfaces/ILucid.sol";
+import {ILucidDesk, ILucidRouter} from "./interfaces/ILucid.sol";
 import {IBinaryMarket, IBinaryModule, IBinaryPool, IERC20Faucet, IERC6909Min} from "./interfaces/IDreamDex.sol";
 import {PolicyLib} from "./lib/PolicyLib.sol";
 import {LucidTypes} from "./types/LucidTypes.sol";
@@ -180,6 +180,19 @@ contract LucidDesk is ILucidDesk {
         _policyBootstrapped = true;
         _policy = p;
         emit PolicySet(p);
+        _syncArmed(p.armed);
+    }
+
+    /// @dev The router iterates its own list of armed desks, so a desk that only flips its local
+    /// flag is invisible to the fan-out and silently never trades. The call is best-effort because
+    /// the factory sets the opening policy before it registers the desk with the router; `arm` is
+    /// what makes it definitive afterwards.
+    function _syncArmed(bool on) private {
+        // The code check is not belt-and-braces: Solidity emits an `extcodesize` guard for a
+        // typed external call, and that guard reverts OUTSIDE the try/catch, so `try` alone does
+        // not make this safe against a router address with no code behind it.
+        if (_router.code.length == 0) return;
+        try ILucidRouter(_router).setDeskArmed(address(this), on) {} catch {}
     }
 
     /// @notice Turn the desk on or off without discarding the rest of the mandate.
@@ -187,6 +200,7 @@ contract LucidDesk is ILucidDesk {
     function arm(bool on) external onlyOwner {
         _policy.armed = on;
         emit ArmedSet(on);
+        _syncArmed(on);
     }
 
     /// @notice Pull collateral in from the owner. Requires a prior ERC-20 approval.

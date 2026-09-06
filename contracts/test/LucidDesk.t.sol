@@ -560,3 +560,70 @@ contract LucidDeskTest is Test {
         assertEq(outcome.operatorGrantsBy(address(desk)), 2);
     }
 }
+
+
+/// @dev A desk that only flips its own flag is invisible to the router's fan-out, which walks the
+/// router's list rather than asking each desk. That is not observable in a unit test that talks to
+/// the desk directly, so it is pinned here explicitly.
+contract ArmRecordingRouter {
+    mapping(address => bool) public deskArmed;
+    uint256 public calls;
+    bool public shouldRevert;
+
+    function setDeskArmed(address desk, bool on) external {
+        if (shouldRevert) revert("router refused");
+        deskArmed[desk] = on;
+        calls++;
+    }
+
+    function setShouldRevert(bool on) external {
+        shouldRevert = on;
+    }
+}
+
+contract LucidDeskArmSyncTest is Test {
+    LucidDesk internal desk;
+    ArmRecordingRouter internal router;
+    address internal owner = address(0xA11CE);
+    address internal brain = address(0xB4A11);
+
+    function setUp() public {
+        router = new ArmRecordingRouter();
+        desk = LucidDesk(payable(Clones.clone(address(new LucidDesk()))));
+        desk.initialize(owner, address(router), brain);
+    }
+
+    function test_arming_tells_the_router() public {
+        vm.prank(owner);
+        desk.arm(true);
+        assertTrue(router.deskArmed(address(desk)));
+    }
+
+    function test_disarming_tells_the_router() public {
+        vm.startPrank(owner);
+        desk.arm(true);
+        desk.arm(false);
+        vm.stopPrank();
+        assertFalse(router.deskArmed(address(desk)));
+    }
+
+    function test_setting_a_policy_syncs_the_armed_flag() public {
+        LucidTypes.Policy memory p;
+        p.armed = true;
+        p.maxStakePerWindow = 1e6;
+        p.dailyBudget = 10e6;
+        p.maxOpenMarkets = 1;
+        vm.prank(owner);
+        desk.setPolicy(p);
+        assertTrue(router.deskArmed(address(desk)));
+    }
+
+    /// A router that rejects the notice must not brick the desk's own controls.
+    function test_arming_survives_a_router_that_refuses() public {
+        router.setShouldRevert(true);
+        vm.prank(owner);
+        desk.arm(true);
+        assertTrue(desk.policy().armed);
+        assertEq(router.calls(), 0);
+    }
+}
