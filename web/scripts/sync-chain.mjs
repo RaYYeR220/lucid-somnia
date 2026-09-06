@@ -79,6 +79,15 @@ function readKitAbis() {
 const haveArtifacts = existsSync(outRoot)
 const kitAbis = haveArtifacts ? null : readKitAbis()
 if (!haveArtifacts && kitAbis === null) {
+  // A deployment platform builds `web/` on its own, without the contracts workspace beside it.
+  // The generated file is committed precisely so that build can succeed; regenerating it is a
+  // developer convenience, not a build requirement. Failing here would make the app undeployable
+  // for the sake of a step that has nothing left to do.
+  const committed = join(webRoot, 'src', 'lib', 'chain', 'synced.ts')
+  if (existsSync(committed)) {
+    console.log('sync-chain: no contract artifacts here — keeping the committed src/lib/chain/synced.ts')
+    process.exit(0)
+  }
   throw new Error(
     `no ABI source found — expected Foundry artifacts in ${outRoot} (run \`forge build\` in contracts/) ` +
       `or an already-synced kit/src/abis.ts`,

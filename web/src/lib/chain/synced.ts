@@ -6,14 +6,14 @@
 export const deployed = {
   chainId: 50312,
   /** ERC-1167 master copy every user desk is cloned from. Never call it directly. */
-  deskImplementation: '0x9A3216423D61a2D743C39a2072cdc22338347Ffd',
-  brain: '0x1DfB06af318b9009E9203D3558BBCa9A78Dbfe25',
+  deskImplementation: '0x8D87D72A23Be0F9a07046b89113a7e615F629994',
+  brain: '0x0c640E3aFc627bEec7eDB9985696e12B50AdAd25',
   /** Sole owner of every reactivity subscription; must hold >= 32 SOMI to keep them alive. */
-  router: '0x11C374e9d4869B89c5B3dB7278AaA5e6f3eFb8fF',
-  factory: '0xf49F4AEB39f1d8b35b3cdff37370F2D9A249259F',
-  keeper: '0xf8e3666DF8F976Db43857E3fC886323555715119',
-  relay: '0xB14508460a949C44Ef3c141f427E8508715A0F80',
-  series: '0xCA142c78bb09922d2716151e22ecb9b4ef37382C',
+  router: '0x6aE21a20444141552648C1f8443bAf171BCCcB99',
+  factory: '0xF36b6E1cf0D43563bC8874dd0cf8c24188eE2d94',
+  keeper: '0x4757599dC9A5a089270373a66BEeeD6592788707',
+  relay: '0xd9Eee9BE420E2CD777E55d890a940a637ed0bB7A',
+  series: '0x747fF3a7A6FE4912c96dCe7faA711dCB6fbd1CE4',
   /** The market creator LucidSeries rolls a window through when the venue's scheduler stalls. */
   marketCreator: '0x7Fa6Ac2a61C0b5A0FcC7E1d9b05a0F6AD84763b2',
   /** The DreamDEX venue the router is armed against. */
@@ -25,7 +25,7 @@ export const deployed = {
    * pre-render. The deploy script names them by strategy and the set changes between
    * deployments, so they are collected by shape rather than by a fixed key.
    */
-  seedDesks: ['0x2E749675c8900244e3F1375c14B800c69C0A3bab', '0x7Fa1E1B5cb95B7d2b5d874e8Dc53b1E39d1e1365'] as readonly string[],
+  seedDesks: ['0x7a3153D5f0142F12dDe38A16E550098AFf4f58c0', '0xb8d3d87cfF214A2c1DC56bdAbe182b8165Db5644'] as readonly string[],
 } as const
 
 export const routerAbi = [
@@ -231,6 +231,7 @@ export const brainAbi = [
   {"type":"function","name":"feedAgentId","inputs":[],"outputs":[{"name":"","type":"uint256"}],"stateMutability":"view"},
   {"type":"function","name":"feedCommitteeSize","inputs":[],"outputs":[{"name":"","type":"uint8"}],"stateMutability":"view"},
   {"type":"function","name":"feedLatencyEma","inputs":[],"outputs":[{"name":"","type":"uint64"}],"stateMutability":"view"},
+  {"type":"function","name":"feedObserved","inputs":[],"outputs":[{"name":"","type":"bool"}],"stateMutability":"view"},
   {"type":"function","name":"feedOf","inputs":[{"name":"assetKey","type":"bytes32"}],"outputs":[{"name":"","type":"tuple","components":[{"name":"kind","type":"uint8"},{"name":"symbol","type":"string"},{"name":"url","type":"string"},{"name":"selector","type":"string"},{"name":"decimals","type":"uint8"}]}],"stateMutability":"view"},
   {"type":"function","name":"feedThreshold","inputs":[],"outputs":[{"name":"","type":"uint8"}],"stateMutability":"view"},
   {"type":"function","name":"handlePrice","inputs":[{"name":"requestId","type":"uint256"},{"name":"responses","type":"tuple[]","components":[{"name":"validator","type":"address"},{"name":"result","type":"bytes"},{"name":"status","type":"uint8"},{"name":"receipt","type":"uint256"},{"name":"timestamp","type":"uint256"},{"name":"executionCost","type":"uint256"}]},{"name":"status","type":"uint8"},{"name":"","type":"tuple","components":[{"name":"id","type":"uint256"},{"name":"requester","type":"address"},{"name":"callbackAddress","type":"address"},{"name":"callbackSelector","type":"bytes4"},{"name":"subcommittee","type":"address[]"},{"name":"responses","type":"tuple[]","components":[{"name":"validator","type":"address"},{"name":"result","type":"bytes"},{"name":"status","type":"uint8"},{"name":"receipt","type":"uint256"},{"name":"timestamp","type":"uint256"},{"name":"executionCost","type":"uint256"}]},{"name":"responseCount","type":"uint256"},{"name":"failureCount","type":"uint256"},{"name":"threshold","type":"uint256"},{"name":"createdAt","type":"uint256"},{"name":"deadline","type":"uint256"},{"name":"status","type":"uint8"},{"name":"consensusType","type":"uint8"},{"name":"remainingBudget","type":"uint256"},{"name":"perAgentBudget","type":"uint256"}]}],"outputs":[],"stateMutability":"nonpayable"},
@@ -260,6 +261,7 @@ export const brainAbi = [
   {"type":"function","name":"systemPrompt","inputs":[],"outputs":[{"name":"","type":"string"}],"stateMutability":"view"},
   {"type":"function","name":"transferOwnership","inputs":[{"name":"newOwner","type":"address"}],"outputs":[],"stateMutability":"nonpayable"},
   {"type":"function","name":"verdictLatencyEma","inputs":[],"outputs":[{"name":"","type":"uint64"}],"stateMutability":"view"},
+  {"type":"function","name":"verdictObserved","inputs":[],"outputs":[{"name":"","type":"bool"}],"stateMutability":"view"},
   {"type":"function","name":"verdictOf","inputs":[{"name":"marketId","type":"bytes32"}],"outputs":[{"name":"","type":"tuple","components":[{"name":"probUpBps","type":"uint16"},{"name":"responded","type":"uint8"},{"name":"agreed","type":"uint8"},{"name":"ok","type":"bool"},{"name":"requestId","type":"uint256"}]}],"stateMutability":"view"},
   {"type":"event","name":"CommitteeUpdated","inputs":[{"name":"size","type":"uint8","indexed":false},{"name":"threshold","type":"uint8","indexed":false}],"anonymous":false},
   {"type":"event","name":"FeedAgentUpdated","inputs":[{"name":"agentId","type":"uint256","indexed":false}],"anonymous":false},
