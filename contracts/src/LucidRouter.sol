@@ -80,6 +80,26 @@ contract LucidRouter is SomniaEventHandler, Ownable {
     /// list into named skips rather than into a lost firing.
     uint256 public constant MAX_FANOUT = 32;
 
+    /// @notice How many queued entries one firing may take from each queue.
+    ///
+    /// @dev A wake-up is a nudge, not a promise about how much work exists behind it. A backlog —
+    /// a chain pause, two instants coalesced into one firing, a burst of windows on the same
+    /// cadence — must never be able to hand a single handler more work than its frame can hold, so
+    /// the drain is bounded by construction and the remainder simply waits. Eight settlements is
+    /// already a wider firing than this router has ever made in production.
+    uint256 public constant MAX_DRAIN = 8;
+
+    /// @notice How far past the front of a queue one firing may look for work that is due.
+    ///
+    /// @dev The queues are appended as markets are seen, and a window's work comes due a fixed
+    /// fraction of that window later — so within one cadence they are naturally in due order. This
+    /// router serves four at once (60s, 300s, 900s, 3600s), so they are *not* globally ordered: an
+    /// hour-long window queued first sits in front of a minute-long one that comes due an hour
+    /// earlier. Stopping at the first entry that is not yet due would strand that minute; sorting
+    /// on chain would cost more than the work being ordered. Scanning a bounded window past it
+    /// does neither.
+    uint256 public constant MAX_SCAN = 16;
+
     /// @notice Callback gas provisioned for every subscription this router creates.
     ///
     /// @dev Measured on Shannon, not guessed: at 2_000_000 the chain charged for the handler and
@@ -211,6 +231,20 @@ contract LucidRouter is SomniaEventHandler, Ownable {
         uint8 next;
     }
 
+    /// @dev One promise this router made: a window, and the second the work on it comes due.
+    ///
+    /// Deliberately not keyed by the wake-up that will carry it. **The chain does not fire
+    /// `Schedule` with the timestamp that was requested.** A one-shot's filter matches "at or after
+    /// `eventTopics[1]`", not "equal to" it, and what is delivered is the instant the chain
+    /// actually emitted at. Every timestamp this router books is a whole second times 1000 and so
+    /// ends in `000`; the `Schedule` decoded from a live Shannon handler transaction carried
+    /// `1788719250073`. Work filed under the requested key was therefore never found again — 56
+    /// windows seen, 56 settlements and 10 decisions booked, and not one of either ever run.
+    struct Pending {
+        bytes32 marketId;
+        uint64 dueAtSec;
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Storage
     // ─────────────────────────────────────────────────────────────────────────
@@ -270,23 +304,37 @@ contract LucidRouter is SomniaEventHandler, Ownable {
     /// @notice Whether a registered desk currently wants to be considered for new markets.
     mapping(address desk => bool) public deskArmed;
 
-    /// @notice The one-shot subscription id serving a wake-up millisecond, or zero.
-    /// @dev Shared by decision and settlement wake-ups on purpose: the chain fires one `Schedule`
-    /// event per millisecond whatever the router queued for it, so a second subscription at the
-    /// same instant would be a second bill for the same wake-up.
+    /// @notice The one-shot subscription id booked for a wake-up millisecond, or zero.
+    ///
+    /// @dev Kept for exactly one job, which it still earns: deduping subscriptions at the same
+    /// instant. On a venue that rolls BTC and ETH on the same 60-second grid two windows expire on
+    /// the same millisecond, and a second subscription for it would be a second bill for one
+    /// wake-up. Shared by decision and settlement bookings for the same reason.
+    ///
+    /// @dev It is no longer how work is found. A booked instant is always strictly in the future,
+    /// so a slot is only ever consulted before its wake-up fires; the entry is cleared when the
+    /// work booked against that instant is drained, which is the last moment the router still knows
+    /// which instant an id stood for.
     mapping(uint256 tsMillis => uint256) public scheduleIdAt;
 
     address[] internal _deskList;
     mapping(address desk => uint256) internal _gasCredit;
     mapping(bytes32 marketId => LucidTypes.MarketInfo) internal _markets;
     mapping(bytes32 marketId => address[]) internal _interested;
-    /// @dev Windows to settle at a millisecond. Kept in its own mapping from `_decisionAt` rather
-    /// than tagged into one list, because the two wake-ups do opposite things to a desk's position
-    /// — one opens it, one closes it — and a settlement mistaken for a decision would ask a
-    /// committee to price a window that has already resolved.
-    mapping(uint256 tsMillis => bytes32[]) internal _dueAt;
-    /// @dev Windows to ask the committee about at a millisecond. See `_dueAt`.
-    mapping(uint256 tsMillis => bytes32[]) internal _decisionAt;
+    /// @dev Windows waiting to be priced, each with the second it comes due.
+    ///
+    /// **Self-healing, and that is the point.** Because an entry is selected by its own due time
+    /// rather than by the key of the wake-up that arrived, no single firing is load-bearing: one
+    /// that lands late, one that coalesced two instants into itself, one that never came at all —
+    /// none of them strand anything. The entry stays queued and the next firing, whatever it was
+    /// booked for, takes it. That is what makes draining by time correct rather than merely
+    /// working, and it is exactly the guarantee the timestamp-keyed version did not have.
+    Pending[] internal _decisionQueue;
+    /// @dev Windows waiting to be settled. Kept in its own queue rather than tagged into one list,
+    /// because the two do opposite things to a desk's position — one opens it, one closes it — and
+    /// a settlement mistaken for a decision would ask a committee to price a window that has
+    /// already resolved. See `_decisionQueue`.
+    Pending[] internal _settlementQueue;
     /// @dev Whether a window's settlement wake-up is already booked. A market can reach
     /// `_scheduleSettlement` twice — once from the keeper's venue-wide pass at creation, once from
     /// the desks' own path at the decision point — and a second queue entry would settle every
@@ -340,6 +388,14 @@ contract LucidRouter is SomniaEventHandler, Ownable {
     /// auditable on chain rather than inferred from when a verdict happened to arrive.
     event DecisionScheduled(bytes32 indexed marketId, uint256 tsMillis, uint256 subscriptionId);
     event DecisionPointSet(uint16 bps);
+    /// @notice A drain ended with entries still queued, and why.
+    /// @dev The bounds that stop a backlog from blowing a handler would otherwise make that backlog
+    /// invisible, which is the one failure this contract refuses everywhere else. `reason` is
+    /// `MAX_DRAIN` (the per-firing cap was reached), `NO_GAS` (the frame ran out before the entry
+    /// was taken, so it is still queued) or `MAX_SCAN` (there are entries this firing did not look
+    /// at). The first two mean due work was certainly left behind; the third means the router
+    /// cannot say either way, which is itself worth publishing.
+    event DrainStopped(bool decisions, uint256 drained, uint256 remaining, string reason);
     /// @notice Work that was not done, and why.
     /// @dev A zero `desk` means the whole fan-out for that market was skipped rather than one
     /// participant. This event is the protocol's answer to "why did nothing happen", and there is
@@ -561,8 +617,12 @@ contract LucidRouter is SomniaEventHandler, Ownable {
             _onMarketCreated(eventTopics, data);
         } else if (topic0 == LucidTypes.TOPIC_SCHEDULE) {
             if (emitter != SomniaExtensions.SOMNIA_REACTIVITY_PRECOMPILE_ADDRESS) return;
+            // A well-formed `Schedule(uint256)` carries its timestamp in `eventTopics[1]`, and that
+            // value is deliberately never read. It is the instant the chain actually emitted at,
+            // not the instant that was requested — matching is "at or after", not equality — so it
+            // identifies nothing. The firing says *when*; the clock says *what*.
             if (eventTopics.length < 2) return;
-            _onSchedule(uint256(eventTopics[1]));
+            _onSchedule();
         }
     }
 
@@ -588,8 +648,9 @@ contract LucidRouter is SomniaEventHandler, Ownable {
     /// @dev Kind-agnostic despite the historical name, which is kept because it is the selector the
     /// deployed ABI publishes. A one-shot is a millisecond and nothing else: the same subscription
     /// serves a decision wake-up, a settlement wake-up, or both at once when two windows happen to
-    /// land on the same instant. What each firing means is decided by which list the market was
-    /// queued on — `_decisionAt` or `_dueAt` — never by the subscription itself.
+    /// land on the same instant. What a firing means is decided by which queue an entry sits on and
+    /// by whether its own due second has passed — never by the subscription, and never by the
+    /// timestamp the firing carries, which is not the one that was asked for.
     /// @param tsMillis Absolute unix timestamp in milliseconds.
     /// @return subscriptionId The new one-shot's id.
     function scheduleSettlement(uint256 tsMillis) external returns (uint256 subscriptionId) {
@@ -663,21 +724,34 @@ contract LucidRouter is SomniaEventHandler, Ownable {
         return _interested[marketId];
     }
 
-    /// @notice The markets queued to settle at a millisecond timestamp.
-    /// @param tsMillis Absolute unix timestamp in milliseconds.
-    /// @return The windows a firing at that timestamp will settle.
-    function pendingAt(uint256 tsMillis) external view returns (bytes32[] memory) {
-        return _dueAt[tsMillis];
+    /// @notice Every window still waiting to be settled, each with the second it comes due.
+    /// @dev The queue itself rather than a slice of it keyed by an instant, because work is no
+    /// longer filed under the instant a wake-up was booked for: that instant never comes back. The
+    /// next firing — any firing — drains whatever this reports as due.
+    /// @return The pending settlements, in the order the drain will consider them.
+    function pendingSettlements() external view returns (Pending[] memory) {
+        return _settlementQueue;
     }
 
-    /// @notice The markets queued to be priced at a millisecond timestamp.
-    /// @dev Deliberately separate from `pendingAt`. A settlement closes a position and a decision
-    /// opens one, and a caller that could not tell them apart would read a window about to be
-    /// traded as a window about to be booked.
-    /// @param tsMillis Absolute unix timestamp in milliseconds.
-    /// @return The windows a firing at that timestamp will ask the committee about.
-    function decisionsAt(uint256 tsMillis) external view returns (bytes32[] memory) {
-        return _decisionAt[tsMillis];
+    /// @notice Every window still waiting to be priced, each with the second it comes due.
+    /// @dev Deliberately separate from `pendingSettlements`. A settlement closes a position and a
+    /// decision opens one, and a caller that could not tell them apart would read a window about to
+    /// be traded as a window about to be booked.
+    /// @return The pending decisions, in the order the drain will consider them.
+    function pendingDecisions() external view returns (Pending[] memory) {
+        return _decisionQueue;
+    }
+
+    /// @notice How many settlements are still owed.
+    /// @return The settlement queue's depth, which is the backlog `DrainStopped` reports on.
+    function settlementQueueLength() external view returns (uint256) {
+        return _settlementQueue.length;
+    }
+
+    /// @notice How many decisions are still owed.
+    /// @return The decision queue's depth.
+    function decisionQueueLength() external view returns (uint256) {
+        return _decisionQueue.length;
     }
 
     /// @notice Whether a window's settlement wake-up has already been booked.
@@ -766,7 +840,8 @@ contract LucidRouter is SomniaEventHandler, Ownable {
 
         // Scheduling a wake-up is only possible strictly in the future, and a window we cannot wake
         // up for is a window we must not pay a committee to price.
-        uint256 tsMillis = (uint256(m.expiry) + SETTLEMENT_DELAY) * 1000;
+        uint64 dueAtSec = _settlementSec(m);
+        uint256 tsMillis = uint256(dueAtSec) * 1000;
         if (tsMillis < ((block.timestamp + 1) * 1000) + 1) {
             emit Skipped(address(0), m.marketId, "EXPIRED");
             return;
@@ -781,7 +856,7 @@ contract LucidRouter is SomniaEventHandler, Ownable {
         // — so every market on the venue gets a settlement one-shot, but only when a keeper is
         // attached to make use of it. With no keeper the router books settlement at the decision
         // point instead, for exactly the desks that paid to be there.
-        if (keeper != address(0)) _scheduleSettlement(m.marketId, tsMillis);
+        if (keeper != address(0)) _scheduleSettlement(m.marketId, dueAtSec);
     }
 
     /// @dev Books the wake-up at which this window will actually be priced, if anyone wants it.
@@ -798,7 +873,8 @@ contract LucidRouter is SomniaEventHandler, Ownable {
         // every time would bury every log line that matters.
         if (_candidates(m).length == 0) return;
 
-        uint256 tsMillis = _decisionMillis(m);
+        uint64 dueAtSec = _decisionSec(m);
+        uint256 tsMillis = uint256(dueAtSec) * 1000;
 
         // A window whose decision point has already passed cannot be woken for. Rather than fall
         // back to asking now — which is the behaviour this whole change exists to remove — it is
@@ -824,13 +900,13 @@ contract LucidRouter is SomniaEventHandler, Ownable {
         }
 
         _decisionBooked[m.marketId] = true;
-        _decisionAt[tsMillis].push(m.marketId);
+        _decisionQueue.push(Pending({marketId: m.marketId, dueAtSec: dueAtSec}));
         emit DecisionScheduled(m.marketId, tsMillis, subscriptionId);
     }
 
     /// @dev The desks' half of a window that has reached its decision point: who still wants it, who
     /// pays for the committee, and the settlement wake-up their positions oblige the router to book.
-    function _serveDesks(LucidTypes.MarketInfo memory m, uint256 tsMillis) private {
+    function _serveDesks(LucidTypes.MarketInfo memory m, uint64 dueAtSec) private {
         address[] memory candidates = _candidates(m);
         if (candidates.length == 0) return;
 
@@ -908,7 +984,7 @@ contract LucidRouter is SomniaEventHandler, Ownable {
             _interested[m.marketId].push(payers[i]);
         }
 
-        _scheduleSettlement(m.marketId, tsMillis);
+        _scheduleSettlement(m.marketId, dueAtSec);
     }
 
     /// @dev Armed desks that want this market, capped at `MAX_FANOUT` considered. A desk whose
@@ -1001,9 +1077,10 @@ contract LucidRouter is SomniaEventHandler, Ownable {
     /// whole venue; the desks' own path reaches it again at the decision point, and a second entry
     /// in the same queue would call `onSettlement` twice on every holder in one firing — booking
     /// the same window's result against the desk's loss streak and open-market count twice over.
-    function _scheduleSettlement(bytes32 marketId, uint256 tsMillis) private {
+    function _scheduleSettlement(bytes32 marketId, uint64 dueAtSec) private {
         if (_settlementBooked[marketId]) return;
 
+        uint256 tsMillis = uint256(dueAtSec) * 1000;
         uint256 subscriptionId = scheduleIdAt[tsMillis];
 
         if (subscriptionId == 0) {
@@ -1019,7 +1096,7 @@ contract LucidRouter is SomniaEventHandler, Ownable {
         }
 
         _settlementBooked[marketId] = true;
-        _dueAt[tsMillis].push(marketId);
+        _settlementQueue.push(Pending({marketId: marketId, dueAtSec: dueAtSec}));
         emit SettlementScheduled(marketId, tsMillis, subscriptionId);
     }
 
@@ -1027,66 +1104,136 @@ contract LucidRouter is SomniaEventHandler, Ownable {
     // Schedule branch
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @dev Everything this router promised to do at this millisecond: price the windows that have
-    /// reached their decision point, then settle the windows that have closed.
+    /// @dev Everything this router owes by now: price the windows that have reached their decision
+    /// point, then settle the windows that have closed.
     ///
-    /// Both kinds of work can land on the same instant — one market's halfway point is another's
-    /// expiry — and the chain fires exactly one `Schedule` event for a millisecond however much was
-    /// queued against it. Which list a market is on is the only thing that says what happens to it,
-    /// which is why they are separate lists and not one tagged one.
-    function _onSchedule(uint256 tsMillis) private {
-        bytes32[] storage decisions = _decisionAt[tsMillis];
-        uint256 decisionCount = decisions.length;
-        for (uint256 i; i < decisionCount; ++i) {
-            _onDecision(decisions[i]);
-        }
-        // Cleared before the settlement pass, so a market that somehow appears on both lists at the
-        // same millisecond cannot be priced twice.
-        delete _decisionAt[tsMillis];
+    /// The firing that got us here carries a timestamp and it is not consulted. The chain emits
+    /// `Schedule` with the instant it actually fired, never with the instant that was requested, so
+    /// the event answers "when", not "what" — and "what" is a question for the clock. Both kinds of
+    /// work can come due together, one market's halfway point being another's expiry, and which
+    /// queue an entry sits on is the only thing that says what happens to it. Decisions first,
+    /// which is the order the timestamp-keyed version ran them in and the order that keeps a
+    /// settlement from ever being mistaken for a decision.
+    function _onSchedule() private {
+        _drain(_decisionQueue, true);
+        _drain(_settlementQueue, false);
+    }
 
-        bytes32[] storage due = _dueAt[tsMillis];
-        uint256 marketCount = due.length;
+    /// @dev Takes every entry the clock says is due, within bounds a handler can survive.
+    ///
+    /// **This is the self-healing part, and it is worth naming.** An entry is chosen by its own due
+    /// second, never by the key of the wake-up that arrived — so no individual firing is
+    /// load-bearing. A wake-up that lands late, one that coalesced two instants into itself, one
+    /// that was never delivered at all: none of them strand work. Whatever is still due is still
+    /// queued, and the next firing takes it. That is what makes draining by time correct rather
+    /// than merely working, and it is the guarantee that keying by the requested timestamp could
+    /// not offer, because the requested timestamp never comes back.
+    ///
+    /// Three rules hold the bound, and none of them may drop work:
+    ///  - `MAX_DRAIN` caps how much one frame takes on. The rest stays queued.
+    ///  - `MAX_SCAN` caps how far past a not-yet-due entry it looks. The queues are appended in due
+    ///    order within a cadence but the router serves four cadences at once, so stopping at the
+    ///    first entry that is not yet due would strand a short window sitting behind a long one.
+    ///    Sorting on chain would cost more than the work being ordered; a bounded scan does not.
+    ///  - A stipend of zero ends the pass *before* the entry is consumed, so an exhausted frame
+    ///    leaves the work queued rather than swallowing it.
+    ///
+    /// A pass that ends under any of the three says so, because a bound that silently hid a backlog
+    /// would be the same failure as a skip with no reason on it.
+    function _drain(Pending[] storage queue, bool decisions) private {
+        uint256 drained;
+        uint256 scanned;
+        uint256 i;
+        string memory stopped;
 
-        for (uint256 i; i < marketCount; ++i) {
-            bytes32 marketId = due[i];
-            LucidTypes.MarketInfo memory m = _markets[marketId];
-
-            address[] storage holders = _interested[marketId];
-            uint256 holderCount = holders.length;
-            for (uint256 j; j < holderCount; ++j) {
-                address desk = holders[j];
-
-                if (desk.code.length == 0) {
-                    emit Skipped(desk, marketId, "NO_CODE");
-                    continue;
-                }
-
-                uint256 gasFor = _stipend(DESK_GAS);
-                if (gasFor == 0) {
-                    emit Skipped(desk, marketId, "NO_GAS");
-                    continue;
-                }
-
-                try ILucidDesk(desk).onSettlement{gas: gasFor}(m) {}
-                catch {
-                    emit Skipped(desk, marketId, "SETTLEMENT_REVERTED");
-                }
+        while (true) {
+            uint256 len = queue.length;
+            // A consumed slot is backfilled from the tail rather than stepped over, so every live
+            // entry from `i` on is one this pass has genuinely not looked at yet.
+            if (i >= len) break;
+            if (drained == MAX_DRAIN) {
+                stopped = "MAX_DRAIN";
+                break;
+            }
+            if (scanned == MAX_SCAN) {
+                stopped = "MAX_SCAN";
+                break;
             }
 
-            delete _interested[marketId];
-            _keep(m);
-            _relayExits(marketId);
-            _recordOutcome(m);
-            // Last, because it is the most expensive tenant of a settlement firing by an order of
-            // magnitude and the firing was not paid for by it. The desks that paid, the venue-wide
-            // upkeep and the pre-signed exits all get their gas first.
-            _tickSeries(m);
+            Pending memory entry = queue[i];
+            ++scanned;
+
+            // Not yet. Left exactly where it is, and stepped over rather than stopped at.
+            // Block time is the only clock a handler has, and it is the right one here: a window
+            // closes on wall-clock time, and a validator nudging the block by seconds can only move
+            // a wake-up a few seconds either side of a second the next firing would honour anyway.
+            // forge-lint: disable-next-line(block-timestamp)
+            if (entry.dueAtSec > block.timestamp) {
+                ++i;
+                continue;
+            }
+
+            // Read before the entry is consumed. A frame with nothing left to give must leave the
+            // work queued for the next firing, not take it and fail to do it.
+            if (_stipend(DESK_GAS) == 0) {
+                stopped = "NO_GAS";
+                break;
+            }
+
+            // Swap-and-pop: constant cost, and it keeps the array's length equal to the real
+            // backlog rather than to everything this router has ever queued.
+            uint256 last = len - 1;
+            if (i != last) queue[i] = queue[last];
+            queue.pop();
+            ++drained;
+
+            // The chain removes a one-shot once it has fired, so the slot must not be left pointing
+            // at a dead id. It is freed here rather than on the firing itself, because the firing no
+            // longer knows which instant it stands for — this entry does.
+            delete scheduleIdAt[uint256(entry.dueAtSec) * 1000];
+
+            if (decisions) _onDecision(entry.marketId);
+            else _onSettlement(entry.marketId);
         }
 
-        delete _dueAt[tsMillis];
-        // The chain removes a one-shot once it has fired, so the slot must be freed rather than
-        // left pointing at a dead id: a later window closing at the same millisecond needs a new one.
-        delete scheduleIdAt[tsMillis];
+        if (bytes(stopped).length != 0) emit DrainStopped(decisions, drained, queue.length, stopped);
+    }
+
+    /// @dev A window has closed: settle every desk holding it, then run the work the venue, the
+    /// pre-signed exits and this protocol's own series queued behind it.
+    function _onSettlement(bytes32 marketId) private {
+        LucidTypes.MarketInfo memory m = _markets[marketId];
+
+        address[] storage holders = _interested[marketId];
+        uint256 holderCount = holders.length;
+        for (uint256 j; j < holderCount; ++j) {
+            address desk = holders[j];
+
+            if (desk.code.length == 0) {
+                emit Skipped(desk, marketId, "NO_CODE");
+                continue;
+            }
+
+            uint256 gasFor = _stipend(DESK_GAS);
+            if (gasFor == 0) {
+                emit Skipped(desk, marketId, "NO_GAS");
+                continue;
+            }
+
+            try ILucidDesk(desk).onSettlement{gas: gasFor}(m) {}
+            catch {
+                emit Skipped(desk, marketId, "SETTLEMENT_REVERTED");
+            }
+        }
+
+        delete _interested[marketId];
+        _keep(m);
+        _relayExits(marketId);
+        _recordOutcome(m);
+        // Last, because it is the most expensive tenant of a settlement firing by an order of
+        // magnitude and the firing was not paid for by it. The desks that paid, the venue-wide
+        // upkeep and the pre-signed exits all get their gas first.
+        _tickSeries(m);
     }
 
     /// @dev A window has reached the point in its life where the question is worth asking. This is
@@ -1099,14 +1246,15 @@ contract LucidRouter is SomniaEventHandler, Ownable {
 
         // The desks that trade this window will have to be woken again when it closes, and a wake-up
         // can only be booked in the future — so a window already past its settlement instant must
-        // not be traded, exactly as at creation.
-        uint256 tsMillis = (uint256(m.expiry) + SETTLEMENT_DELAY) * 1000;
-        if (tsMillis < ((block.timestamp + 1) * 1000) + 1) {
+        // not be traded, exactly as at creation. This is also what keeps a decision that a backlog
+        // delayed past its own window from buying a verdict nobody can trade on.
+        uint64 dueAtSec = _settlementSec(m);
+        if (uint256(dueAtSec) * 1000 < ((block.timestamp + 1) * 1000) + 1) {
             emit Skipped(address(0), marketId, "EXPIRED");
             return;
         }
 
-        _serveDesks(m, tsMillis);
+        _serveDesks(m, dueAtSec);
     }
 
     /// @dev Runs DreamDEX's permissionless upkeep for a settled window, for the good of the whole
@@ -1348,8 +1496,28 @@ contract LucidRouter is SomniaEventHandler, Ownable {
     /// one-hour window is asked about an hour in and a five-minute one five minutes in — the point
     /// is a fraction of the price's travel, not a wall-clock delay.
     function _decisionMillis(LucidTypes.MarketInfo memory m) private view returns (uint256) {
+        return uint256(_decisionSec(m)) * 1000;
+    }
+
+    /// @dev The same instant in seconds, which is what a queue entry carries. Milliseconds are the
+    /// precompile's unit for booking a wake-up; seconds are the only clock a handler can compare
+    /// against, so the queue is kept in the unit the drain actually reads.
+    function _decisionSec(LucidTypes.MarketInfo memory m) private view returns (uint64) {
         uint256 offset = (uint256(m.intervalSec) * uint256(decisionPointBps)) / LucidTypes.BPS;
-        return (uint256(m.tradingStart) + offset) * 1000;
+        // casting to `uint64` is safe because `tradingStart` is itself a uint64 and `offset` is
+        // bounded by `intervalSec`, a uint32 — the sum cannot leave the range for any window the
+        // venue can encode.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return uint64(uint256(m.tradingStart) + offset);
+    }
+
+    /// @dev The second a window's settlement work comes due: expiry, plus the grace the venue needs
+    /// to resolve the oracle question.
+    function _settlementSec(LucidTypes.MarketInfo memory m) private pure returns (uint64) {
+        // casting to `uint64` is safe for the same reason as `_decisionSec`: `expiry` is a uint64
+        // and `SETTLEMENT_DELAY` is a literal 5.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return uint64(uint256(m.expiry) + SETTLEMENT_DELAY);
     }
 
     /// @dev Whether the window has less left than the brain needs to answer at all.

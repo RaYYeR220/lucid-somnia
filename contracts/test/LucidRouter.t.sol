@@ -202,6 +202,66 @@ contract MockGasWitnessDesk {
     function onLeaderTrade(LucidTypes.MarketInfo calldata, uint8, uint256) external {}
 }
 
+/// @notice A subscriber that records nothing but the timestamp a wake-up actually carried.
+/// @dev Kept here rather than in `test/mocks/` because it exists for exactly one property, and that
+/// property is about the chain rather than about this protocol: what arrives in `eventTopics[1]` is
+/// the instant the precompile emitted at, not the instant somebody asked for. A router cannot
+/// observe this about itself — it can only fail to find its own work — so the observation is made
+/// from outside.
+contract MockScheduleRecorder {
+    uint256 public calls;
+    uint256 public lastTsMillis;
+
+    function onEvent(address, bytes32[] calldata topics, bytes calldata) external {
+        ++calls;
+        lastTsMillis = uint256(topics[1]);
+    }
+}
+
+/// @notice A keeper that remembers every window it was handed, in order.
+/// @dev Kept here for the same reason as `MockKeeperForRouter`, and separate from it because it
+/// answers a different question: not "was upkeep run" but "which windows, and how many times". A
+/// bounded drain is only correct if the entries one firing declines are exactly the entries the
+/// next firing takes, each of them once.
+contract MockRecordingKeeper {
+    bytes32[] internal _seen;
+
+    function keep(LucidTypes.MarketInfo calldata m) external {
+        _seen.push(m.marketId);
+    }
+
+    function seen() external view returns (bytes32[] memory) {
+        return _seen;
+    }
+
+    function seenCount() external view returns (uint256) {
+        return _seen.length;
+    }
+}
+
+/// @notice A desk that says in the log exactly when it was settled.
+/// @dev Kept here because the only observable that distinguishes "decisions are drained before
+/// settlements" from "both happened" is the order the two appear in one transaction's logs, and
+/// that needs an emitter the router does not control.
+contract MockOrderedDesk {
+    event Settled(bytes32 marketId);
+
+    uint256 public settlementCalls;
+
+    function preCheck(LucidTypes.MarketInfo calldata) external pure returns (bool) {
+        return true;
+    }
+
+    function onVerdict(LucidTypes.MarketInfo calldata, LucidTypes.Verdict calldata, uint256, bool) external {}
+
+    function onSettlement(LucidTypes.MarketInfo calldata m) external {
+        ++settlementCalls;
+        emit Settled(m.marketId);
+    }
+
+    function onLeaderTrade(LucidTypes.MarketInfo calldata, uint8, uint256) external {}
+}
+
 /// @title LucidRouterTest
 /// @notice Exercises the one contract that talks to Somnia's reactivity precompile.
 ///
@@ -231,6 +291,13 @@ contract LucidRouterTest is Test {
     address internal constant ETH_POOL = 0x56154C18cf0e7E601919b13c7478747398AA5057;
     uint64 internal constant TRADING_START = 1_788_647_100;
     uint64 internal constant EXPIRY = 1_788_647_160;
+
+    /// @dev Where `tradingStart` and `expiry` sit in the captured log body, counted in 32-byte
+    /// words from the start of the non-indexed data. Rewriting those two words is what turns the
+    /// fixture into a window of any cadence without inventing an encoding the decoder has never
+    /// seen — `intervalSec` is derived from their difference.
+    uint256 internal constant TRADING_START_WORD = 10;
+    uint256 internal constant EXPIRY_WORD = 11;
 
     /// @dev The router schedules settlement five seconds after expiry, in milliseconds.
     uint256 internal constant DUE_MS = (uint256(EXPIRY) + 5) * 1000;
@@ -457,7 +524,7 @@ contract LucidRouterTest is Test {
 
         assertEq(router.interestedIn(BTC_MARKET_ID).length, 0, "nobody is on the hook for a verdict nobody bought");
         assertEq(precompile.subscriptionCount(), 2, "the venue subscription and the decision wake-up, and nothing more");
-        assertEq(router.pendingAt(DUE_MS).length, 0, "no settlement one-shot was booked for them");
+        assertEq(router.settlementQueueLength(), 0, "no settlement one-shot was booked for them");
 
         // Every desk that would have paid is named, because "we decided not to" and "nothing
         // happened" have to be distinguishable from outside.
@@ -524,10 +591,11 @@ contract LucidRouterTest is Test {
         assertEq(s.handlerContractAddress, address(router), "the router handles it");
         assertGe(s.gasLimit, 5_000_000, "the same 5M floor applies to one-shots");
 
-        bytes32[] memory due = router.pendingAt(DUE_MS);
+        LucidRouter.Pending[] memory due = router.pendingSettlements();
         assertEq(due.length, 1, "one market due");
-        assertEq(due[0], BTC_MARKET_ID, "the BTC window");
-        assertEq(router.scheduleIdAt(DUE_MS), 3, "the one-shot id is remembered");
+        assertEq(due[0].marketId, BTC_MARKET_ID, "the BTC window");
+        assertEq(uint256(due[0].dueAtSec), uint256(EXPIRY) + 5, "filed under its own due second, not under a wake-up key");
+        assertEq(router.scheduleIdAt(DUE_MS), 3, "the one-shot id is remembered, purely so the instant is not booked twice");
     }
 
     function test_one_schedule_subscription_per_timestamp() public {
@@ -538,12 +606,12 @@ contract LucidRouterTest is Test {
 
         // Both fixtures are the same 60-second window, so they share a decision instant too.
         assertEq(precompile.subscriptionCount(), 2, "the second market reuses the decision one-shot");
-        assertEq(router.decisionsAt(DECISION_MS).length, 2, "both markets queued on it");
+        assertEq(router.decisionQueueLength(), 2, "both markets queued against the same instant");
 
         _decide();
 
         assertEq(precompile.subscriptionCount(), 3, "and one settlement one-shot serves both of them");
-        assertEq(router.pendingAt(DUE_MS).length, 2, "both markets queued on it");
+        assertEq(router.settlementQueueLength(), 2, "both markets queued against the same instant");
     }
 
     function test_schedule_fires_settlement_for_all_markets_due_at_that_timestamp() public {
@@ -557,8 +625,8 @@ contract LucidRouterTest is Test {
         _fireSchedule(DUE_MS);
 
         assertEq(d.settlementCalls(), 2, "settled in both markets");
-        assertEq(router.pendingAt(DUE_MS).length, 0, "the queue is drained");
-        assertEq(router.scheduleIdAt(DUE_MS), 0, "the one-shot slot is freed for reuse");
+        assertEq(router.settlementQueueLength(), 0, "the queue is drained");
+        assertEq(router.scheduleIdAt(DUE_MS), 0, "and the dedupe slot for that instant is freed with the work");
         assertEq(router.interestedIn(BTC_MARKET_ID).length, 0, "positions closed out");
         assertEq(router.interestedIn(ETH_MARKET_ID).length, 0, "positions closed out");
     }
@@ -597,8 +665,9 @@ contract LucidRouterTest is Test {
 
         // tradingStart + 60s * 5000bps: halfway through the fixture's one-minute window.
         assertEq(DECISION_MS, (uint256(TRADING_START) + 30) * 1000, "halfway, in milliseconds");
-        assertEq(router.decisionsAt(DECISION_MS).length, 1, "one window is queued for it");
-        assertEq(router.decisionsAt(DECISION_MS)[0], BTC_MARKET_ID, "this one");
+        assertEq(router.decisionQueueLength(), 1, "one window is queued for it");
+        assertEq(router.pendingDecisions()[0].marketId, BTC_MARKET_ID, "this one");
+        assertEq(uint256(router.pendingDecisions()[0].dueAtSec), DECISION_TS, "due at the halfway second");
         assertEq(router.scheduleIdAt(DECISION_MS), 2, "and the one-shot id is remembered");
 
         ISomniaReactivityPrecompile.SubscriptionData memory sub = precompile.subscriptionAt(1);
@@ -613,8 +682,8 @@ contract LucidRouterTest is Test {
         assertEq(brain.requestCount(), 1, "the question is put when there is something to reason about");
         assertEq(brain.lastMarketId(), BTC_MARKET_ID, "for this window");
         assertEq(router.interestedIn(BTC_MARKET_ID).length, 1, "and only then is the desk on the hook");
-        assertEq(router.decisionsAt(DECISION_MS).length, 0, "the decision queue is drained");
-        assertEq(router.scheduleIdAt(DECISION_MS), 0, "and the one-shot slot is freed for reuse");
+        assertEq(router.decisionQueueLength(), 0, "the decision queue is drained");
+        assertEq(router.scheduleIdAt(DECISION_MS), 0, "and the dedupe slot for that instant is freed with the work");
     }
 
     /// @dev The decision point is a fraction of the window rather than a fixed delay, because what
@@ -645,7 +714,7 @@ contract LucidRouterTest is Test {
         _fireBtc();
 
         assertEq(precompile.subscriptionCount(), 1, "only the venue subscription: no wake-up was bought");
-        assertEq(router.decisionsAt(DECISION_MS).length, 0, "nothing queued to be priced");
+        assertEq(router.decisionQueueLength(), 0, "nothing queued to be priced");
         assertEq(router.scheduleIdAt(DECISION_MS), 0, "and no one-shot recorded");
         assertEq(router.gasCreditOf(address(a)), 1 ether, "nobody charged");
         assertEq(router.gasCreditOf(address(b)), 1 ether, "nobody charged");
@@ -663,7 +732,7 @@ contract LucidRouterTest is Test {
         MockDeskForRouter b = _newDesk(true, 1 ether);
 
         _fireBtc();
-        assertEq(router.decisionsAt(DECISION_MS).length, 1, "the wake-up was booked at creation");
+        assertEq(router.decisionQueueLength(), 1, "the wake-up was booked at creation");
 
         // Thirty seconds of window remain at the decision point; the brain now wants six hundred.
         brain.setSlack(600);
@@ -680,7 +749,7 @@ contract LucidRouterTest is Test {
         assertEq(router.gasCreditOf(address(b)), 1 ether, "nor by the other desk");
         assertEq(router.totalGasCredit(), 2 ether, "the credit book agrees");
         assertEq(router.interestedIn(BTC_MARKET_ID).length, 0, "nobody holds this window");
-        assertEq(router.pendingAt(DUE_MS).length, 0, "so no settlement was booked for it either");
+        assertEq(router.settlementQueueLength(), 0, "so no settlement was booked for it either");
         assertEq(_countTopic(logs, keccak256("Debited(address,bytes32,uint256)")), 0, "nothing was debited");
         assertEq(_countTopic(logs, keccak256("VerdictRequested(bytes32,uint256,uint256)")), 0, "nothing requested");
     }
@@ -709,13 +778,13 @@ contract LucidRouterTest is Test {
         MockDeskForRouter d = _newDesk(true, 1 ether);
 
         _fireBtc();
-        assertEq(router.decisionsAt(DECISION_MS).length, 1, "queued to be priced");
-        assertEq(router.pendingAt(DECISION_MS).length, 0, "and not to be settled");
+        assertEq(router.decisionQueueLength(), 1, "queued to be priced");
+        assertEq(router.settlementQueueLength(), 0, "and not to be settled");
 
         _decide();
         assertEq(d.settlementCalls(), 0, "a decision must not settle anybody");
-        assertEq(router.pendingAt(DUE_MS).length, 1, "queued to be settled");
-        assertEq(router.decisionsAt(DUE_MS).length, 0, "and not to be priced");
+        assertEq(router.settlementQueueLength(), 1, "queued to be settled");
+        assertEq(router.decisionQueueLength(), 0, "and not to be priced");
 
         vm.prank(address(brain));
         router.onVerdict(BTC_MARKET_ID, _verdict(6200));
@@ -777,8 +846,12 @@ contract LucidRouterTest is Test {
         emit LucidRouter.DecisionScheduled(BTC_MARKET_ID, quarterMs, 2);
         _fireBtc();
 
-        assertEq(router.decisionsAt(quarterMs).length, 1, "queued a quarter of the way in");
-        assertEq(router.decisionsAt(DECISION_MS).length, 0, "and not halfway");
+        assertEq(router.decisionQueueLength(), 1, "one window queued");
+        assertEq(
+            uint256(router.pendingDecisions()[0].dueAtSec) * 1000, quarterMs, "due a quarter of the way in"
+        );
+        assertEq(router.scheduleIdAt(quarterMs), 2, "and the one-shot was booked for that instant");
+        assertEq(router.scheduleIdAt(DECISION_MS), 0, "not for the halfway one");
     }
 
     // ── what the committee is told about the book ─────────────────────────────
@@ -1137,7 +1210,7 @@ contract LucidRouterTest is Test {
         _fireBtc();
 
         assertEq(precompile.subscriptionCount(), 1, "no one-shot for a market nobody wanted");
-        assertEq(router.pendingAt(DUE_MS).length, 0, "nothing queued");
+        assertEq(router.settlementQueueLength(), 0, "nothing queued");
         assertEq(router.scheduleIdAt(DUE_MS), 0, "no one-shot recorded");
     }
 
@@ -1151,10 +1224,12 @@ contract LucidRouterTest is Test {
         assertEq(precompile.subscriptionCount(), 2, "venue subscription plus one shared one-shot");
         assertEq(router.scheduleIdAt(DUE_MS), 2, "the one-shot is recorded");
 
-        bytes32[] memory due = router.pendingAt(DUE_MS);
+        LucidRouter.Pending[] memory due = router.pendingSettlements();
         assertEq(due.length, 2, "both markets queued for upkeep");
-        assertEq(due[0], BTC_MARKET_ID, "BTC");
-        assertEq(due[1], ETH_MARKET_ID, "ETH");
+        assertEq(due[0].marketId, BTC_MARKET_ID, "BTC");
+        assertEq(due[1].marketId, ETH_MARKET_ID, "ETH");
+        assertEq(uint256(due[0].dueAtSec), uint256(EXPIRY) + 5, "both due at the same second");
+        assertEq(uint256(due[1].dueAtSec), uint256(EXPIRY) + 5, "which is why they share one wake-up");
         assertEq(keeper.keepCalls(), 0, "nothing kept until the window closes");
     }
 
@@ -1185,7 +1260,7 @@ contract LucidRouterTest is Test {
         // With a keeper attached the settlement is booked at creation for the whole venue, and the
         // desks reach it again at the decision point. Once, not twice: a second queue entry would
         // settle every holder twice in the same firing.
-        assertEq(router.pendingAt(DUE_MS).length, 1, "a served market is queued exactly once");
+        assertEq(router.settlementQueueLength(), 1, "a served market is queued exactly once");
 
         vm.warp(EXPIRY + 5);
         vm.expectEmit(true, true, false, true, address(router));
@@ -1223,8 +1298,8 @@ contract LucidRouterTest is Test {
         assertEq(d.settlementCalls(), 1, "the desk settled exactly as it always has");
         assertEq(d.lastSettledMarketId(), BTC_MARKET_ID, "for its market");
         assertEq(router.interestedIn(BTC_MARKET_ID).length, 0, "positions closed out");
-        assertEq(router.pendingAt(DUE_MS).length, 0, "the queue drained");
-        assertEq(router.scheduleIdAt(DUE_MS), 0, "the one-shot slot was freed");
+        assertEq(router.settlementQueueLength(), 0, "the queue drained");
+        assertEq(router.scheduleIdAt(DUE_MS), 0, "the one-shot slot was freed with it");
         assertEq(precompile.subscriptionCount(), 3, "the venue subscription and this window's two wake-ups");
     }
 
@@ -1316,15 +1391,15 @@ contract LucidRouterTest is Test {
 
         _decide();
         assertEq(precompile.subscriptionCount(), 3, "and the settlement one-shot the position obliges");
-        assertEq(router.pendingAt(DUE_MS).length, 1, "queued exactly as before");
+        assertEq(router.settlementQueueLength(), 1, "queued exactly as before");
 
         vm.warp(EXPIRY + 5);
         _fireSchedule(DUE_MS);
 
         assertEq(d.settlementCalls(), 1, "the desk settled exactly as it always has");
         assertEq(d.lastSettledMarketId(), BTC_MARKET_ID, "for its market");
-        assertEq(router.pendingAt(DUE_MS).length, 0, "the queue drained");
-        assertEq(router.scheduleIdAt(DUE_MS), 0, "the one-shot slot was freed");
+        assertEq(router.settlementQueueLength(), 0, "the queue drained");
+        assertEq(router.scheduleIdAt(DUE_MS), 0, "the one-shot slot was freed with it");
         assertEq(precompile.subscriptionCount(), 3, "and no extra subscription was taken out");
     }
 
@@ -1365,7 +1440,7 @@ contract LucidRouterTest is Test {
         _fireBtc();
 
         assertEq(s.venueMarketCalls(), 1, "the heartbeat is taken before the window is judged");
-        assertEq(router.pendingAt(DUE_MS).length, 0, "and the window itself is still declined");
+        assertEq(router.settlementQueueLength(), 0, "and the window itself is still declined");
     }
 
     /// @dev The series spends real money on a venue deployment this router does not own, so it is
@@ -1379,10 +1454,10 @@ contract LucidRouterTest is Test {
         vm.expectEmit(true, true, false, true, address(router));
         emit LucidRouter.Skipped(address(s), BTC_MARKET_ID, "SERIES_FAILED");
         _fireBtc();
-        assertEq(router.decisionsAt(DECISION_MS).length, 1, "the market was served regardless");
+        assertEq(router.decisionQueueLength(), 1, "the market was served regardless");
 
         _decide();
-        assertEq(router.pendingAt(DUE_MS).length, 1, "and its settlement was booked");
+        assertEq(router.settlementQueueLength(), 1, "and its settlement was booked");
 
         vm.warp(EXPIRY + 5);
         vm.expectEmit(true, true, false, true, address(router));
@@ -1560,6 +1635,324 @@ contract LucidRouterTest is Test {
         assertEq(skipped, n, "and every one of them is named rather than dropped");
     }
 
+    // ── wake-ups are nudges, not keys ─────────────────────────────────────────
+    //
+    // Measured on chain, not reasoned about. The router booked one-shots with
+    // `scheduleSubscriptionAtTimestamp` and filed the work under the exact millisecond it asked
+    // for. The chain does not fire `Schedule` with that millisecond: a one-shot matches "at or
+    // after `eventTopics[1]`", and what it delivers is the instant it really emitted at. Decoded
+    // from a live Shannon handler transaction
+    // (0x5775871466afcd7f10e9e7fb2037404f4ced0906f74585856788bc4bd09998ad) a wake-up booked for a
+    // whole second came back carrying 1788719250073. Every lookup missed. Over twenty-five minutes
+    // the deployed router logged 56 `MarketSeen`, 56 `SettlementScheduled` and 10
+    // `DecisionScheduled` — and zero verdicts, zero skips, zero settlements, at 72_254 gas per
+    // firing, which is the early-return path. Settlement had never run once since first deploy.
+    //
+    // Work is drained by the clock now. What follows fires wake-ups that do not match, that arrive
+    // before anything is due, that arrive an hour after everything is, and that arrive with more
+    // work behind them than one handler can hold.
+
+    /// @dev The fixture for the whole section. If this ever passes with the two timestamps equal,
+    /// every other test here is testing a chain that does not exist.
+    function test_the_default_firing_delivers_a_timestamp_that_was_never_requested() public {
+        MockScheduleRecorder recorder = new MockScheduleRecorder();
+
+        precompile.fireSchedule(address(recorder), DUE_MS);
+
+        assertEq(recorder.calls(), 1, "delivered");
+        assertEq(DUE_MS % 1000, 0, "every instant this router books is a whole second times 1000");
+        assertTrue(recorder.lastTsMillis() != DUE_MS, "and the chain does not echo the request back");
+        assertEq(recorder.lastTsMillis(), DUE_MS + 73, "it delivers the instant it actually emitted at");
+        assertEq(recorder.lastTsMillis() % 1000, 73, "which is why a keyed lookup missed every single time");
+        assertEq(precompile.SCHEDULE_SKEW_MS(), 73, "the offset decoded from the Shannon transaction");
+
+        // The literal topic1 from that transaction, so the fixture is the measurement rather than a
+        // rounding of it.
+        precompile.fireScheduleAt(address(recorder), 1_788_719_250_073);
+        assertEq(recorder.lastTsMillis(), 1_788_719_250_073, "and an exact instant passes through untouched");
+    }
+
+    function test_a_decision_fires_when_the_wakeup_carries_a_later_timestamp() public {
+        MockDeskForRouter d = _newDesk(true, 1 ether);
+
+        _fireBtc();
+        assertEq(router.decisionQueueLength(), 1, "queued at creation");
+        assertEq(router.scheduleIdAt(DECISION_MS), 2, "against a one-shot booked for the halfway instant");
+
+        vm.warp(DECISION_TS);
+        // Deliberately not DECISION_MS. Nothing here may depend on that value coming back.
+        _fireScheduleAt(DECISION_MS + 73);
+
+        assertEq(brain.requestCount(), 1, "the committee was asked anyway");
+        assertEq(brain.lastMarketId(), BTC_MARKET_ID, "about the right window");
+        assertEq(router.decisionQueueLength(), 0, "and the entry left the queue");
+        assertEq(router.interestedIn(BTC_MARKET_ID).length, 1, "the desk is on the hook");
+        assertEq(
+            router.gasCreditOf(address(d)),
+            1 ether - (brain.fee() + router.SETTLEMENT_BUDGET()),
+            "and it paid its share of the committee the wake-up went and bought"
+        );
+    }
+
+    function test_a_settlement_fires_when_the_wakeup_carries_a_later_timestamp() public {
+        MockDeskForRouter d = _newDesk(true, 1 ether);
+
+        _fireBtc();
+        _decide();
+        assertEq(router.settlementQueueLength(), 1, "queued at the decision point");
+
+        vm.warp(EXPIRY + 5);
+        _fireScheduleAt(DUE_MS + 73);
+
+        assertEq(d.settlementCalls(), 1, "settled anyway");
+        assertEq(d.lastSettledMarketId(), BTC_MARKET_ID, "the right window");
+        assertEq(router.settlementQueueLength(), 0, "and the entry left the queue");
+        assertEq(router.interestedIn(BTC_MARKET_ID).length, 0, "the position is closed out");
+    }
+
+    /// @dev The general form: the topic is not merely offset, it is irrelevant. A firing that
+    /// claims to be from another day still drains whatever the clock says is due, because that is
+    /// what makes a missed or coalesced wake-up survivable rather than fatal.
+    function test_a_wakeup_carrying_an_unrelated_timestamp_still_drains_what_is_due() public {
+        MockDeskForRouter d = _newDesk(true, 1 ether);
+
+        _fireBtc();
+        _decide();
+
+        vm.warp(EXPIRY + 3600);
+        _fireScheduleAt(1);
+
+        assertEq(d.settlementCalls(), 1, "the work was found by its own due second, not by the topic");
+    }
+
+    function test_an_early_wakeup_drains_nothing_and_leaves_the_work_queued() public {
+        MockDeskForRouter d = _newDesk(true, 1 ether);
+
+        _fireBtc();
+        _decide();
+        assertEq(router.settlementQueueLength(), 1, "one settlement owed");
+
+        // One second short of due, and carrying the settlement instant exactly — the strongest form
+        // of the wrong answer, a matching key with the clock not there yet. The clock wins.
+        vm.warp(EXPIRY + 4);
+        vm.recordLogs();
+        _fireScheduleAt(DUE_MS);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        assertEq(d.settlementCalls(), 0, "nothing was settled early");
+        assertEq(router.settlementQueueLength(), 1, "and the entry is still queued");
+        assertEq(
+            _countTopic(logs, keccak256("DrainStopped(bool,uint256,uint256,string)")),
+            0,
+            "a queue with nothing due in it is not a backlog and must not be reported as one"
+        );
+
+        vm.warp(EXPIRY + 5);
+        _fireSchedule(DUE_MS);
+
+        assertEq(d.settlementCalls(), 1, "the next firing takes it, which is the self-healing part");
+        assertEq(router.settlementQueueLength(), 0, "and the queue empties");
+    }
+
+    /// @dev A handler runs inside a fixed frame, so a backlog has to be bounded by construction.
+    /// The bound is only correct if what one firing declines is exactly what the next one takes —
+    /// once each, nothing lost, nothing done twice.
+    function test_a_backlog_larger_than_MAX_DRAIN_is_drained_across_firings() public {
+        assertEq(router.MAX_DRAIN(), 8, "the per-firing cap this protocol ships");
+
+        MockRecordingKeeper keeper = new MockRecordingKeeper();
+        vm.prank(owner);
+        router.setKeeper(address(keeper));
+
+        uint256 n = 12;
+        bytes32[] memory ids = new bytes32[](n);
+        for (uint256 i; i < n; ++i) {
+            ids[i] = bytes32(0x20000 + i);
+            _fireMarket(uint256(ids[i]), TRADING_START, 60);
+        }
+
+        assertEq(router.settlementQueueLength(), n, "every window is queued for upkeep");
+        assertEq(uint256(router.marketOf(ids[0]).intervalSec), 60, "and the synthetic log decodes as a 60s window");
+        assertEq(uint256(router.marketOf(ids[0]).expiry), uint256(EXPIRY), "closing when the fixture closes");
+
+        vm.warp(EXPIRY + 5);
+
+        vm.expectEmit(false, false, false, true, address(router));
+        emit LucidRouter.DrainStopped(false, 8, 4, "MAX_DRAIN");
+        _fireSchedule(DUE_MS);
+
+        assertEq(keeper.seenCount(), 8, "one firing takes the cap and no more");
+        assertEq(router.settlementQueueLength(), 4, "and the remainder stays queued rather than being dropped");
+
+        _fireSchedule(DUE_MS);
+
+        assertEq(keeper.seenCount(), n, "the next firing finishes the backlog");
+        assertEq(router.settlementQueueLength(), 0, "with nothing left");
+
+        bytes32[] memory seen = keeper.seen();
+        for (uint256 i; i < n; ++i) {
+            assertEq(_countIn(seen, ids[i]), 1, "every window was settled exactly once across the two firings");
+        }
+    }
+
+    /// @dev The queues are appended in due order within one cadence and are not globally ordered
+    /// across four of them. A drain that stopped at the first entry not yet due would strand a
+    /// minute-long window behind an hour-long one for the whole hour.
+    function test_mixed_cadences_queued_out_of_order_are_all_drained() public {
+        assertEq(router.MAX_SCAN(), 16, "the scan window this protocol ships");
+
+        MockRecordingKeeper keeper = new MockRecordingKeeper();
+        vm.prank(owner);
+        router.setKeeper(address(keeper));
+
+        bytes32 slow = bytes32(uint256(0x31000));
+        bytes32 fastA = bytes32(uint256(0x31001));
+        bytes32 fastB = bytes32(uint256(0x31002));
+
+        // The hour-long window is created first, so it sits at the front of the queue while coming
+        // due an hour after the two behind it.
+        _fireMarket(uint256(slow), TRADING_START, 3600);
+        _fireMarket(uint256(fastA), TRADING_START, 60);
+        _fireMarket(uint256(fastB), TRADING_START, 60);
+
+        assertEq(router.settlementQueueLength(), 3, "all three queued");
+        assertEq(router.pendingSettlements()[0].marketId, slow, "the slow one is at the front");
+        assertEq(uint256(router.marketOf(slow).intervalSec), 3600, "and it really is an hour long");
+
+        vm.warp(TRADING_START + 65);
+        _fireSchedule((uint256(TRADING_START) + 65) * 1000);
+
+        assertEq(keeper.seenCount(), 2, "both short windows were reached past the long one");
+        assertEq(_countIn(keeper.seen(), fastA), 1, "the first");
+        assertEq(_countIn(keeper.seen(), fastB), 1, "the second");
+        assertEq(router.settlementQueueLength(), 1, "and the long one is left exactly where it was");
+        assertEq(router.pendingSettlements()[0].marketId, slow, "untouched");
+
+        vm.warp(TRADING_START + 3605);
+        _fireSchedule((uint256(TRADING_START) + 3605) * 1000);
+
+        assertEq(keeper.seenCount(), 3, "and it is taken when its own second arrives");
+        assertEq(_countIn(keeper.seen(), slow), 1, "once");
+        assertEq(router.settlementQueueLength(), 0, "with nothing left over");
+    }
+
+    /// @dev One market's halfway point is another's expiry, so both kinds of work land on the same
+    /// firing. Decisions go first — the order the timestamp-keyed version ran them in, and the
+    /// order that keeps a settlement from ever reaching the committee.
+    function test_one_firing_drains_due_decisions_before_due_settlements() public {
+        MockOrderedDesk desk = new MockOrderedDesk();
+        _admitDesk(address(desk), 1 ether);
+
+        _fireBtc();
+        _decide();
+        assertEq(router.settlementQueueLength(), 1, "the fixture window owes a settlement");
+
+        // A second window whose decision point lands on exactly the second the first one settles.
+        bytes32 late = bytes32(uint256(0x41000));
+        _fireMarket(uint256(late), uint64(uint256(EXPIRY) + 5 - 30), 60);
+        assertEq(router.decisionQueueLength(), 1, "and a decision comes due on that same second");
+
+        vm.warp(EXPIRY + 5);
+        vm.recordLogs();
+        _fireSchedule(DUE_MS);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        uint256 priced = _indexOf(logs, address(router), keccak256("VerdictRequested(bytes32,uint256,uint256)"));
+        uint256 settled = _indexOf(logs, address(desk), keccak256("Settled(bytes32)"));
+
+        assertTrue(priced != type(uint256).max, "the due decision was taken");
+        assertTrue(settled != type(uint256).max, "and the due settlement was taken");
+        assertLt(priced, settled, "decisions before settlements, in one firing");
+
+        assertEq(brain.lastMarketId(), late, "the committee was asked about the new window");
+        assertEq(desk.settlementCalls(), 1, "and the desk was settled in the old one");
+        assertEq(router.decisionQueueLength(), 0, "the decision queue drained");
+        assertEq(router.settlementQueueLength(), 1, "and the new window's own settlement is queued behind it");
+    }
+
+    /// @dev A frame with nothing left to give must end the pass *before* the entry is consumed.
+    /// Taking it and then failing to do it is the one outcome a bounded drain may not produce.
+    function test_a_drain_that_runs_out_of_gas_stops_before_taking_the_work_and_says_so() public {
+        MockDeskForRouter d = _newDesk(true, 1 ether);
+
+        _fireBtc();
+        _decide();
+
+        vm.warp(EXPIRY + 5);
+        assertEq(router.settlementQueueLength(), 1, "one settlement due");
+
+        // At the reserve there is nothing left to hand a callee, by construction.
+        vm.expectEmit(false, false, false, true, address(router));
+        emit LucidRouter.DrainStopped(false, 0, 1, "NO_GAS");
+        assertTrue(_callSchedule(router.GAS_RESERVE()), "the handler reported rather than running out");
+
+        assertEq(d.settlementCalls(), 0, "nothing was half-done");
+        assertEq(router.settlementQueueLength(), 1, "and the entry is still queued rather than consumed and lost");
+
+        _fireSchedule(DUE_MS);
+
+        assertEq(d.settlementCalls(), 1, "a firing with a real frame finishes it");
+        assertEq(router.settlementQueueLength(), 0, "and the queue empties");
+    }
+
+    /// @dev The confusion that must stay impossible now that both kinds of work are found by the
+    /// same clock rather than by two different keys.
+    function test_a_settlement_is_never_drained_as_a_decision() public {
+        MockDeskForRouter d = _newDesk(true, 1 ether);
+
+        _fireBtc();
+        _decide();
+
+        assertEq(brain.requestCount(), 1, "the window was priced once, at its decision point");
+        assertEq(router.decisionQueueLength(), 0, "and its decision entry is gone");
+        assertEq(router.settlementQueueLength(), 1, "only a settlement is owed now");
+
+        vm.warp(EXPIRY + 5);
+        vm.recordLogs();
+        _fireSchedule(DUE_MS);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        assertEq(d.settlementCalls(), 1, "the window was settled");
+        assertEq(brain.requestCount(), 1, "and no second verdict was bought for a window that had resolved");
+        assertEq(_countTopic(logs, keccak256("VerdictRequested(bytes32,uint256,uint256)")), 0, "nothing was priced");
+        assertEq(
+            _countTopic(logs, keccak256("DecisionScheduled(bytes32,uint256,uint256)")),
+            0,
+            "and nothing was queued to be"
+        );
+        assertEq(
+            _countTopic(logs, keccak256("Debited(address,bytes32,uint256)")),
+            0,
+            "nobody paid a committee fee at settlement"
+        );
+    }
+
+    /// @dev The self-healing case end to end: nothing fires until long after both instants have
+    /// passed. Both entries come due together, the settlement runs, and the decision — for a window
+    /// that has already resolved — is refused out loud rather than paid for.
+    function test_a_late_firing_settles_a_window_without_pricing_the_decision_it_missed() public {
+        MockKeeperForRouter keeper = _attachKeeper();
+        MockDeskForRouter d = _newDesk(true, 1 ether);
+
+        // With a keeper attached both wake-ups are booked at creation, so both entries are on the
+        // queues before anything fires at all.
+        _fireBtc();
+        assertEq(router.decisionQueueLength(), 1, "a decision is owed");
+        assertEq(router.settlementQueueLength(), 1, "and a settlement");
+
+        vm.warp(EXPIRY + 5);
+        vm.recordLogs();
+        _fireScheduleAt(DUE_MS + 73);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        assertEq(brain.requestCount(), 0, "an expired window is never priced");
+        assertEq(_countReason(logs, address(0), "EXPIRED"), 1, "and the refusal is named");
+        assertEq(d.settlementCalls(), 0, "no desk ever held it, so no desk is settled");
+        assertEq(keeper.keepCalls(), 1, "but the venue-wide upkeep still ran");
+        assertEq(router.decisionQueueLength(), 0, "the decision queue drained");
+        assertEq(router.settlementQueueLength(), 0, "and so did the settlement queue");
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────────
 
     /// @dev Delivers a verdict inside a frame of exactly `gasCap`, which is the only way to reach
@@ -1683,13 +2076,76 @@ contract LucidRouterTest is Test {
         _fireSchedule(DECISION_MS);
     }
 
-    function _fireSchedule(uint256 tsMillis) internal {
+    /// @dev Delivers a wake-up the way the chain delivers one. The timestamp that arrives is the
+    /// instant the precompile actually emitted at — `requestedMs + MockPrecompile.SCHEDULE_SKEW_MS`
+    /// — and so is never the instant anything was booked for. Every scheduled-path test in this file
+    /// runs through here, which is the point: the polite version of this helper is what let a
+    /// timestamp-keyed router pass a full suite and then no-op on chain for its entire life.
+    function _fireSchedule(uint256 requestedMs) internal {
+        precompile.fireSchedule(address(router), requestedMs);
+    }
+
+    /// @dev Delivers a wake-up carrying exactly `tsMillis`, for what a fixed skew cannot express:
+    /// one that arrives before the work is due, one that arrives an hour after the chain unpaused,
+    /// one firing standing in for two instants.
+    function _fireScheduleAt(uint256 tsMillis) internal {
+        precompile.fireScheduleAt(address(router), tsMillis);
+    }
+
+    /// @dev Delivers a wake-up inside a frame of exactly `gasCap`, which is the only way to reach
+    /// the branch where a drain runs out of budget with entries still due.
+    function _callSchedule(uint256 gasCap) internal returns (bool ok) {
         bytes32[] memory topics = new bytes32[](2);
         topics[0] = LucidTypes.TOPIC_SCHEDULE;
-        topics[1] = bytes32(tsMillis);
+        topics[1] = bytes32(block.timestamp * 1000 + precompile.SCHEDULE_SKEW_MS());
+
+        bytes memory payload = abi.encodeWithSelector(ISomniaEventHandler.onEvent.selector, PRECOMPILE, topics, bytes(""));
 
         vm.prank(PRECOMPILE);
-        router.onEvent(PRECOMPILE, topics, "");
+        (ok,) = address(router).call{gas: gasCap}(payload);
+    }
+
+    /// @dev A synthetic window, made by rewriting the clock inside a real captured log so the bytes
+    /// still travel through `MarketDecoder` exactly as a chain log would. The venue, the pool and
+    /// the asset stay the fixture's; only the id and the window move. `intervalSec` is derived by
+    /// the decoder from `expiry - tradingStart`, which is why both words are rewritten.
+    function _fireMarket(uint256 marketId, uint64 tradingStart, uint32 intervalSec) internal {
+        bytes32[] memory topics = _btcTopics();
+        topics[1] = bytes32(marketId);
+
+        bytes memory data = _btcData();
+        _setWord(data, TRADING_START_WORD, tradingStart);
+        _setWord(data, EXPIRY_WORD, uint256(tradingStart) + intervalSec);
+
+        vm.prank(PRECOMPILE);
+        router.onEvent(MODULE, topics, data);
+    }
+
+    /// @dev Overwrite one 32-byte word of a captured log body in place.
+    function _setWord(bytes memory data, uint256 index, uint256 value) internal pure {
+        uint256 offset = 32 + index * 32;
+        assembly {
+            mstore(add(data, offset), value)
+        }
+    }
+
+    /// @dev The position of the first log with this signature from this emitter, or `type(uint256).max`.
+    /// @dev Ordering between two different emitters is the only way to observe that decisions are
+    /// drained before settlements, which is what keeps the two from ever being confused.
+    function _indexOf(Vm.Log[] memory logs, address emitter, bytes32 topic0) internal pure returns (uint256) {
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].emitter != emitter) continue;
+            if (logs[i].topics.length != 0 && logs[i].topics[0] == topic0) return i;
+        }
+        return type(uint256).max;
+    }
+
+    /// @dev Exactly one occurrence of `value` in `list`. The witness for "nothing was lost": a
+    /// bounded drain is only correct if what it left behind is what the next firing takes, once.
+    function _countIn(bytes32[] memory list, bytes32 value) internal pure returns (uint256 count) {
+        for (uint256 i; i < list.length; ++i) {
+            if (list[i] == value) ++count;
+        }
     }
 
     function _ceilDiv(uint256 a, uint256 b) internal pure returns (uint256) {
