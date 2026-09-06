@@ -24,11 +24,12 @@ contract PolicyHarness {
         LucidTypes.MarketInfo calldata m,
         LucidTypes.Verdict calldata v,
         uint256 pBookBps,
+        bool bookObserved,
         uint256 stake,
         uint256 equity,
         uint256 nowTs
     ) external pure returns (LucidTypes.Refusal) {
-        return PolicyLib.gate(p, s, m, v, pBookBps, stake, equity, nowTs);
+        return PolicyLib.gate(p, s, m, v, pBookBps, bookObserved, stake, equity, nowTs);
     }
 
     function maxStake(LucidTypes.Policy calldata p, LucidTypes.DeskState calldata s)
@@ -120,6 +121,8 @@ contract PolicyLibTest is Test {
         v = LucidTypes.Verdict({probUpBps: 6000, responded: 3, agreed: 3, ok: true, requestId: 1});
     }
 
+    /// @dev Every fixture below quotes a book price, so the observation flag is true here and the
+    /// tests that care about an unobserved book say so explicitly through `_gateBook`.
     function _gate(
         LucidTypes.Policy memory p,
         LucidTypes.DeskState memory s,
@@ -129,7 +132,20 @@ contract PolicyLibTest is Test {
         uint256 stake,
         uint256 equity
     ) internal view returns (LucidTypes.Refusal) {
-        return harness.gate(p, s, m, v, pBookBps, stake, equity, NOW);
+        return harness.gate(p, s, m, v, pBookBps, true, stake, equity, NOW);
+    }
+
+    /// @dev The same call with the book observation made explicit.
+    function _gateBook(
+        LucidTypes.Policy memory p,
+        LucidTypes.DeskState memory s,
+        LucidTypes.Verdict memory v,
+        uint256 pBookBps,
+        bool bookObserved,
+        uint256 stake,
+        uint256 equity
+    ) internal view returns (LucidTypes.Refusal) {
+        return harness.gate(p, s, _market(), v, pBookBps, bookObserved, stake, equity, NOW);
     }
 
     function _expect(LucidTypes.Refusal actual, LucidTypes.Refusal expected) internal pure {
@@ -323,6 +339,132 @@ contract PolicyLibTest is Test {
         LucidTypes.DeskState memory s = _state();
         s.spentToday = 999e6;
         _expect(_gate(_policy(), s, _market(), _verdict(), 5000, 500e6, 1000e6), LucidTypes.Refusal.CapExceeded);
+    }
+
+    // -- the book that was never there -----------------------------------------
+    //
+    // An edge is a distance between the committee's probability and the market's. `LucidRouter`
+    // used to report an empty book as 5000, so a desk comparing an 8800 verdict against it measured
+    // a 38-point edge against a price nobody had quoted, and staked 38% of its equity on it. The
+    // book is now reported with an observation flag, and a strategy that trades on edge has to
+    // refuse when there is no market price to measure against.
+
+    function test_gate_refuses_an_edge_desk_when_the_book_was_not_observed() public view {
+        LucidTypes.Verdict memory v = _verdict();
+        v.probUpBps = 8800; // a 38-point "edge" against the old 5000 fallback
+
+        _expect(
+            _gateBook(_policy(), _state(), v, 0, false, 10e6, 1000e6),
+            LucidTypes.Refusal.NoBook
+        );
+    }
+
+    /// The other half, and the one that is easy to break by over-tightening: a maker mints a
+    /// complete set and rests both legs, which needs no counterparty and no quote to price against.
+    /// An empty book is precisely the state it exists for.
+    function test_gate_lets_a_maker_through_when_the_book_was_not_observed() public view {
+        LucidTypes.Policy memory p = _policy();
+        p.strategy = uint8(LucidTypes.Strategy.Maker);
+
+        LucidTypes.Verdict memory v = _verdict();
+        v.probUpBps = 8800;
+
+        _expect(_gateBook(p, _state(), v, 0, false, 10e6, 1000e6), LucidTypes.Refusal.None);
+    }
+
+    /// A maker is not exempt from anything else. The exemption is about the book alone.
+    function test_a_maker_on_an_empty_book_still_obeys_the_window_cap() public view {
+        LucidTypes.Policy memory p = _policy();
+        p.strategy = uint8(LucidTypes.Strategy.Maker);
+
+        _expect(
+            _gateBook(p, _state(), _verdict(), 0, false, 100e6 + 1, 1000e6),
+            LucidTypes.Refusal.CapExceeded
+        );
+    }
+
+    /// An observed book at 0% is a real quote and must still be traded against. "There was no book"
+    /// and "the book was at zero" are different facts, and only one of them refuses.
+    function test_gate_trades_against_an_observed_book_of_zero() public view {
+        _expect(_gateBook(_policy(), _state(), _verdict(), 0, true, 10e6, 1000e6), LucidTypes.Refusal.None);
+    }
+
+    // -- ordering: where NoBook sits -------------------------------------------
+
+    function test_gate_reports_risk_before_noBook() public view {
+        LucidTypes.DeskState memory s = _state();
+        s.consecutiveLosses = 9;
+        _expect(_gateBook(_policy(), s, _verdict(), 0, false, 10e6, 1000e6), LucidTypes.Refusal.RiskHalt);
+    }
+
+    function test_gate_reports_unavailable_before_noBook() public view {
+        LucidTypes.Verdict memory v = _verdict();
+        v.ok = false;
+        _expect(_gateBook(_policy(), _state(), v, 0, false, 10e6, 1000e6), LucidTypes.Refusal.AiUnavailable);
+    }
+
+    function test_gate_reports_malformed_before_noBook() public view {
+        LucidTypes.Verdict memory v = _verdict();
+        v.probUpBps = 10_001;
+        _expect(_gateBook(_policy(), _state(), v, 0, false, 10e6, 1000e6), LucidTypes.Refusal.AiMalformed);
+    }
+
+    /// NoBook is the precondition of the edge test, so it is reported instead of `LowEdge` rather
+    /// than after it: with no market price there is no edge to be low.
+    function test_gate_reports_noBook_before_lowEdge() public view {
+        LucidTypes.Policy memory p = _policy();
+        p.minEdgeBps = 9999;
+        LucidTypes.Verdict memory v = _verdict();
+        v.probUpBps = 5000;
+        _expect(_gateBook(p, _state(), v, 0, false, 10e6, 1000e6), LucidTypes.Refusal.NoBook);
+    }
+
+    function test_gate_reports_noBook_before_the_cap() public view {
+        _expect(
+            _gateBook(_policy(), _state(), _verdict(), 0, false, 999e6, 1000e6),
+            LucidTypes.Refusal.NoBook
+        );
+    }
+
+    /// The pre-filter runs before the book is ever read, so it cannot and must not know about it.
+    /// A maker with an empty book has to reach the committee at all, or the exemption in `gate`
+    /// would never be exercised.
+    function test_preCheck_is_indifferent_to_the_strategy() public view {
+        LucidTypes.Policy memory maker = _policy();
+        maker.strategy = uint8(LucidTypes.Strategy.Maker);
+
+        _expect(harness.preCheck(_policy(), _state(), _market(), NOW), LucidTypes.Refusal.None);
+        _expect(harness.preCheck(maker, _state(), _market(), NOW), LucidTypes.Refusal.None);
+    }
+
+    // -- the wire format -------------------------------------------------------
+
+    /// The deployed contracts and the front end already speak these numbers. `NoBook` is appended;
+    /// nothing before it may move, because a renumbering would silently retitle every refusal in
+    /// every log line ever emitted — the one change that cannot be noticed from outside.
+    function test_the_refusal_numbering_is_append_only() public pure {
+        assertEq(uint256(LucidTypes.Refusal.None), 0);
+        assertEq(uint256(LucidTypes.Refusal.NotArmed), 1);
+        assertEq(uint256(LucidTypes.Refusal.AssetNotAllowed), 2);
+        assertEq(uint256(LucidTypes.Refusal.CadenceNotAllowed), 3);
+        assertEq(uint256(LucidTypes.Refusal.WindowTooShort), 4);
+        assertEq(uint256(LucidTypes.Refusal.CapExceeded), 5);
+        assertEq(uint256(LucidTypes.Refusal.DailyBudgetExceeded), 6);
+        assertEq(uint256(LucidTypes.Refusal.MaxOpenReached), 7);
+        assertEq(uint256(LucidTypes.Refusal.RiskHalt), 8);
+        assertEq(uint256(LucidTypes.Refusal.AiUnavailable), 9);
+        assertEq(uint256(LucidTypes.Refusal.AiMalformed), 10);
+        assertEq(uint256(LucidTypes.Refusal.LowEdge), 11);
+        assertEq(uint256(LucidTypes.Refusal.VenueRejected), 12);
+        assertEq(uint256(LucidTypes.Refusal.NoCredit), 13);
+        assertEq(uint256(LucidTypes.Refusal.InsufficientFunds), 14);
+        assertEq(uint256(LucidTypes.Refusal.NoBook), 15, "appended at the end, never inserted");
+    }
+
+    /// The sentinel has to be unmistakable: inside the probability range it would read as a quote.
+    function test_the_unobserved_book_sentinel_is_outside_the_probability_range() public pure {
+        assertEq(uint256(LucidTypes.BOOK_UNOBSERVED), 65_535);
+        assertGt(uint256(LucidTypes.BOOK_UNOBSERVED), uint256(LucidTypes.BPS));
     }
 
     // -- edge symmetry ---------------------------------------------------------
@@ -545,6 +687,8 @@ contract PolicyLibTest is Test {
     // -- the gate must survive nonsense ----------------------------------------
 
     /// Router-driven code paths cannot afford a revert here: one would kill the whole fan-out.
+    /// The book observation is fuzzed alongside everything else, because an unobserved book is the
+    /// venue's usual state rather than an edge case.
     function testFuzz_gate_never_reverts(
         uint16 maxDrawdownBps,
         uint16 minEdgeBps,
@@ -553,6 +697,7 @@ contract PolicyLibTest is Test {
         uint64 dailyBudget,
         uint16 probUpBps,
         uint256 pBookBps,
+        bool bookObserved,
         uint256 stake,
         uint256 equity,
         uint256 nowTs
@@ -569,7 +714,9 @@ contract PolicyLibTest is Test {
         LucidTypes.Verdict memory v = _verdict();
         v.probUpBps = probUpBps;
 
-        try harness.gate(p, s, _market(), v, pBookBps, stake, equity, nowTs) returns (LucidTypes.Refusal) {}
+        try harness.gate(p, s, _market(), v, pBookBps, bookObserved, stake, equity, nowTs) returns (
+            LucidTypes.Refusal
+        ) {}
         catch {
             assertTrue(false, "gate reverted");
         }
@@ -604,7 +751,7 @@ contract PolicyLibTest is Test {
     /// An absurd clock must refuse, not overflow while adding the window slack.
     function test_gate_refuses_a_far_future_clock_without_overflowing() public view {
         _expect(
-            harness.gate(_policy(), _state(), _market(), _verdict(), 5000, 10e6, 1000e6, type(uint256).max),
+            harness.gate(_policy(), _state(), _market(), _verdict(), 5000, true, 10e6, 1000e6, type(uint256).max),
             LucidTypes.Refusal.WindowTooShort
         );
     }

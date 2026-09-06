@@ -44,6 +44,9 @@ contract MockDeskForRouter {
 
     bytes32 public lastVerdictMarketId;
     uint256 public lastPBookBps;
+    /// @dev Recorded separately from the value, because the whole point of the flag is that a book
+    /// value alone cannot say whether anybody quoted it.
+    bool public lastBookObserved;
     uint16 public lastProbUpBps;
 
     bytes32 public lastSettledMarketId;
@@ -89,13 +92,19 @@ contract MockDeskForRouter {
         return wants;
     }
 
-    function onVerdict(LucidTypes.MarketInfo calldata m, LucidTypes.Verdict calldata v, uint256 pBookBps) external {
+    function onVerdict(
+        LucidTypes.MarketInfo calldata m,
+        LucidTypes.Verdict calldata v,
+        uint256 pBookBps,
+        bool bookObserved
+    ) external {
         if (revertOnVerdict) revert DeskIsDown();
         if (gasBombOnVerdict) _burnGas();
 
         verdictCalls++;
         lastVerdictMarketId = m.marketId;
         lastPBookBps = pBookBps;
+        lastBookObserved = bookObserved;
         lastProbUpBps = v.probUpBps;
 
         if (reportsTrade) IRouterTradeSink(router).reportTrade(m.marketId, tradeKind, tradeStake);

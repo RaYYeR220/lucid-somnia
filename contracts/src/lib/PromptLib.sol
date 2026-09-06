@@ -19,7 +19,9 @@ library PromptLib {
     /// three fields but not a whole `MarketInfo` may pass a struct carrying just them and get a
     /// byte-identical prompt.
     /// @param m The market being considered.
-    /// @param pBookBps The book-implied UP probability, in bps of probability (10000 = certain).
+    /// @param pBookBps The book-implied UP probability, in bps of probability (10000 = certain), or
+    /// `LucidTypes.BOOK_UNOBSERVED` when there was no book to read — in which case the prompt says
+    /// nothing whatsoever about what the market is quoting. See `_book`.
     /// @param recentOutcomes Past window results, oldest first; any non-zero entry means UP.
     /// @param nowTs The timestamp to measure the remaining window against.
     /// @param spot The asset's current price, in hundredths, on the same scale as the strike.
@@ -32,9 +34,6 @@ library PromptLib {
         uint256 spot
     ) internal pure returns (string memory) {
         uint256 secondsLeft = m.expiry > nowTs ? m.expiry - nowTs : 0;
-        // A mid above 100% means the book was misread upstream; clamping keeps that from reaching
-        // the committee as an impossible fact it would then reason from.
-        uint256 book = pBookBps > LucidTypes.BPS ? LucidTypes.BPS : pBookBps;
 
         return string.concat(
             "Asset: ",
@@ -47,12 +46,44 @@ library PromptLib {
             _distance(spot, m.strike),
             ". Seconds to expiry: ",
             Strings.toString(secondsLeft),
-            ". Book-implied UP probability: ",
-            formatTwoDecimals(book),
-            "%. Recent outcomes: ",
+            // Carries its own leading ". " so that an unobserved book leaves no seam behind: the
+            // prompt reads as if the sentence had never been written, rather than as one with a
+            // hole in it that invites the committee to wonder what was removed.
+            _book(pBookBps),
+            ". Recent outcomes: ",
             _outcomes(recentOutcomes),
             "."
         );
+    }
+
+    /// @dev The book sentence — or nothing at all, when there was no book to read.
+    ///
+    /// Omission, deliberately, rather than a placeholder. Measured on the live three-validator
+    /// committee with everything else held identical: a window +776 bps through the strike with
+    /// eight seconds left scored a median of 50 while "Book-implied UP probability: 50.00%" was in
+    /// the prompt, and 95 with that one sentence deleted; its mirror-image bearish twin scored 0.
+    /// Every production verdict had been coming back at exactly 50.00% because the prompt asserted
+    /// 50 first and then asked for a number. The committee was never degenerate, only anchored.
+    ///
+    /// So a substituted midpoint is not a neutral default. It is a fact the committee reasons from,
+    /// and it is a fact nobody quoted. Whoever reads this next and wants to be helpful: "unknown",
+    /// "n/a" and "50.00%" are the same mistake wearing different clothes. The honest statement when
+    /// the book was empty is that there is no market price, and the honest way to state it is to
+    /// say nothing.
+    ///
+    /// An observed book is the opposite case and is rendered in full: a real quote is real evidence
+    /// about the very question being asked, and the committee is entitled to it.
+    function _book(uint256 pBookBps) private pure returns (string memory) {
+        // Tested before the clamp below and never after. `BOOK_UNOBSERVED` sits above `BPS` on
+        // purpose, so a clamp reached first would fold it to 10000 and hand the committee a
+        // confident "100.00%" where a missing book belongs — reintroducing the anchor silently,
+        // with no line of code that looks wrong.
+        if (pBookBps == LucidTypes.BOOK_UNOBSERVED) return "";
+
+        // Any other value above 100% means the book was misread upstream; clamping keeps that from
+        // reaching the committee as an impossible fact it would then reason from.
+        uint256 book = pBookBps > LucidTypes.BPS ? LucidTypes.BPS : pBookBps;
+        return string.concat(". Book-implied UP probability: ", formatTwoDecimals(book), "%");
     }
 
     /// @notice Signed distance from strike to spot, in basis points of the strike.

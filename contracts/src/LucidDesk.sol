@@ -42,10 +42,17 @@ contract LucidDesk is ILucidDesk {
     /// @notice A window reached this desk and was evaluated.
     event Considered(bytes32 indexed marketId, uint32 intervalSec, bytes32 assetKey);
     /// @notice The committee's answer for a window, recorded before the mandate is applied.
+    /// @dev `pBookBps` carries `LucidTypes.BOOK_UNOBSERVED` (65535) when no side of the venue's book
+    /// quoted. See `Refused`.
     event VerdictReceived(bytes32 indexed marketId, uint16 probUpBps, uint16 pBookBps, uint8 responded);
     /// @notice An order actually reached the venue and the venue accepted it.
     event Executed(bytes32 indexed marketId, uint8 kind, uint256 price, uint256 quantity, uint128 orderId);
     /// @notice The desk declined to trade, and exactly why.
+    /// @dev `pBookBps` is the book value this desk actually saw. When no side of the book quoted it
+    /// carries the sentinel `LucidTypes.BOOK_UNOBSERVED` (65535, outside the 0..10000 probability
+    /// range) rather than a stand-in probability, so a reader can tell "there was no book" apart
+    /// from "the book was at 0%". Those are different facts and this contract reports neither as
+    /// the other.
     event Refused(bytes32 indexed marketId, LucidTypes.Refusal reason, uint16 probUpBps, uint16 pBookBps);
     /// @notice A window closed, was redeemed, and the result was booked.
     event Settled(bytes32 indexed marketId, int256 pnl, uint256 equityAfter);
@@ -256,13 +263,22 @@ contract LucidDesk is ILucidDesk {
     /// @notice Act on a committee verdict for one window. Never reverts.
     /// @param m The window.
     /// @param v The committee's answer.
-    /// @param pBookBps The book-implied UP probability, on the verdict's 0..10000 scale.
-    function onVerdict(LucidTypes.MarketInfo calldata m, LucidTypes.Verdict calldata v, uint256 pBookBps)
-        external
-        onlyRouter
-    {
+    /// @param pBookBps The book-implied UP probability, on the verdict's 0..10000 scale. Only
+    /// meaningful when `bookObserved` is true.
+    /// @param bookObserved Whether any side of the venue's book actually quoted. An empty book is
+    /// the absence of a price, not a price, and this desk is told which of the two it has.
+    function onVerdict(
+        LucidTypes.MarketInfo calldata m,
+        LucidTypes.Verdict calldata v,
+        uint256 pBookBps,
+        bool bookObserved
+    ) external onlyRouter {
+        // Computed once and used in every log line below, so a window with no book reads the same
+        // way wherever it is reported.
+        uint16 bookField = _bookField(pBookBps, bookObserved);
+
         emit Considered(m.marketId, m.intervalSec, m.assetKey);
-        emit VerdictReceived(m.marketId, v.probUpBps, _bps16(pBookBps), v.responded);
+        emit VerdictReceived(m.marketId, v.probUpBps, bookField, v.responded);
 
         // The roll is persisted BEFORE the gate reads it. `PolicyLib` deliberately never rolls
         // the day itself, so a stale `dayKey` would charge yesterday's spending against today's
@@ -274,25 +290,33 @@ contract LucidDesk is ILucidDesk {
         // handler, and the two values must describe the same instant anyway.
         uint256 free = _free();
         uint256 equity_ = free + openNotional;
-        uint256 intended = _intendedStake(equity_, _absDiff(v.probUpBps, pBookBps));
+        // Sizing is by disagreement with the book, so an unobserved book has nothing to disagree
+        // with. `Maker` is the only strategy that reaches the venue from here without a book, and
+        // it quotes around the committee's own fair value rather than around a spread it measured,
+        // so its conviction is the committee's distance from an even split.
+        uint256 edgeBps = bookObserved
+            ? _absDiff(v.probUpBps, pBookBps)
+            : _absDiff(v.probUpBps, LucidTypes.BPS / 2);
+        uint256 intended = _intendedStake(equity_, edgeBps);
 
-        LucidTypes.Refusal r = PolicyLib.gate(_policy, s, m, v, pBookBps, intended, equity_, block.timestamp);
+        LucidTypes.Refusal r =
+            PolicyLib.gate(_policy, s, m, v, pBookBps, bookObserved, intended, equity_, block.timestamp);
         if (r != LucidTypes.Refusal.None) {
-            emit Refused(m.marketId, r, v.probUpBps, _bps16(pBookBps));
+            emit Refused(m.marketId, r, v.probUpBps, bookField);
             return;
         }
 
         uint256 stake = _min(intended, free);
         if (stake == 0) {
-            emit Refused(m.marketId, LucidTypes.Refusal.InsufficientFunds, v.probUpBps, _bps16(pBookBps));
+            emit Refused(m.marketId, LucidTypes.Refusal.InsufficientFunds, v.probUpBps, bookField);
             return;
         }
 
         if (_policy.strategy == uint8(LucidTypes.Strategy.Maker)) {
-            _make(m, stake, v.probUpBps, _bps16(pBookBps));
+            _make(m, stake, v.probUpBps, bookField);
         } else {
             uint8 kind = v.probUpBps > pBookBps ? LucidTypes.BUY_YES : LucidTypes.BUY_NO;
-            _take(m, kind, stake, v.probUpBps, _bps16(pBookBps));
+            _take(m, kind, stake, v.probUpBps, bookField);
         }
     }
 
@@ -321,8 +345,14 @@ contract LucidDesk is ILucidDesk {
         uint16 pBookBps = LucidTypes.BPS / 2;
 
         uint256 free = _free();
+        // `bookObserved` is asserted here, and it is not a claim about the venue's book. This path
+        // mirrors a direction rather than measuring an edge: both the full-conviction verdict above
+        // and the even-money book beside it are constructions of this function, built so the shared
+        // gate stays total. `NoBook` guards the edge computation against a quote nobody made, and
+        // there is no edge being computed here — the follower's own caps, budget, open-window count,
+        // loss streak and drawdown floor are what actually decide this trade.
         LucidTypes.Refusal r =
-            PolicyLib.gate(_policy, s, m, v, pBookBps, stake, free + openNotional, block.timestamp);
+            PolicyLib.gate(_policy, s, m, v, pBookBps, true, stake, free + openNotional, block.timestamp);
         if (r != LucidTypes.Refusal.None) {
             emit Refused(m.marketId, r, v.probUpBps, pBookBps);
             return;
@@ -681,6 +711,12 @@ contract LucidDesk is ILucidDesk {
 
     function _min(uint256 a, uint256 b) private pure returns (uint256) {
         return a < b ? a : b;
+    }
+
+    /// @dev What the book field of a log line carries: the value if it was read, the sentinel if
+    /// there was nothing to read. Never a stand-in probability — see the `Refused` event.
+    function _bookField(uint256 bps, bool observed) private pure returns (uint16) {
+        return observed ? _bps16(bps) : LucidTypes.BOOK_UNOBSERVED;
     }
 
     /// @dev Probabilities are logged as uint16 bps; a caller passing something absurd should not

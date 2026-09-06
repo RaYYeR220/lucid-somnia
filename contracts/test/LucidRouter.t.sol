@@ -160,6 +160,12 @@ contract MockRefusingBrain {
         return fee;
     }
 
+    /// @dev Zero, so this mock's refusal is the one the test is looking at. A non-zero slack would
+    /// make the router decline before it ever asked, and the property under test would go untested.
+    function requiredSlack() external pure returns (uint256) {
+        return 0;
+    }
+
     function requestVerdict(bytes32, LucidTypes.MarketInfo calldata, uint256, uint16[] calldata)
         external
         payable
@@ -185,7 +191,7 @@ contract MockGasWitnessDesk {
         return true;
     }
 
-    function onVerdict(LucidTypes.MarketInfo calldata, LucidTypes.Verdict calldata, uint256) external {
+    function onVerdict(LucidTypes.MarketInfo calldata, LucidTypes.Verdict calldata, uint256, bool) external {
         lastVerdictGas = gasleft();
     }
 
@@ -228,6 +234,12 @@ contract LucidRouterTest is Test {
 
     /// @dev The router schedules settlement five seconds after expiry, in milliseconds.
     uint256 internal constant DUE_MS = (uint256(EXPIRY) + 5) * 1000;
+
+    /// @dev Halfway through the fixture's 60-second window, which is where the committee is asked.
+    /// At `TRADING_START` the strike IS the spot price, so the question has no answer but a coin
+    /// flip; thirty seconds later the price has moved and there is something to reason about.
+    uint256 internal constant DECISION_TS = uint256(TRADING_START) + 30;
+    uint256 internal constant DECISION_MS = DECISION_TS * 1000;
 
     address internal owner = makeAddr("owner");
     address internal deskOwner = makeAddr("deskOwner");
@@ -364,16 +376,19 @@ contract LucidRouterTest is Test {
         assertEq(m.intervalSec, 60, "intervalSec");
     }
 
-    function test_marketCreated_requests_exactly_one_verdict_for_many_desks() public {
+    function test_the_decision_requests_exactly_one_verdict_for_many_desks() public {
         MockDeskForRouter a = _newDesk(true, 1 ether);
         MockDeskForRouter b = _newDesk(true, 1 ether);
         MockDeskForRouter c = _newDesk(true, 1 ether);
 
         uint256 fee = brain.fee();
 
+        _fireBtc();
+        assertEq(brain.requestCount(), 0, "nothing is asked at the open");
+
         vm.expectEmit(true, false, false, true, address(router));
         emit LucidRouter.VerdictRequested(BTC_MARKET_ID, fee, 3);
-        _fireBtc();
+        _decide();
 
         assertEq(brain.requestCount(), 1, "one request serves the whole fan-out");
         assertEq(brain.lastValue(), fee, "the full quoted fee is forwarded");
@@ -408,6 +423,7 @@ contract LucidRouterTest is Test {
         MockDeskForRouter good = _newDesk(true, 1 ether);
 
         _fireBtc();
+        _decide();
 
         address[] memory interested = router.interestedIn(BTC_MARKET_ID);
         assertEq(interested.length, 1, "only the healthy desk");
@@ -426,8 +442,11 @@ contract LucidRouterTest is Test {
         MockDeskForRouter a = _newDesk(true, 1 ether);
         MockDeskForRouter b = _newDesk(true, 1 ether);
 
-        vm.recordLogs();
         _fireBtc();
+        // Recorded around the decision alone: the creation firing has its own `DecisionScheduled`
+        // and its own skips, and the property here is about what the refusal did or did not charge.
+        vm.recordLogs();
+        _decide();
         Vm.Log[] memory logs = vm.getRecordedLogs();
 
         assertEq(refusing.requestCount(), 1, "the brain was asked, and it declined");
@@ -437,7 +456,8 @@ contract LucidRouterTest is Test {
         assertEq(router.totalGasCredit(), 2 ether, "and the credit book agrees");
 
         assertEq(router.interestedIn(BTC_MARKET_ID).length, 0, "nobody is on the hook for a verdict nobody bought");
-        assertEq(precompile.subscriptionCount(), 1, "and no settlement one-shot was booked for them");
+        assertEq(precompile.subscriptionCount(), 2, "the venue subscription and the decision wake-up, and nothing more");
+        assertEq(router.pendingAt(DUE_MS).length, 0, "no settlement one-shot was booked for them");
 
         // Every desk that would have paid is named, because "we decided not to" and "nothing
         // happened" have to be distinguishable from outside.
@@ -460,8 +480,9 @@ contract LucidRouterTest is Test {
         uint256 fee = brain.fee();
         uint256 share = _ceilDiv(fee, 2) + router.SETTLEMENT_BUDGET();
 
-        vm.recordLogs();
         _fireBtc();
+        vm.recordLogs();
+        _decide();
         Vm.Log[] memory logs = vm.getRecordedLogs();
 
         assertEq(brain.requestCount(), 1, "the mock brain answers with a non-zero id");
@@ -470,7 +491,7 @@ contract LucidRouterTest is Test {
         assertEq(router.totalGasCredit(), 2 ether - 2 * share, "and the credit book agrees");
 
         assertEq(router.interestedIn(BTC_MARKET_ID).length, 2, "both desks are on the hook");
-        assertEq(precompile.subscriptionCount(), 2, "and their settlement wake-up is booked");
+        assertEq(precompile.subscriptionCount(), 3, "the venue subscription, the decision wake-up, and the settlement one");
 
         assertEq(_countTopic(logs, keccak256("VerdictRequested(bytes32,uint256,uint256)")), 1, "one request");
         assertEq(_countReason(logs, address(a), "NO_VERDICT"), 0, "and nobody was told it was refused");
@@ -482,13 +503,19 @@ contract LucidRouterTest is Test {
     function test_settlement_oneshot_is_scheduled_after_expiry() public {
         _newDesk(true, 1 ether);
 
+        // The window's own two wake-ups, in the order they are booked: the decision at creation,
+        // the settlement once a desk has actually taken a position.
         vm.expectEmit(true, false, false, true, address(router));
-        emit LucidRouter.SettlementScheduled(BTC_MARKET_ID, DUE_MS, 2);
+        emit LucidRouter.DecisionScheduled(BTC_MARKET_ID, DECISION_MS, 2);
         _fireBtc();
 
-        assertEq(precompile.subscriptionCount(), 2, "venue subscription plus one-shot");
+        vm.expectEmit(true, false, false, true, address(router));
+        emit LucidRouter.SettlementScheduled(BTC_MARKET_ID, DUE_MS, 3);
+        _decide();
 
-        ISomniaReactivityPrecompile.SubscriptionData memory s = precompile.subscriptionAt(1);
+        assertEq(precompile.subscriptionCount(), 3, "venue subscription, decision one-shot, settlement one-shot");
+
+        ISomniaReactivityPrecompile.SubscriptionData memory s = precompile.subscriptionAt(2);
         assertEq(s.eventTopics[0], LucidTypes.TOPIC_SCHEDULE, "Schedule(uint256)");
         assertEq(s.eventTopics[1], bytes32(DUE_MS), "absolute millisecond timestamp");
         assertEq(s.eventTopics[2], bytes32(0), "wildcard");
@@ -500,7 +527,7 @@ contract LucidRouterTest is Test {
         bytes32[] memory due = router.pendingAt(DUE_MS);
         assertEq(due.length, 1, "one market due");
         assertEq(due[0], BTC_MARKET_ID, "the BTC window");
-        assertEq(router.scheduleIdAt(DUE_MS), 2, "the one-shot id is remembered");
+        assertEq(router.scheduleIdAt(DUE_MS), 3, "the one-shot id is remembered");
     }
 
     function test_one_schedule_subscription_per_timestamp() public {
@@ -509,8 +536,13 @@ contract LucidRouterTest is Test {
         _fireBtc();
         _fireEth();
 
-        // Both fixtures are the same 60-second window, so they settle at the same millisecond.
-        assertEq(precompile.subscriptionCount(), 2, "the second market reuses the one-shot");
+        // Both fixtures are the same 60-second window, so they share a decision instant too.
+        assertEq(precompile.subscriptionCount(), 2, "the second market reuses the decision one-shot");
+        assertEq(router.decisionsAt(DECISION_MS).length, 2, "both markets queued on it");
+
+        _decide();
+
+        assertEq(precompile.subscriptionCount(), 3, "and one settlement one-shot serves both of them");
         assertEq(router.pendingAt(DUE_MS).length, 2, "both markets queued on it");
     }
 
@@ -519,6 +551,7 @@ contract LucidRouterTest is Test {
 
         _fireBtc();
         _fireEth();
+        _decide();
 
         vm.warp(EXPIRY + 5);
         _fireSchedule(DUE_MS);
@@ -542,6 +575,245 @@ contract LucidRouterTest is Test {
         assertEq(brain.requestCount(), 0, "nothing happened");
     }
 
+    // ── the decision point ────────────────────────────────────────────────────
+    //
+    // Observed live: every verdict came back exactly 50, from three validators that agreed, on a
+    // 96ms-old spot of 7971580 for market 0x…1530a — and the desk correctly refused `LowEdge`
+    // against it. The committee was not broken. For these markets the strike IS the window's
+    // opening price, so at `tradingStart` spot equals strike and "will it close above the strike"
+    // has no answer but a coin flip. Everything worked; the question was empty. It is now asked
+    // partway through the window instead, once the price has had time to move away from the strike.
+
+    function test_nothing_is_asked_at_creation_and_the_decision_is_booked_halfway_in() public {
+        MockDeskForRouter d = _newDesk(true, 1 ether);
+
+        vm.expectEmit(true, false, false, true, address(router));
+        emit LucidRouter.DecisionScheduled(BTC_MARKET_ID, DECISION_MS, 2);
+        _fireBtc();
+
+        assertEq(brain.requestCount(), 0, "no verdict is bought at the open any more");
+        assertEq(router.gasCreditOf(address(d)), 1 ether, "and nobody is charged for one");
+        assertEq(router.interestedIn(BTC_MARKET_ID).length, 0, "nobody is on the hook yet");
+
+        // tradingStart + 60s * 5000bps: halfway through the fixture's one-minute window.
+        assertEq(DECISION_MS, (uint256(TRADING_START) + 30) * 1000, "halfway, in milliseconds");
+        assertEq(router.decisionsAt(DECISION_MS).length, 1, "one window is queued for it");
+        assertEq(router.decisionsAt(DECISION_MS)[0], BTC_MARKET_ID, "this one");
+        assertEq(router.scheduleIdAt(DECISION_MS), 2, "and the one-shot id is remembered");
+
+        ISomniaReactivityPrecompile.SubscriptionData memory sub = precompile.subscriptionAt(1);
+        assertEq(sub.eventTopics[0], LucidTypes.TOPIC_SCHEDULE, "Schedule(uint256)");
+        assertEq(sub.eventTopics[1], bytes32(DECISION_MS), "at the halfway millisecond");
+        assertEq(sub.emitter, PRECOMPILE, "system events come from the precompile");
+        assertEq(sub.handlerContractAddress, address(router), "the router handles it");
+        assertGe(sub.gasLimit, 5_000_000, "the same 5M floor applies to a decision one-shot");
+
+        _decide();
+
+        assertEq(brain.requestCount(), 1, "the question is put when there is something to reason about");
+        assertEq(brain.lastMarketId(), BTC_MARKET_ID, "for this window");
+        assertEq(router.interestedIn(BTC_MARKET_ID).length, 1, "and only then is the desk on the hook");
+        assertEq(router.decisionsAt(DECISION_MS).length, 0, "the decision queue is drained");
+        assertEq(router.scheduleIdAt(DECISION_MS), 0, "and the one-shot slot is freed for reuse");
+    }
+
+    /// @dev The decision point is a fraction of the window rather than a fixed delay, because what
+    /// matters is how far the price has travelled, not how many seconds have passed. An hour-long
+    /// window is asked about half an hour in; a five-minute one, two and a half minutes in.
+    function test_the_decision_point_is_a_fraction_of_the_window() public {
+        LucidTypes.MarketInfo memory m;
+        m.tradingStart = 1_000_000;
+
+        m.intervalSec = 3600;
+        assertEq(router.decisionPointOf(m), (1_000_000 + 1800) * 1000, "half of an hour");
+
+        m.intervalSec = 300;
+        assertEq(router.decisionPointOf(m), (1_000_000 + 150) * 1000, "half of five minutes");
+
+        vm.prank(owner);
+        router.setDecisionPoint(2_500);
+        assertEq(router.decisionPointOf(m), (1_000_000 + 75) * 1000, "a quarter of five minutes");
+    }
+
+    /// @dev The router pays for its own wake-ups, and asking mid-window roughly doubles how many
+    /// there are per market. A window no armed desk would touch must therefore cost nothing at all:
+    /// no subscription, no float, no firing.
+    function test_no_decision_is_booked_when_every_desk_declines_at_creation() public {
+        MockDeskForRouter a = _newDesk(false, 1 ether);
+        MockDeskForRouter b = _newDesk(false, 1 ether);
+
+        _fireBtc();
+
+        assertEq(precompile.subscriptionCount(), 1, "only the venue subscription: no wake-up was bought");
+        assertEq(router.decisionsAt(DECISION_MS).length, 0, "nothing queued to be priced");
+        assertEq(router.scheduleIdAt(DECISION_MS), 0, "and no one-shot recorded");
+        assertEq(router.gasCreditOf(address(a)), 1 ether, "nobody charged");
+        assertEq(router.gasCreditOf(address(b)), 1 ether, "nobody charged");
+
+        _decide();
+        assertEq(brain.requestCount(), 0, "and there was nothing to wake up for");
+    }
+
+    /// @dev The brain refuses a window with less than `requiredSlack()` left — both of its stages
+    /// have to finish and the desk still needs room to trade — so asking would spend a request in
+    /// order to be told no. Every desk that would have paid is named instead, because "nobody
+    /// wanted it" and "we ran out of window" are different facts.
+    function test_a_decision_that_arrives_too_late_says_so_and_spends_nothing() public {
+        MockDeskForRouter a = _newDesk(true, 1 ether);
+        MockDeskForRouter b = _newDesk(true, 1 ether);
+
+        _fireBtc();
+        assertEq(router.decisionsAt(DECISION_MS).length, 1, "the wake-up was booked at creation");
+
+        // Thirty seconds of window remain at the decision point; the brain now wants six hundred.
+        brain.setSlack(600);
+
+        vm.recordLogs();
+        _decide();
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        assertEq(_countReason(logs, address(a), "TOO_LATE"), 1, "desk a is told why");
+        assertEq(_countReason(logs, address(b), "TOO_LATE"), 1, "desk b is told why");
+
+        assertEq(brain.requestCount(), 0, "the committee was never asked");
+        assertEq(router.gasCreditOf(address(a)), 1 ether, "and nothing was spent finding out");
+        assertEq(router.gasCreditOf(address(b)), 1 ether, "nor by the other desk");
+        assertEq(router.totalGasCredit(), 2 ether, "the credit book agrees");
+        assertEq(router.interestedIn(BTC_MARKET_ID).length, 0, "nobody holds this window");
+        assertEq(router.pendingAt(DUE_MS).length, 0, "so no settlement was booked for it either");
+        assertEq(_countTopic(logs, keccak256("Debited(address,bytes32,uint256)")), 0, "nothing was debited");
+        assertEq(_countTopic(logs, keccak256("VerdictRequested(bytes32,uint256,uint256)")), 0, "nothing requested");
+    }
+
+    /// @dev A brain this router cannot read makes nothing certain, so the window must not be blamed
+    /// for it. `TOO_LATE` says the window ran out; the paths downstream name a missing or refusing
+    /// brain accurately, and a guess here would send whoever reads the log to the wrong contract.
+    function test_an_unreadable_slack_is_not_reported_as_TOO_LATE() public {
+        MockDeskForRouter d = _newDesk(true, 1 ether);
+        _fireBtc();
+
+        brain.setRevertOnSlack(true);
+
+        vm.recordLogs();
+        _decide();
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        assertEq(_countReason(logs, address(d), "TOO_LATE"), 0, "the window was not the problem");
+        assertEq(brain.requestCount(), 1, "so the question was still put");
+    }
+
+    /// @dev The one confusion that must be impossible. A settlement mistaken for a decision would
+    /// ask a committee to price a window that has already resolved; a decision mistaken for a
+    /// settlement would close a position nobody has opened yet.
+    function test_a_settlement_wakeup_is_never_mistaken_for_a_decision() public {
+        MockDeskForRouter d = _newDesk(true, 1 ether);
+
+        _fireBtc();
+        assertEq(router.decisionsAt(DECISION_MS).length, 1, "queued to be priced");
+        assertEq(router.pendingAt(DECISION_MS).length, 0, "and not to be settled");
+
+        _decide();
+        assertEq(d.settlementCalls(), 0, "a decision must not settle anybody");
+        assertEq(router.pendingAt(DUE_MS).length, 1, "queued to be settled");
+        assertEq(router.decisionsAt(DUE_MS).length, 0, "and not to be priced");
+
+        vm.prank(address(brain));
+        router.onVerdict(BTC_MARKET_ID, _verdict(6200));
+        assertEq(d.verdictCalls(), 1, "the desk took its position");
+
+        vm.warp(EXPIRY + 5);
+        _fireSchedule(DUE_MS);
+
+        assertEq(d.settlementCalls(), 1, "settled exactly once");
+        assertEq(brain.requestCount(), 1, "and the settlement firing bought no second verdict");
+    }
+
+    function test_setDecisionPoint_is_owner_only_and_bounded() public {
+        assertEq(router.decisionPointBps(), router.DECISION_POINT_BPS(), "halfway by default");
+        assertEq(router.DECISION_POINT_BPS(), 5_000, "the value this protocol ships");
+
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        router.setDecisionPoint(4_000);
+        assertEq(router.decisionPointBps(), 5_000, "unchanged");
+
+        uint16 low = router.MIN_DECISION_POINT_BPS();
+        uint16 high = router.MAX_DECISION_POINT_BPS();
+        assertEq(low, 1_000, "a tenth of the window");
+        assertEq(high, 8_000, "four fifths of it");
+
+        vm.startPrank(owner);
+        vm.expectRevert(abi.encodeWithSelector(LucidRouter.BadDecisionPoint.selector, uint16(0)));
+        router.setDecisionPoint(0);
+        vm.expectRevert(abi.encodeWithSelector(LucidRouter.BadDecisionPoint.selector, low - 1));
+        router.setDecisionPoint(low - 1);
+        vm.expectRevert(abi.encodeWithSelector(LucidRouter.BadDecisionPoint.selector, high + 1));
+        router.setDecisionPoint(high + 1);
+
+        // Both ends of the band are themselves allowed; the bounds are inclusive.
+        router.setDecisionPoint(low);
+        assertEq(router.decisionPointBps(), low, "the earliest the operator may ask");
+        router.setDecisionPoint(high);
+        assertEq(router.decisionPointBps(), high, "and the latest");
+
+        vm.expectEmit(false, false, false, true, address(router));
+        emit LucidRouter.DecisionPointSet(6_000);
+        router.setDecisionPoint(6_000);
+        vm.stopPrank();
+
+        assertEq(router.decisionPointBps(), 6_000, "and anything in between");
+    }
+
+    /// @dev A moved decision point has to move the wake-up that is actually booked, not merely the
+    /// number in storage.
+    function test_a_moved_decision_point_moves_the_wakeup() public {
+        vm.prank(owner);
+        router.setDecisionPoint(2_500);
+        _newDesk(true, 1 ether);
+
+        uint256 quarterMs = (uint256(TRADING_START) + 15) * 1000;
+
+        vm.expectEmit(true, false, false, true, address(router));
+        emit LucidRouter.DecisionScheduled(BTC_MARKET_ID, quarterMs, 2);
+        _fireBtc();
+
+        assertEq(router.decisionsAt(quarterMs).length, 1, "queued a quarter of the way in");
+        assertEq(router.decisionsAt(DECISION_MS).length, 0, "and not halfway");
+    }
+
+    // ── what the committee is told about the book ─────────────────────────────
+    //
+    // The book line was anchoring the committee. With an empty book the router substituted 50%,
+    // the prompt printed it as a fact, and the committee was then asked to disagree with a number
+    // this protocol had invented. It obediently repeated it — which is the other reason every
+    // production verdict came back exactly 50.00%. Measured on the live committee with the same
+    // window and the book line deleted, the identical question answered 95 on a +776 bps distance
+    // to strike and 0 on the bearish case.
+
+    function test_the_brain_is_told_when_there_was_no_book() public {
+        _newDesk(true, 1 ether);
+        MockPool(BTC_POOL).clearBook();
+
+        _fireBtc();
+        _decide();
+
+        assertEq(brain.requestCount(), 1, "the committee was asked");
+        assertEq(brain.lastPBookBps(), LucidTypes.BOOK_UNOBSERVED, "and no invented probability reached it");
+        assertEq(uint256(LucidTypes.BOOK_UNOBSERVED), 65_535, "the sentinel, spelled out");
+        assertGt(uint256(LucidTypes.BOOK_UNOBSERVED), uint256(LucidTypes.BPS), "outside the probability range");
+    }
+
+    function test_the_brain_is_given_the_real_mid_when_the_book_quotes() public {
+        _newDesk(true, 1 ether);
+        MockPool(BTC_POOL).setLevel(true, 870_000, 200);
+        MockPool(BTC_POOL).setLevel(false, 890_000, 200);
+
+        _fireBtc();
+        _decide();
+
+        assertEq(brain.lastPBookBps(), 8_800, "an observed book is reported exactly as observed");
+    }
+
     // ── fan-out bounds and isolation ──────────────────────────────────────────
 
     function test_fanout_is_bounded_at_max() public {
@@ -551,6 +823,7 @@ contract LucidRouterTest is Test {
         }
 
         _fireBtc();
+        _decide();
 
         assertEq(router.armedDesks().length, max + 8, "all desks are armed");
         assertEq(router.interestedIn(BTC_MARKET_ID).length, max, "but only MAX_FANOUT are served");
@@ -563,6 +836,7 @@ contract LucidRouterTest is Test {
         bad.setRevertModes(false, true, true, false);
 
         _fireBtc();
+        _decide();
 
         vm.expectEmit(true, true, false, true, address(router));
         emit LucidRouter.Skipped(address(bad), BTC_MARKET_ID, "DESK_REVERTED");
@@ -588,6 +862,7 @@ contract LucidRouterTest is Test {
         bomb.setGasBombs(true, true);
 
         _fireBtc();
+        _decide();
 
         vm.prank(address(brain));
         router.onVerdict(BTC_MARKET_ID, _verdict(6200));
@@ -604,9 +879,13 @@ contract LucidRouterTest is Test {
         MockDeskForRouter broke = _newDesk(true, 0);
         MockDeskForRouter funded = _newDesk(true, 1 ether);
 
+        _fireBtc();
+
+        // Credit is only spent when the committee is actually asked, which is now the decision
+        // wake-up rather than the open.
         vm.expectEmit(true, true, false, true, address(router));
         emit LucidRouter.Skipped(address(broke), BTC_MARKET_ID, "NO_CREDIT");
-        _fireBtc();
+        _decide();
 
         address[] memory interested = router.interestedIn(BTC_MARKET_ID);
         assertEq(interested.length, 1, "only the funded desk");
@@ -627,6 +906,7 @@ contract LucidRouterTest is Test {
         MockDeskForRouter rich = _newDesk(true, 1 ether);
 
         _fireBtc();
+        _decide();
 
         address[] memory interested = router.interestedIn(BTC_MARKET_ID);
         assertEq(interested.length, 1, "the thin desk cannot afford the reduced set's share");
@@ -675,12 +955,14 @@ contract LucidRouterTest is Test {
         MockPool(BTC_POOL).setLevel(false, 890_000, 200);
 
         _fireBtc();
+        _decide();
 
         vm.prank(address(brain));
         router.onVerdict(BTC_MARKET_ID, _verdict(6200));
 
         // (0.87 + 0.89) / 2 = 0.88 of one collateral unit.
         assertEq(d.lastPBookBps(), 8_800, "book mid in bps");
+        assertTrue(d.lastBookObserved(), "both sides quoted, so the mid was observed");
         assertEq(d.lastProbUpBps(), 6_200, "the committee's number is passed through");
         assertEq(d.lastVerdictMarketId(), BTC_MARKET_ID, "for this market");
     }
@@ -690,35 +972,45 @@ contract LucidRouterTest is Test {
         MockPool(BTC_POOL).setLevel(true, 640_000, 100);
 
         _fireBtc();
+        _decide();
 
         vm.prank(address(brain));
         router.onVerdict(BTC_MARKET_ID, _verdict(5000));
 
         assertEq(d.lastPBookBps(), 6_400, "a one-sided book is still information");
+        assertTrue(d.lastBookObserved(), "a resting bid is somebody's real opinion");
     }
 
-    function test_pBook_defaults_to_5000_when_the_book_is_empty() public {
+    /// @dev The correction. This used to report 5000, and a desk comparing an 8800 verdict against
+    /// that fallback measures a 38-point edge against a price nobody quoted -- then stakes 38% of
+    /// its equity on it. An empty book is the absence of a price, not a price of 50%, and the desk
+    /// is now told which of the two it has.
+    function test_pBook_reports_unobserved_when_the_book_is_empty() public {
         MockDeskForRouter d = _newDesk(true, 1 ether);
         MockPool(BTC_POOL).clearBook();
 
         _fireBtc();
+        _decide();
 
         vm.prank(address(brain));
         router.onVerdict(BTC_MARKET_ID, _verdict(6200));
 
-        assertEq(d.lastPBookBps(), 5_000, "an empty book implies nothing but a coin flip");
+        assertFalse(d.lastBookObserved(), "nobody quoted, so nothing was observed");
+        assertEq(d.lastPBookBps(), 0, "and no number is invented to stand in for the one that is missing");
     }
 
-    function test_pBook_defaults_to_5000_when_the_pool_reverts() public {
+    function test_pBook_reports_unobserved_when_the_pool_reverts() public {
         MockDeskForRouter d = _newDesk(true, 1 ether);
         MockPool(BTC_POOL).setRevertOnBook(true);
 
         _fireBtc();
+        _decide();
 
         vm.prank(address(brain));
         router.onVerdict(BTC_MARKET_ID, _verdict(6200));
 
-        assertEq(d.lastPBookBps(), 5_000, "a broken pool must not take the fan-out down");
+        assertFalse(d.lastBookObserved(), "a broken pool is not a book, and must not take the fan-out down");
+        assertEq(d.lastPBookBps(), 0, "nor does it produce a reading");
     }
 
     // ── copy trading ──────────────────────────────────────────────────────────
@@ -736,6 +1028,7 @@ contract LucidRouterTest is Test {
         _linkFollower(address(leader), address(follower), 2_500);
 
         _fireBtc();
+        _decide();
 
         vm.prank(address(brain));
         router.onVerdict(BTC_MARKET_ID, _verdict(6200));
@@ -760,6 +1053,7 @@ contract LucidRouterTest is Test {
         assertEq(router.factory(), address(0), "no factory");
 
         _fireBtc();
+        _decide();
         vm.prank(address(brain));
         router.onVerdict(BTC_MARKET_ID, _verdict(6200));
 
@@ -775,6 +1069,7 @@ contract LucidRouterTest is Test {
         factory.setRevertOnRead(true);
 
         _fireBtc();
+        _decide();
         vm.prank(address(brain));
         router.onVerdict(BTC_MARKET_ID, _verdict(6200));
 
@@ -789,6 +1084,7 @@ contract LucidRouterTest is Test {
         _linkFollower(address(leader), address(follower), 10_001);
 
         _fireBtc();
+        _decide();
 
         vm.expectEmit(true, true, false, true, address(router));
         emit LucidRouter.Skipped(address(follower), BTC_MARKET_ID, "BAD_SCALE");
@@ -805,6 +1101,7 @@ contract LucidRouterTest is Test {
         _linkFollower(address(leader), address(follower), 5_000);
 
         _fireBtc();
+        _decide();
 
         vm.expectEmit(true, true, false, true, address(router));
         emit LucidRouter.Skipped(address(follower), BTC_MARKET_ID, "NO_CREDIT");
@@ -884,6 +1181,10 @@ contract LucidRouterTest is Test {
         MockDeskForRouter d = _newDesk(true, 1 ether);
 
         _fireBtc();
+        _decide();
+        // With a keeper attached the settlement is booked at creation for the whole venue, and the
+        // desks reach it again at the decision point. Once, not twice: a second queue entry would
+        // settle every holder twice in the same firing.
         assertEq(router.pendingAt(DUE_MS).length, 1, "a served market is queued exactly once");
 
         vm.warp(EXPIRY + 5);
@@ -915,6 +1216,7 @@ contract LucidRouterTest is Test {
         MockDeskForRouter d = _newDesk(true, 1 ether);
 
         _fireBtc();
+        _decide();
         vm.warp(EXPIRY + 5);
         _fireSchedule(DUE_MS);
 
@@ -923,7 +1225,7 @@ contract LucidRouterTest is Test {
         assertEq(router.interestedIn(BTC_MARKET_ID).length, 0, "positions closed out");
         assertEq(router.pendingAt(DUE_MS).length, 0, "the queue drained");
         assertEq(router.scheduleIdAt(DUE_MS), 0, "the one-shot slot was freed");
-        assertEq(precompile.subscriptionCount(), 2, "and no extra subscription was taken out");
+        assertEq(precompile.subscriptionCount(), 3, "the venue subscription and this window's two wake-ups");
     }
 
     function test_relay_is_drained_at_settlement() public {
@@ -933,6 +1235,7 @@ contract LucidRouterTest is Test {
         MockDeskForRouter d = _newDesk(true, 1 ether);
 
         _fireBtc();
+        _decide();
         assertEq(exits.relayCalls(), 0, "nothing is redeemed before the window closes");
 
         vm.warp(EXPIRY + 5);
@@ -953,6 +1256,7 @@ contract LucidRouterTest is Test {
         MockDeskForRouter d = _newDesk(true, 1 ether);
 
         _fireBtc();
+        _decide();
 
         vm.warp(EXPIRY + 5);
         vm.expectEmit(true, true, false, true, address(router));
@@ -970,6 +1274,7 @@ contract LucidRouterTest is Test {
         router.setRelay(stranger);
 
         _fireEth();
+        _decide();
         vm.warp(EXPIRY + 5);
         _fireSchedule(DUE_MS);
 
@@ -1007,7 +1312,10 @@ contract LucidRouterTest is Test {
         MockDeskForRouter d = _newDesk(true, 1 ether);
 
         _fireBtc();
-        assertEq(precompile.subscriptionCount(), 2, "the venue subscription and one settlement one-shot");
+        assertEq(precompile.subscriptionCount(), 2, "the venue subscription and one decision one-shot");
+
+        _decide();
+        assertEq(precompile.subscriptionCount(), 3, "and the settlement one-shot the position obliges");
         assertEq(router.pendingAt(DUE_MS).length, 1, "queued exactly as before");
 
         vm.warp(EXPIRY + 5);
@@ -1017,7 +1325,7 @@ contract LucidRouterTest is Test {
         assertEq(d.lastSettledMarketId(), BTC_MARKET_ID, "for its market");
         assertEq(router.pendingAt(DUE_MS).length, 0, "the queue drained");
         assertEq(router.scheduleIdAt(DUE_MS), 0, "the one-shot slot was freed");
-        assertEq(precompile.subscriptionCount(), 2, "and no extra subscription was taken out");
+        assertEq(precompile.subscriptionCount(), 3, "and no extra subscription was taken out");
     }
 
     function test_both_series_hooks_are_driven() public {
@@ -1029,6 +1337,10 @@ contract LucidRouterTest is Test {
         assertEq(s.lastVenueMarketId(), BTC_MARKET_ID, "for the window the venue created");
         assertEq(s.lastVenueInterval(), 60, "carrying the cadence it was rolled at");
         assertEq(s.tickCalls(), 0, "and nothing ticks before the window closes");
+
+        _decide();
+        assertEq(s.venueMarketCalls(), 1, "a decision wake-up is not a venue market, and is not reported as one");
+        assertEq(s.tickCalls(), 0, "nor is it a settlement");
 
         vm.warp(EXPIRY + 5);
         _fireSchedule(DUE_MS);
@@ -1067,7 +1379,10 @@ contract LucidRouterTest is Test {
         vm.expectEmit(true, true, false, true, address(router));
         emit LucidRouter.Skipped(address(s), BTC_MARKET_ID, "SERIES_FAILED");
         _fireBtc();
-        assertEq(router.pendingAt(DUE_MS).length, 1, "the market was served regardless");
+        assertEq(router.decisionsAt(DECISION_MS).length, 1, "the market was served regardless");
+
+        _decide();
+        assertEq(router.pendingAt(DUE_MS).length, 1, "and its settlement was booked");
 
         vm.warp(EXPIRY + 5);
         vm.expectEmit(true, true, false, true, address(router));
@@ -1083,6 +1398,7 @@ contract LucidRouterTest is Test {
         router.setSeries(stranger);
 
         _fireEth();
+        _decide();
         vm.warp(EXPIRY + 5);
         _fireSchedule(DUE_MS);
 
@@ -1128,6 +1444,7 @@ contract LucidRouterTest is Test {
         _admitDesk(address(witness), 1 ether);
 
         _fireBtc();
+        _decide();
 
         uint256 frame = 3_000_000;
         assertLt(frame, router.DESK_GAS(), "the frame really is smaller than the ceiling asks for");
@@ -1146,6 +1463,7 @@ contract LucidRouterTest is Test {
     function test_desk_is_skipped_with_NO_GAS_when_the_budget_is_exhausted() public {
         MockDeskForRouter d = _newDesk(true, 1 ether);
         _fireBtc();
+        _decide();
 
         // At the reserve there is nothing left to give away, by construction: the frame the router
         // holds back for its own bookkeeping is the whole frame.
@@ -1164,6 +1482,7 @@ contract LucidRouterTest is Test {
         MockDeskForRouter good = _newDesk(true, 1 ether);
 
         _fireBtc();
+        _decide();
 
         vm.expectEmit(true, true, false, true, address(router));
         emit LucidRouter.Skipped(address(bad), BTC_MARKET_ID, "DESK_REVERTED");
@@ -1180,6 +1499,7 @@ contract LucidRouterTest is Test {
         MockDeskForRouter good = _newDesk(true, 1 ether);
 
         _fireBtc();
+        _decide();
         vm.warp(EXPIRY + 5);
 
         vm.expectEmit(true, true, false, true, address(router));
@@ -1202,10 +1522,12 @@ contract LucidRouterTest is Test {
 
         _newDesk(true, 1 ether);
         _fireBtc();
+        _decide();
 
-        assertEq(precompile.subscriptionCount(), 2, "the venue log subscription and the settlement one-shot");
+        assertEq(precompile.subscriptionCount(), 3, "the venue log subscription and this window's two wake-ups");
         assertEq(precompile.subscriptionAt(0).gasLimit, router.HANDLER_GAS_LIMIT(), "venue log subscription");
-        assertEq(precompile.subscriptionAt(1).gasLimit, router.HANDLER_GAS_LIMIT(), "settlement one-shot");
+        assertEq(precompile.subscriptionAt(1).gasLimit, router.HANDLER_GAS_LIMIT(), "decision one-shot");
+        assertEq(precompile.subscriptionAt(2).gasLimit, router.HANDLER_GAS_LIMIT(), "settlement one-shot");
     }
 
     /// @dev The property that matters when the budget runs out partway down a list: every desk is
@@ -1223,6 +1545,7 @@ contract LucidRouterTest is Test {
         }
 
         _fireBtc();
+        _decide();
         assertEq(router.interestedIn(BTC_MARKET_ID).length, n, "all five are on the hook");
 
         vm.recordLogs();
@@ -1350,6 +1673,14 @@ contract LucidRouterTest is Test {
     function _fireEth() internal {
         vm.prank(PRECOMPILE);
         router.onEvent(MODULE, _ethTopics(), _ethData());
+    }
+
+    /// @dev Delivers the decision wake-up the router booked at creation: warps to the halfway
+    /// point of the fixture window and fires the precompile's `Schedule` event for that instant.
+    /// Nothing is asked of the committee before this runs.
+    function _decide() internal {
+        vm.warp(DECISION_TS);
+        _fireSchedule(DECISION_MS);
     }
 
     function _fireSchedule(uint256 tsMillis) internal {

@@ -139,6 +139,57 @@ contract LucidBrainStageTest is Test {
         assertTrue(_contains(prompt, "Distance to strike: +3 bps"), "computed here, not by the model");
     }
 
+    // ── the book, and the anchor it was ───────────────────────────────────────
+    //
+    // The committee returned exactly 50.00% on every production verdict because the router
+    // substituted a midpoint for an empty book and the prompt then asserted it as a fact. Measured
+    // on the live three-validator committee, identical facts either way: +776 bps through the
+    // strike with eight seconds left scored a median of 50 with the book sentence present and 95
+    // with it deleted, and its bearish twin scored 0. The sentinel is how the router now says "no
+    // book"; these tests hold the whole path from `requestVerdict` to the payload the committee is
+    // handed, because every hop in between is somewhere a well-meaning clamp could put 50 back.
+
+    function test_an_unobserved_book_reaches_the_committee_as_no_sentence_at_all() public {
+        uint256 priceId = _requestPriceWithBook(_market(start + 900), LucidTypes.BOOK_UNOBSERVED);
+        _deliverPrices(priceId, _three(SPOT, SPOT, SPOT));
+
+        string memory prompt = _promptOf(platform.lastRequest().payload);
+        assertFalse(_contains(prompt, "Book"), "the honest statement about an empty book is silence");
+        assertFalse(_contains(prompt, "50.00%"), "no midpoint survived the two stages");
+        // The sentinel sits above BPS, so the clamp on the way into the pending record is exactly
+        // where it could have become a confident lie. It does not.
+        assertFalse(_contains(prompt, "100.00%"), "and it was not clamped into certainty on the way");
+        assertTrue(_contains(prompt, "Spot: 79912.40"), "every other fact still arrived");
+    }
+
+    function test_an_observed_book_reaches_the_committee_unchanged() public {
+        uint256 priceId = _requestPriceWithBook(_market(start + 900), 5123);
+        _deliverPrices(priceId, _three(SPOT, SPOT, SPOT));
+
+        assertTrue(
+            _contains(_promptOf(platform.lastRequest().payload), ". Book-implied UP probability: 51.23%"),
+            "a real quote crosses the callback gap intact, to the basis point"
+        );
+    }
+
+    function test_the_sentinel_changes_the_prompt_by_exactly_one_sentence() public {
+        uint256 unobservedId = _requestPriceWithBook(_market(start + 900), LucidTypes.BOOK_UNOBSERVED);
+        _deliverPrices(unobservedId, _three(SPOT, SPOT, SPOT));
+        string memory unobserved = _promptOf(platform.lastRequest().payload);
+
+        uint256 observedId = _requestPriceWithBook(_market(start + 900), 5123);
+        _deliverPrices(observedId, _three(SPOT, SPOT, SPOT));
+        string memory observed = _promptOf(platform.lastRequest().payload);
+
+        // Same block, same window, same price. If anything other than the book sentence moved, the
+        // measurement that motivated the omission would not be about the book at all.
+        assertEq(
+            _removeFirst(observed, ". Book-implied UP probability: 51.23%"),
+            unobserved,
+            "one sentence, and nothing else"
+        );
+    }
+
     /// @dev The tail the brain carries between callbacks must be the tail the prompt renders. If
     /// `PENDING_OUTCOMES` and `PromptLib.MAX_OUTCOMES` ever drift apart, either the brain pays for
     /// storage nobody reads or the committee silently loses history.
@@ -818,8 +869,14 @@ contract LucidBrainStageTest is Test {
     }
 
     function _requestPrice(LucidTypes.MarketInfo memory m) internal returns (uint256 id) {
+        return _requestPriceWithBook(m, 5000);
+    }
+
+    /// @dev Stage one with a chosen book reading, so a test can hand the brain the sentinel the
+    /// router sends when there was no book at all.
+    function _requestPriceWithBook(LucidTypes.MarketInfo memory m, uint256 pBookBps) internal returns (uint256 id) {
         vm.prank(owner);
-        id = brain.requestVerdict(MARKET, m, 5000, new uint16[](0));
+        id = brain.requestVerdict(MARKET, m, pBookBps, new uint16[](0));
     }
 
     /// @dev A whole window answered in the same block, which is what the fast end of the live
@@ -933,6 +990,32 @@ contract LucidBrainStageTest is Test {
         for (uint256 i; i < out.length; ++i) {
             out[i] = payload[i + 4];
         }
+    }
+
+    /// @dev The haystack with the first occurrence of `needle` cut out, so a test can assert that
+    /// two prompts differ by exactly one sentence rather than by "something around there".
+    function _removeFirst(string memory haystack, string memory needle) internal pure returns (string memory) {
+        bytes memory h = bytes(haystack);
+        bytes memory n = bytes(needle);
+        require(n.length != 0 && n.length <= h.length, "needle does not fit");
+
+        for (uint256 i; i <= h.length - n.length; ++i) {
+            uint256 j;
+            while (j < n.length && h[i + j] == n[j]) {
+                ++j;
+            }
+            if (j != n.length) continue;
+
+            bytes memory out = new bytes(h.length - n.length);
+            for (uint256 k; k < i; ++k) {
+                out[k] = h[k];
+            }
+            for (uint256 k = i + n.length; k < h.length; ++k) {
+                out[k - n.length] = h[k];
+            }
+            return string(out);
+        }
+        revert("needle not present");
     }
 
     function _contains(string memory haystack, string memory needle) internal pure returns (bool) {

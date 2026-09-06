@@ -135,9 +135,19 @@ contract LucidDeskTest is Test {
         return LucidTypes.Verdict({probUpBps: probUpBps, responded: 3, agreed: 3, ok: ok, requestId: 1});
     }
 
+    /// @dev Every fixture that uses this helper quotes a book, so the observation flag is true.
+    /// The tests that care about an empty book drive the desk directly and say so.
     function _drive(bytes32 id, uint16 probUpBps, uint256 pBookBps) internal {
         vm.prank(router);
-        desk.onVerdict(_info(id), _verdict(probUpBps, true), pBookBps);
+        desk.onVerdict(_info(id), _verdict(probUpBps, true), pBookBps, true);
+    }
+
+    /// @dev Drives the desk with the window the venue presents most of the time: a book with no
+    /// levels on either side. The value is zero because nothing was read, and the flag is what says
+    /// so — the desk must never treat the two as the same thing.
+    function _driveNoBook(bytes32 id, uint16 probUpBps) internal {
+        vm.prank(router);
+        desk.onVerdict(_info(id), _verdict(probUpBps, true), 0, false);
     }
 
     // -- lifecycle -------------------------------------------------------------
@@ -163,7 +173,7 @@ contract LucidDeskTest is Test {
         vm.expectRevert(LucidDesk.NotRouter.selector);
         desk.preCheck(m);
         vm.expectRevert(LucidDesk.NotRouter.selector);
-        desk.onVerdict(m, _verdict(8800, true), 5000);
+        desk.onVerdict(m, _verdict(8800, true), 5000, true);
         vm.expectRevert(LucidDesk.NotRouter.selector);
         desk.onSettlement(m);
         vm.expectRevert(LucidDesk.NotRouter.selector);
@@ -272,7 +282,7 @@ contract LucidDeskTest is Test {
         emit Refused(MARKET_A, LucidTypes.Refusal.AiUnavailable, 8800, 5000);
 
         vm.prank(router);
-        desk.onVerdict(_info(MARKET_A), _verdict(8800, false), 5000);
+        desk.onVerdict(_info(MARKET_A), _verdict(8800, false), 5000, true);
 
         assertEq(pool.orderCount(), 0);
     }
@@ -409,6 +419,102 @@ contract LucidDeskTest is Test {
         assertEq(pool.orderAt(0).kind, LucidTypes.SELL_YES);
         assertEq(pool.mintSetCalls(), 1);
         assertEq(desk.state().openMarkets, 1, "the minted set is still a position");
+    }
+
+    // -- the book that was never there -----------------------------------------
+    //
+    // The router used to report an empty book as 5000. A desk comparing an 8800 verdict against
+    // that fallback measures a 38-point edge against a price nobody quoted and stakes 38% of its
+    // equity on it. The book now arrives with an observation flag, and the refusal carries a
+    // sentinel rather than a stand-in probability so a reader can tell "there was no book" from
+    // "the book was at 0%".
+
+    function test_an_edge_desk_refuses_NoBook_and_places_nothing() public {
+        // The same 8800 verdict that trades happily against a quoted 5000 book.
+        vm.expectEmit(true, false, false, true, address(desk));
+        emit Refused(MARKET_A, LucidTypes.Refusal.NoBook, 8800, type(uint16).max);
+        _driveNoBook(MARKET_A, 8800);
+
+        assertEq(pool.orderCount(), 0, "an edge is not measurable against a price nobody quoted");
+        assertEq(desk.state().spentToday, 0, "and nothing was charged against the budget");
+        assertEq(desk.state().openMarkets, 0);
+        assertEq(desk.equity(), FUNDING, "no collateral moved");
+    }
+
+    /// The sentinel is the point of the event: 65535 sits outside the 0..10000 probability range,
+    /// so a reader that does not know about it sees an impossible number rather than a plausible
+    /// lie, and one that does can separate "no book" from "book at zero".
+    function test_the_refusal_carries_the_unobserved_sentinel_not_a_stand_in_price() public {
+        vm.expectEmit(true, false, false, true, address(desk));
+        emit VerdictReceived(MARKET_A, 8800, type(uint16).max, 3);
+        _driveNoBook(MARKET_A, 8800);
+
+        assertEq(uint256(type(uint16).max), 65_535, "the sentinel, spelled out");
+        assertEq(LucidTypes.BOOK_UNOBSERVED, type(uint16).max, "and it is the one the types declare");
+    }
+
+    /// An observed book at zero is a real quote. It is reported as 0, traded against, and must not
+    /// be confused with the window above.
+    function test_an_observed_book_of_zero_is_traded_against_and_reported_as_zero() public {
+        // An 88-point disagreement sizes 88% of equity, and the subject here is the book rather
+        // than the cap, so the cap is lifted out of the way.
+        LucidTypes.Policy memory p = _basePolicy();
+        p.maxStakePerWindow = 100e6;
+        vm.prank(owner);
+        desk.setPolicy(p);
+
+        vm.expectEmit(true, false, false, true, address(desk));
+        emit VerdictReceived(MARKET_A, 8800, 0, 3);
+        _drive(MARKET_A, 8800, 0);
+
+        assertEq(pool.orderCount(), 1, "a quoted book is tradable however low it is");
+        assertTrue(uint256(0) != uint256(type(uint16).max), "and 0 is not the sentinel the empty book carries");
+    }
+
+    /// The whole reason `Maker` exists. It mints a complete set and rests both legs, which needs no
+    /// counterparty at all — an empty book is the state it was built for, and refusing it here
+    /// would delete the one strategy that works on this venue's usual book.
+    function test_a_maker_mints_and_rests_both_legs_on_an_unobserved_book() public {
+        vm.prank(owner);
+        desk.setPolicy(_makerPolicy());
+
+        _driveNoBook(MARKET_A, 6000);
+
+        assertEq(pool.mintSetCalls(), 1, "a maker needs no counterparty, only a complete set");
+        assertEq(pool.lastMintSetAmount(), 10e6);
+        assertEq(pool.orderCount(), 2, "both legs rest");
+
+        MockBinaryPool.Order memory yes = pool.orderAt(0);
+        assertEq(yes.kind, LucidTypes.SELL_YES);
+        assertEq(yes.orderType, LucidTypes.ORDER_POST_ONLY);
+        assertEq(yes.price, 620_000, "quoted around the committee's fair value, not around a book");
+        assertEq(yes.quantity, 10e6);
+
+        MockBinaryPool.Order memory no = pool.orderAt(1);
+        assertEq(no.kind, LucidTypes.SELL_NO);
+        assertEq(no.orderType, LucidTypes.ORDER_POST_ONLY);
+        assertEq(no.price, 580_000, "the NO quote, converted to the YES side the venue wants");
+        assertEq(no.quantity, 10e6);
+
+        assertEq(outcome.balanceOf(address(desk), YES_ID), 10e6);
+        assertEq(outcome.balanceOf(address(desk), NO_ID), 10e6);
+        assertEq(desk.state().spentToday, 10e6, "sized exactly as it is against a quoted 50/50 book");
+        assertEq(desk.state().openMarkets, 1);
+    }
+
+    /// A maker on an empty book is not exempt from the mandate, only from needing a quote.
+    function test_a_maker_on_an_unobserved_book_still_obeys_the_window_cap() public {
+        LucidTypes.Policy memory p = _makerPolicy();
+        p.maxStakePerWindow = 10e6 - 1;
+        vm.prank(owner);
+        desk.setPolicy(p);
+
+        vm.expectEmit(true, false, false, true, address(desk));
+        emit Refused(MARKET_A, LucidTypes.Refusal.CapExceeded, 6000, type(uint16).max);
+        _driveNoBook(MARKET_A, 6000);
+
+        assertEq(pool.mintSetCalls(), 0, "the cap is a veto, not a clamp");
+        assertEq(pool.orderCount(), 0);
     }
 
     // -- settlement ------------------------------------------------------------

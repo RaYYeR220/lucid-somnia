@@ -5,6 +5,9 @@ pragma solidity 0.8.30;
 /// @notice Shared enums, structs and protocol constants. No logic lives here.
 library LucidTypes {
     /// @notice Why a desk declined to trade. `None` is the only value that permits execution.
+    /// @dev New reasons are APPENDED, never inserted. The deployed contracts and the front end
+    /// already speak the numbers below, and a renumbering would silently retitle every refusal in
+    /// every log line ever emitted — the one change that cannot be noticed from the outside.
     enum Refusal {
         None,
         NotArmed,
@@ -20,8 +23,19 @@ library LucidTypes {
         LowEdge,
         VenueRejected,
         NoCredit,
-        InsufficientFunds
+        InsufficientFunds,
+        NoBook
     }
+
+    /// @dev What a book-probability field carries when there was no book to read.
+    ///
+    /// A probability is a number between 0 and `BPS`, so every value in that range is a claim about
+    /// what the market quoted. An empty book is not a claim; it is the absence of one, and rendering
+    /// it as `BPS / 2` would put a price nobody quoted into the log next to prices somebody did.
+    /// This sentinel sits outside the probability range on purpose: a reader that does not know
+    /// about it sees an obviously impossible number rather than a plausible lie, and a reader that
+    /// does can tell "no book" apart from "book at 0%".
+    uint16 internal constant BOOK_UNOBSERVED = type(uint16).max;
 
     /// @notice Which execution style a desk runs.
     /// AiEdge takes liquidity when the committee disagrees with the book.

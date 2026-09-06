@@ -46,13 +46,17 @@ library PolicyLib {
 
     /// @notice The full gate, run once the committee verdict is in and a stake has been sized.
     /// @dev Order is part of the contract with the outside world: mandate, then market, then risk,
-    /// then the AI answer, then the money. Risk state is read before the verdict so a halted desk
-    /// reports why it is halted rather than blaming the committee.
+    /// then the AI answer, then the evidence that answer is judged against, then the money. Risk
+    /// state is read before the verdict so a halted desk reports why it is halted rather than
+    /// blaming the committee. `NoBook` was appended to the enum but inserted into this sequence
+    /// just before `LowEdge`, because it is the precondition of that check rather than a new one.
     /// @param p The owner mandate.
     /// @param s The desk risk accounting.
     /// @param m The market window being traded.
     /// @param v The committee verdict.
     /// @param pBookBps Book-implied UP probability, on the same 0..10000 scale as the verdict.
+    /// @param bookObserved Whether `pBookBps` was actually read off the venue's book. False means
+    /// no side of the book had a level, so there is no market price at all — not a price of zero.
     /// @param stake Intended notional, in raw 6dp collateral units.
     /// @param equity Current desk equity, in raw 6dp collateral units.
     /// @param nowTs Current block timestamp, in seconds.
@@ -63,6 +67,7 @@ library PolicyLib {
         LucidTypes.MarketInfo memory m,
         LucidTypes.Verdict memory v,
         uint256 pBookBps,
+        bool bookObserved,
         uint256 stake,
         uint256 equity,
         uint256 nowTs
@@ -74,6 +79,19 @@ library PolicyLib {
 
         if (!v.ok) return LucidTypes.Refusal.AiUnavailable;
         if (v.probUpBps > LucidTypes.BPS) return LucidTypes.Refusal.AiMalformed;
+
+        // Sits immediately before the edge test because it is the same question asked one step
+        // earlier: an edge is a distance between the committee's probability and the market's, and
+        // with no market price there is no distance to measure. A default standing in for the book
+        // would hand `AiEdge` a large edge against a number nobody quoted, which is a trade opened
+        // on an invented disagreement.
+        //
+        // `Maker` is deliberately exempt. It mints a complete set and rests both legs, which needs
+        // no counterparty and no quote to price against — an empty book is the case it exists for,
+        // and refusing it here would delete the one strategy that works on this venue's usual state.
+        if (!bookObserved && p.strategy == uint8(LucidTypes.Strategy.AiEdge)) {
+            return LucidTypes.Refusal.NoBook;
+        }
 
         uint256 pAi = v.probUpBps;
         uint256 edge = pAi > pBookBps ? pAi - pBookBps : pBookBps - pAi;

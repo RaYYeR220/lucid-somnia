@@ -25,6 +25,9 @@ contract PolicyGateHandler is StdUtils {
     bool public sawMaxStakeMismatch;
     bool public sawStaleDayKey;
     bool public sawUnclearedSpend;
+    bool public sawEdgeTradeWithoutBook;
+    bool public sawMakerRefusedForNoBook;
+    uint256 public unobservedMakerPasses;
 
     constructor(PolicyHarness harness_) {
         HARNESS = harness_;
@@ -34,13 +37,20 @@ contract PolicyGateHandler is StdUtils {
     function fuzzChaos(uint256 seed, uint256 pBookBps, uint256 stake, uint256 equity, uint256 nowTs) external {
         seed = _decorrelate(seed);
 
-        LucidTypes.Policy memory p = _chaosPolicy(seed);
-        LucidTypes.DeskState memory s = _chaosState(seed);
-        LucidTypes.MarketInfo memory m = _market(_word(seed, 20) % 4, _word(seed, 21) % 5, uint64(_word(seed, 22)));
-        LucidTypes.Verdict memory v = _verdict(uint16(_word(seed, 23)), _word(seed, 24) % 2 == 0);
-
         gateCalls++;
-        try HARNESS.gate(p, s, m, v, pBookBps, stake, equity, nowTs) returns (LucidTypes.Refusal) {}
+        // Built inline rather than into named locals: this frame has no room left for them, and
+        // nothing here needs to look at the inputs again once the gate has answered.
+        try HARNESS.gate(
+            _chaosPolicy(seed),
+            _chaosState(seed),
+            _market(_word(seed, 20) % 4, _word(seed, 21) % 5, uint64(_word(seed, 22))),
+            _verdict(uint16(_word(seed, 23)), _word(seed, 24) % 2 == 0),
+            pBookBps,
+            _word(seed, 26) % 2 == 0,
+            stake,
+            equity,
+            nowTs
+        ) returns (LucidTypes.Refusal) {}
         catch {
             sawRevert = true;
         }
@@ -58,26 +68,58 @@ contract PolicyGateHandler is StdUtils {
         stake = bound(stake, 0, 300e6);
         equity = bound(equity, 0, 4000e6);
 
-        LucidTypes.Policy memory p = _plausiblePolicy(seed);
-        LucidTypes.DeskState memory s = _plausibleState(seed, nowTs);
-        LucidTypes.MarketInfo memory m = _market(
-            _word(seed, 14) % 2, _word(seed, 15) % 4, _u64(nowTs + 120 + (_word(seed, 16) % 600))
-        );
-        LucidTypes.Verdict memory v = _verdict(uint16(_word(seed, 17) % 10_001), _word(seed, 18) % 8 != 0);
-
         gateCalls++;
-        try HARNESS.gate(p, s, m, v, _word(seed, 19) % 10_001, stake, equity, nowTs) returns (
-            LucidTypes.Refusal r
-        ) {
-            if (r != LucidTypes.Refusal.None) return;
-            plausiblePasses++;
+        _plausibleGate(seed, stake, equity, nowTs);
+    }
 
-            if (stake > p.maxStakePerWindow) sawCapBreach = true;
-            if (uint256(s.spentToday) + stake > p.dailyBudget) sawBudgetBreach = true;
-            if (stake > 0 && HARNESS.maxStake(p, s) == 0) sawTradeWithoutHeadroom = true;
+    /// @dev Split out of `fuzzPlausible`, and every input built inline, because this frame has no
+    /// room for named locals. The inputs are pure functions of the seed, so rebuilding two of them
+    /// for `_record` costs gas and nothing else.
+    function _plausibleGate(uint256 seed, uint256 stake, uint256 equity, uint256 nowTs) private {
+        try HARNESS.gate(
+            _plausiblePolicy(seed),
+            _plausibleState(seed, nowTs),
+            _market(_word(seed, 14) % 2, _word(seed, 15) % 4, _u64(nowTs + 120 + (_word(seed, 16) % 600))),
+            _verdict(uint16(_word(seed, 17) % 10_001), _word(seed, 18) % 8 != 0),
+            _word(seed, 19) % 10_001,
+            // Half the draws present a book nobody quoted, which is the venue's usual state. The
+            // other half keep the paying branch populated, so the properties stay non-vacuous.
+            _word(seed, 26) % 2 == 0,
+            stake,
+            equity,
+            nowTs
+        ) returns (LucidTypes.Refusal r) {
+            _record(_plausiblePolicy(seed), _plausibleState(seed, nowTs), r, stake, _word(seed, 26) % 2 == 0);
         } catch {
             sawRevert = true;
         }
+    }
+
+    /// @dev What one permitted-or-refused answer says about the properties under test.
+    function _record(
+        LucidTypes.Policy memory p,
+        LucidTypes.DeskState memory s,
+        LucidTypes.Refusal r,
+        uint256 stake,
+        bool bookObserved
+    ) private {
+        bool isMaker = p.strategy == uint8(LucidTypes.Strategy.Maker);
+
+        // A maker needs no counterparty, so an empty book must never be the reason it stands down.
+        // This is the half of the property a refusal-only check would miss.
+        if (isMaker && r == LucidTypes.Refusal.NoBook) sawMakerRefusedForNoBook = true;
+
+        if (r != LucidTypes.Refusal.None) return;
+        plausiblePasses++;
+        if (!bookObserved) {
+            // An edge desk may never trade against a price nobody quoted.
+            if (!isMaker) sawEdgeTradeWithoutBook = true;
+            else unobservedMakerPasses++;
+        }
+
+        if (stake > p.maxStakePerWindow) sawCapBreach = true;
+        if (uint256(s.spentToday) + stake > p.dailyBudget) sawBudgetBreach = true;
+        if (stake > 0 && HARNESS.maxStake(p, s) == 0) sawTradeWithoutHeadroom = true;
     }
 
     /// @notice Everything except the money is already clean, so `maxStake` must be the exact
@@ -92,13 +134,52 @@ contract PolicyGateHandler is StdUtils {
         LucidTypes.Verdict memory v = _verdict(5000, true);
 
         gateCalls++;
-        try HARNESS.gate(p, s, m, v, 5000, stake, 0, nowTs) returns (LucidTypes.Refusal r) {
+        // The book is quoted here on purpose: this entry point exists to pin `maxStake` as the
+        // exact boundary between a trade and a refusal, and an unobserved book would move that
+        // boundary for reasons that have nothing to do with the money.
+        try HARNESS.gate(p, s, m, v, 5000, true, stake, 0, nowTs) returns (LucidTypes.Refusal r) {
             bool traded = r == LucidTypes.Refusal.None;
             if (traded) cleanPasses++;
             if (traded != (stake <= HARNESS.maxStake(p, s))) sawMaxStakeMismatch = true;
             if (traded && stake > p.maxStakePerWindow) sawCapBreach = true;
             if (traded && uint256(s.spentToday) + stake > p.dailyBudget) sawBudgetBreach = true;
             if (traded && HARNESS.maxStake(p, s) == 0) sawTradeWithoutHeadroom = true;
+        } catch {
+            sawRevert = true;
+        }
+    }
+
+    /// @notice A maker on a book nobody quoted, with only the money left in play.
+    ///
+    /// This is the branch the `NoBook` refusal must never reach, and it is driven here directly
+    /// rather than left to a one-in-four draw inside `fuzzPlausible`. An exemption that no campaign
+    /// ever exercises proves exactly as little as a missing one, and a guard that depends on the
+    /// generator getting lucky reports the generator rather than the code.
+    function fuzzMakerNoBook(uint64 cap, uint64 budget, uint64 spent, uint256 stake, uint256 nowTs)
+        external
+    {
+        nowTs = bound(nowTs, 1_000_000_000, 2_000_000_000);
+        stake = bound(stake, 1, type(uint64).max);
+
+        gateCalls++;
+        // Built inline for the same reason as `fuzzChaos`: the frame has no room for named locals.
+        try HARNESS.gate(
+            _cleanMakerPolicy(cap, budget),
+            _cleanState(spent, nowTs),
+            _market(0, 0, _u64(nowTs + 300)),
+            _verdict(5000, true),
+            0,
+            false,
+            stake,
+            0,
+            nowTs
+        ) returns (LucidTypes.Refusal r) {
+            if (r == LucidTypes.Refusal.NoBook) sawMakerRefusedForNoBook = true;
+            if (r != LucidTypes.Refusal.None) return;
+
+            unobservedMakerPasses++;
+            if (stake > cap) sawCapBreach = true;
+            if (uint256(spent) + stake > budget) sawBudgetBreach = true;
         } catch {
             sawRevert = true;
         }
@@ -198,6 +279,12 @@ contract PolicyGateHandler is StdUtils {
         });
     }
 
+    /// @dev The same clean mandate, run by the strategy that needs no counterparty.
+    function _cleanMakerPolicy(uint64 cap, uint64 budget) private pure returns (LucidTypes.Policy memory p) {
+        p = _cleanPolicy(cap, budget);
+        p.strategy = uint8(LucidTypes.Strategy.Maker);
+    }
+
     function _cleanState(uint64 spentToday, uint256 nowTs) private pure returns (LucidTypes.DeskState memory s) {
         s = LucidTypes.DeskState({
             dayKey: _u64(nowTs / 1 days),
@@ -282,6 +369,19 @@ contract PolicyLibInvariantTest is Test {
         assertFalse(handler.sawMaxStakeMismatch(), "maxStake disagrees with the gate");
     }
 
+    /// An edge is a distance from the market's price, so a desk that trades on edge may never be
+    /// permitted to trade when there was no market price to measure against.
+    function invariant_noEdgeTradeAgainstAnUnobservedBook() public view {
+        assertFalse(handler.sawEdgeTradeWithoutBook(), "permitted an edge trade against a price nobody quoted");
+    }
+
+    /// The other half of the same rule, and the one that is easy to break by over-tightening it: a
+    /// maker mints a complete set and rests both legs, which needs no counterparty. An empty book is
+    /// precisely the state it exists for, and it must still be let through.
+    function invariant_makerIsNeverRefusedForAnEmptyBook() public view {
+        assertFalse(handler.sawMakerRefusedForNoBook(), "a maker was refused for having no book to quote against");
+    }
+
     function invariant_rollDayAlwaysLandsOnToday() public view {
         assertFalse(handler.sawStaleDayKey(), "rollDay left a stale day key");
     }
@@ -296,5 +396,10 @@ contract PolicyLibInvariantTest is Test {
         assertGt(handler.gateCalls(), 0, "gate was never called");
         assertGt(handler.cleanPasses(), 0, "no input ever cleared the gate");
         assertGt(handler.plausiblePasses(), 0, "no mixed-policy input ever cleared the gate");
+        assertGt(
+            handler.unobservedMakerPasses(),
+            0,
+            "no maker ever cleared the gate on an empty book, so the exemption proves nothing"
+        );
     }
 }

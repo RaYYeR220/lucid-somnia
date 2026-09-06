@@ -107,6 +107,78 @@ contract PromptLibTest is Test {
         assertTrue(_contains(p, "Seconds to expiry: 0"), "no underflow past expiry");
     }
 
+    // ── the book sentence, and its absence ────────────────────────────────────
+    //
+    // Measured on the live three-validator committee with everything else held identical: a window
+    // +776 bps through the strike with eight seconds left scored a median of 50 while
+    // "Book-implied UP probability: 50.00%" was in the prompt, and 95 with that one sentence
+    // deleted; the mirror-image bearish window scored 0. The substituted midpoint was not a neutral
+    // default, it was the answer. So an empty book now costs the sentence entirely, and the tests
+    // below are what stop a helpful placeholder growing back.
+
+    function test_an_observed_book_is_stated_in_full() public pure {
+        string memory p =
+            PromptLib.build(_market(LucidTypes.ASSET_BTC, 7_988_185), 5123, new uint16[](0), EXPIRY - 60, SPOT);
+
+        assertTrue(
+            _contains(p, ". Book-implied UP probability: 51.23%. Recent outcomes:"),
+            "a real quote is real evidence and the committee keeps it"
+        );
+    }
+
+    function test_a_book_quoted_at_zero_is_still_a_quote() public pure {
+        // Zero is a claim about the market. The sentinel is the absence of one, and the prompt has
+        // to be able to tell them apart or the distinction in `LucidTypes` buys nothing.
+        string memory p =
+            PromptLib.build(_market(LucidTypes.ASSET_BTC, 7_988_185), 0, new uint16[](0), EXPIRY - 60, SPOT);
+
+        assertTrue(_contains(p, ". Book-implied UP probability: 0.00%"), "somebody quoted zero, so say zero");
+    }
+
+    function test_an_unobserved_book_omits_the_sentence_entirely() public pure {
+        string memory p = PromptLib.build(
+            _market(LucidTypes.ASSET_BTC, 7_988_185), LucidTypes.BOOK_UNOBSERVED, new uint16[](0), EXPIRY - 60, SPOT
+        );
+
+        assertFalse(_contains(p, "Book"), "not a sentence, not a label, nothing");
+        assertFalse(_contains(p, "50.00%"), "and no midpoint smuggled back in under another name");
+        assertFalse(_contains(p, "100.00%"), "the sentinel is never clamped into a plausible percentage");
+        assertTrue(_contains(p, "Seconds to expiry: 60. Recent outcomes: none."), "the seam closes cleanly");
+    }
+
+    function test_the_two_prompts_differ_by_exactly_the_book_sentence() public pure {
+        LucidTypes.MarketInfo memory m = _market(LucidTypes.ASSET_BTC, 7_988_185);
+        uint16[] memory outcomes = new uint16[](2);
+        outcomes[0] = 1;
+        outcomes[1] = 0;
+
+        string memory observed = PromptLib.build(m, 5123, outcomes, EXPIRY - 247, SPOT);
+        string memory unobserved = PromptLib.build(m, LucidTypes.BOOK_UNOBSERVED, outcomes, EXPIRY - 247, SPOT);
+
+        // Byte-identical once the one sentence is cut out. The measurement above only means
+        // anything if nothing else moved with it.
+        assertEq(
+            _removeFirst(observed, ". Book-implied UP probability: 51.23%"),
+            unobserved,
+            "one sentence removed, every other byte unchanged"
+        );
+    }
+
+    function test_a_value_just_below_the_sentinel_is_still_a_book_reading() public pure {
+        // 65534 bps is not "no book", it is a book misread upstream. It is clamped and stated,
+        // because the clamp exists for impossible quotes and the omission exists for absent ones,
+        // and only one value on the whole number line means absent.
+        string memory p = PromptLib.build(
+            _market(LucidTypes.ASSET_BTC, 7_988_185),
+            uint256(LucidTypes.BOOK_UNOBSERVED) - 1,
+            new uint16[](0),
+            EXPIRY - 60,
+            SPOT
+        );
+
+        assertTrue(_contains(p, ". Book-implied UP probability: 100.00%"), "clamped to certainty, not omitted");
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────────
 
     function _market(bytes32 assetKey, uint256 strike) internal pure returns (LucidTypes.MarketInfo memory m) {
@@ -116,6 +188,32 @@ contract PromptLibTest is Test {
         m.tradingStart = EXPIRY - 300;
         m.expiry = EXPIRY;
         m.intervalSec = 300;
+    }
+
+    /// @dev The haystack with the first occurrence of `needle` cut out, so a test can assert that
+    /// two prompts differ by exactly one sentence rather than by "something around there".
+    function _removeFirst(string memory haystack, string memory needle) internal pure returns (string memory) {
+        bytes memory h = bytes(haystack);
+        bytes memory n = bytes(needle);
+        require(n.length != 0 && n.length <= h.length, "needle does not fit");
+
+        for (uint256 i; i <= h.length - n.length; ++i) {
+            uint256 j;
+            while (j < n.length && h[i + j] == n[j]) {
+                ++j;
+            }
+            if (j != n.length) continue;
+
+            bytes memory out = new bytes(h.length - n.length);
+            for (uint256 k; k < i; ++k) {
+                out[k] = h[k];
+            }
+            for (uint256 k = i + n.length; k < h.length; ++k) {
+                out[k - n.length] = h[k];
+            }
+            return string(out);
+        }
+        revert("needle not present");
     }
 
     function _contains(string memory haystack, string memory needle) internal pure returns (bool) {

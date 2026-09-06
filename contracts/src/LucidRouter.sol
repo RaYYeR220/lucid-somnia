@@ -114,6 +114,32 @@ contract LucidRouter is SomniaEventHandler, Ownable {
     /// desks are woken slightly late rather than exactly on time.
     uint256 public constant SETTLEMENT_DELAY = 5;
 
+    /// @notice How far into a window the committee is asked, as a fraction of the window in bps.
+    ///
+    /// @dev Halfway, and this is the whole point of asking at all. For these markets the strike IS
+    /// the window's opening price, so at `tradingStart` spot equals strike exactly and "will it
+    /// close above the strike" is a coin flip with no content. That is not a broken committee; it
+    /// is an empty question, and a committee asked an empty question answers 50 — which is what
+    /// every live verdict did, from three sources that agreed, on a 96ms-old spot of 7971580 for
+    /// market 0x…1530a. The desk then correctly refused `LowEdge` against a 50/50 book. Everything
+    /// worked. Nothing was worth asking.
+    ///
+    /// @dev Waiting lets the price move away from the strike, so by the time the committee is asked
+    /// there is a real distance to reason about. It costs one extra wake-up per market, which the
+    /// router pays for — hence the guard in `_onMarketCreated` that books one only when some desk
+    /// has already said it wants the window.
+    uint256 public constant DECISION_POINT_BPS = 5_000;
+
+    /// @notice The earliest point in a window the operator may move the decision to.
+    /// @dev Below a tenth of the window, spot has barely left the strike and the question is the
+    /// empty one again.
+    uint16 public constant MIN_DECISION_POINT_BPS = 1_000;
+
+    /// @notice The latest point in a window the operator may move the decision to.
+    /// @dev Above four fifths, the brain's own `requiredSlack()` refuses almost every window and the
+    /// router would be buying wake-ups to be told no.
+    uint16 public constant MAX_DECISION_POINT_BPS = 8_000;
+
     /// @notice The gas this contract keeps for itself, never offered to a callee.
     /// @dev Held back so the loop can finish and still emit what happened. A handler that runs out
     /// of gas mid-fan-out reports nothing at all, which is the one outcome worse than a skipped desk.
@@ -226,6 +252,15 @@ contract LucidRouter is SomniaEventHandler, Ownable {
     /// behaviour immediately.
     address public series;
 
+    /// @notice How far into a window the committee is asked, in bps of the window length.
+    /// @dev Settable so the operator can retune it against what the venue's price series actually
+    /// does without redeploying the contract that holds the bond. Bounded on both sides, because a
+    /// value near either end reproduces one of the two failures this parameter exists to avoid.
+    // casting to 'uint16' is safe because `DECISION_POINT_BPS` is a literal 5000, and every value
+    // this field can later take is bounded by `setDecisionPoint` to at most 8000.
+    // forge-lint: disable-next-line(unsafe-typecast)
+    uint16 public decisionPointBps = uint16(DECISION_POINT_BPS);
+
     /// @notice Prepaid desk credit held by this contract. Not the operator's money.
     uint256 public totalGasCredit;
 
@@ -235,14 +270,32 @@ contract LucidRouter is SomniaEventHandler, Ownable {
     /// @notice Whether a registered desk currently wants to be considered for new markets.
     mapping(address desk => bool) public deskArmed;
 
-    /// @notice The one-shot subscription id serving a settlement millisecond, or zero.
+    /// @notice The one-shot subscription id serving a wake-up millisecond, or zero.
+    /// @dev Shared by decision and settlement wake-ups on purpose: the chain fires one `Schedule`
+    /// event per millisecond whatever the router queued for it, so a second subscription at the
+    /// same instant would be a second bill for the same wake-up.
     mapping(uint256 tsMillis => uint256) public scheduleIdAt;
 
     address[] internal _deskList;
     mapping(address desk => uint256) internal _gasCredit;
     mapping(bytes32 marketId => LucidTypes.MarketInfo) internal _markets;
     mapping(bytes32 marketId => address[]) internal _interested;
+    /// @dev Windows to settle at a millisecond. Kept in its own mapping from `_decisionAt` rather
+    /// than tagged into one list, because the two wake-ups do opposite things to a desk's position
+    /// — one opens it, one closes it — and a settlement mistaken for a decision would ask a
+    /// committee to price a window that has already resolved.
     mapping(uint256 tsMillis => bytes32[]) internal _dueAt;
+    /// @dev Windows to ask the committee about at a millisecond. See `_dueAt`.
+    mapping(uint256 tsMillis => bytes32[]) internal _decisionAt;
+    /// @dev Whether a window's settlement wake-up is already booked. A market can reach
+    /// `_scheduleSettlement` twice — once from the keeper's venue-wide pass at creation, once from
+    /// the desks' own path at the decision point — and a second queue entry would settle every
+    /// holder twice in the same firing.
+    mapping(bytes32 marketId => bool) internal _settlementBooked;
+    /// @dev Whether a window's decision wake-up is already booked. The venue emits one
+    /// `MarketCreated` per market, but a redelivered log must not buy a second wake-up and then
+    /// charge every desk a second committee fee for the same window.
+    mapping(bytes32 marketId => bool) internal _decisionBooked;
     mapping(address desk => mapping(bytes32 marketId => Trade)) internal _lastTrade;
     mapping(bytes32 assetKey => History) internal _history;
 
@@ -272,6 +325,8 @@ contract LucidRouter is SomniaEventHandler, Ownable {
     error SweepFailed();
     /// @notice A self-call entry point was reached from outside.
     error NotSelf();
+    /// @notice The requested decision point falls outside the band the router will schedule in.
+    error BadDecisionPoint(uint16 bps);
 
     // ─────────────────────────────────────────────────────────────────────────
     // Events
@@ -281,6 +336,10 @@ contract LucidRouter is SomniaEventHandler, Ownable {
     event MarketSeen(bytes32 indexed marketId, uint32 intervalSec, bytes32 assetKey);
     event VerdictRequested(bytes32 indexed marketId, uint256 fee, uint256 deskCount);
     event SettlementScheduled(bytes32 indexed marketId, uint256 tsMillis, uint256 subscriptionId);
+    /// @notice When this router will ask the committee about a window, published so the timing is
+    /// auditable on chain rather than inferred from when a verdict happened to arrive.
+    event DecisionScheduled(bytes32 indexed marketId, uint256 tsMillis, uint256 subscriptionId);
+    event DecisionPointSet(uint16 bps);
     /// @notice Work that was not done, and why.
     /// @dev A zero `desk` means the whole fan-out for that market was skipped rather than one
     /// participant. This event is the protocol's answer to "why did nothing happen", and there is
@@ -390,6 +449,20 @@ contract LucidRouter is SomniaEventHandler, Ownable {
     function setSeries(address series_) external onlyOwner {
         series = series_;
         emit SeriesSet(series_);
+    }
+
+    /// @notice Move the point in a window at which the committee is asked.
+    /// @dev Bounded rather than free, because both ends of the range are the failure this parameter
+    /// exists to prevent: too early and spot has not left the strike, so the committee is asked the
+    /// empty question again; too late and the brain's own `requiredSlack()` refuses, so the router
+    /// buys a wake-up in order to be told no.
+    /// @param bps Fraction of the window, between `MIN_DECISION_POINT_BPS` and
+    /// `MAX_DECISION_POINT_BPS`.
+    function setDecisionPoint(uint16 bps) external onlyOwner {
+        if (bps < MIN_DECISION_POINT_BPS || bps > MAX_DECISION_POINT_BPS) revert BadDecisionPoint(bps);
+
+        decisionPointBps = bps;
+        emit DecisionPointSet(bps);
     }
 
     /// @notice Recover the operator's own float.
@@ -508,9 +581,15 @@ contract LucidRouter is SomniaEventHandler, Ownable {
         return MarketDecoder.decode(topics, data);
     }
 
-    /// @notice Create the settlement one-shot for a millisecond timestamp.
+    /// @notice Create the one-shot wake-up for a millisecond timestamp.
     /// @dev Self-call only. It exists purely as a revert boundary: the subscription helper reverts
     /// on a past timestamp or a thin balance, and a handler must absorb that rather than propagate it.
+    ///
+    /// @dev Kind-agnostic despite the historical name, which is kept because it is the selector the
+    /// deployed ABI publishes. A one-shot is a millisecond and nothing else: the same subscription
+    /// serves a decision wake-up, a settlement wake-up, or both at once when two windows happen to
+    /// land on the same instant. What each firing means is decided by which list the market was
+    /// queued on — `_decisionAt` or `_dueAt` — never by the subscription itself.
     /// @param tsMillis Absolute unix timestamp in milliseconds.
     /// @return subscriptionId The new one-shot's id.
     function scheduleSettlement(uint256 tsMillis) external returns (uint256 subscriptionId) {
@@ -528,7 +607,7 @@ contract LucidRouter is SomniaEventHandler, Ownable {
         // A verdict for a market this router never saw. Nothing to fan out to.
         if (m.marketId == bytes32(0)) return;
 
-        uint256 pBookBps = _pBookBps(m.pool);
+        (uint256 pBookBps, bool bookObserved) = _pBookBps(m.pool);
 
         // A memory copy, because desks re-enter through `reportTrade` while this loop runs and the
         // copy fan-out appends followers to the same list.
@@ -550,7 +629,7 @@ contract LucidRouter is SomniaEventHandler, Ownable {
                 continue;
             }
 
-            try ILucidDesk(desk).onVerdict{gas: gasFor}(m, v, pBookBps) {}
+            try ILucidDesk(desk).onVerdict{gas: gasFor}(m, v, pBookBps, bookObserved) {}
             catch {
                 emit Skipped(desk, marketId, "DESK_REVERTED");
             }
@@ -589,6 +668,31 @@ contract LucidRouter is SomniaEventHandler, Ownable {
     /// @return The windows a firing at that timestamp will settle.
     function pendingAt(uint256 tsMillis) external view returns (bytes32[] memory) {
         return _dueAt[tsMillis];
+    }
+
+    /// @notice The markets queued to be priced at a millisecond timestamp.
+    /// @dev Deliberately separate from `pendingAt`. A settlement closes a position and a decision
+    /// opens one, and a caller that could not tell them apart would read a window about to be
+    /// traded as a window about to be booked.
+    /// @param tsMillis Absolute unix timestamp in milliseconds.
+    /// @return The windows a firing at that timestamp will ask the committee about.
+    function decisionsAt(uint256 tsMillis) external view returns (bytes32[] memory) {
+        return _decisionAt[tsMillis];
+    }
+
+    /// @notice Whether a window's settlement wake-up has already been booked.
+    /// @param marketId The window's venue id.
+    /// @return True once the window is queued to settle, whoever booked it.
+    function settlementBooked(bytes32 marketId) external view returns (bool) {
+        return _settlementBooked[marketId];
+    }
+
+    /// @notice The instant this router will ask the committee about a window.
+    /// @dev Derived rather than stored, so it always describes the current `decisionPointBps`.
+    /// @param m The window.
+    /// @return Absolute unix timestamp in milliseconds.
+    function decisionPointOf(LucidTypes.MarketInfo calldata m) external view returns (uint256) {
+        return _decisionMillis(m);
     }
 
     /// @notice Every registered desk currently asking to be considered.
@@ -668,47 +772,105 @@ contract LucidRouter is SomniaEventHandler, Ownable {
             return;
         }
 
-        bool scheduled = _serveDesks(m, tsMillis);
+        // Nothing is asked of the committee here any more. At this instant the strike IS the spot
+        // price, so the question has no content and the answer is 50 every time. All that happens
+        // now is a promise to come back later, and only if somebody wants the window.
+        _scheduleDecision(m);
 
         // Venue-wide upkeep needs the router to be awake after this window closes, and nothing else
-        // — so a market no desk wanted still gets a one-shot, but only when a keeper is attached to
-        // make use of it. With no keeper the router pays for exactly what its desks asked for.
-        if (!scheduled && keeper != address(0)) _scheduleSettlement(m.marketId, tsMillis);
+        // — so every market on the venue gets a settlement one-shot, but only when a keeper is
+        // attached to make use of it. With no keeper the router books settlement at the decision
+        // point instead, for exactly the desks that paid to be there.
+        if (keeper != address(0)) _scheduleSettlement(m.marketId, tsMillis);
     }
 
-    /// @dev The desks' half of a new market: who wants it, who pays for the committee, and the
-    /// settlement wake-up their positions oblige the router to book.
-    /// @return scheduled Whether the settlement one-shot for this market was already handled here.
-    function _serveDesks(LucidTypes.MarketInfo memory m, uint256 tsMillis) private returns (bool scheduled) {
+    /// @dev Books the wake-up at which this window will actually be priced, if anyone wants it.
+    ///
+    /// The `preCheck` pass is run here rather than only at the decision point because the router
+    /// pays for its own wake-ups, and this change roughly doubles how many there are. A market no
+    /// armed desk would touch must cost nothing — no subscription, no float, no firing. The pass is
+    /// run again when the wake-up lands, because a desk's answer can have changed by then: it is a
+    /// filter, not a reservation.
+    function _scheduleDecision(LucidTypes.MarketInfo memory m) private {
+        if (_decisionBooked[m.marketId]) return;
+
+        // Silent when nobody wants the window: on a venue that rolls two assets a minute, saying so
+        // every time would bury every log line that matters.
+        if (_candidates(m).length == 0) return;
+
+        uint256 tsMillis = _decisionMillis(m);
+
+        // A window whose decision point has already passed cannot be woken for. Rather than fall
+        // back to asking now — which is the behaviour this whole change exists to remove — it is
+        // declined out loud, so a router that is chronically late is visible rather than quietly
+        // trading on the empty question again.
+        if (tsMillis < ((block.timestamp + 1) * 1000) + 1) {
+            emit Skipped(address(0), m.marketId, "DECISION_PAST");
+            return;
+        }
+
+        uint256 subscriptionId = scheduleIdAt[tsMillis];
+        if (subscriptionId == 0) {
+            try this.scheduleSettlement(tsMillis) returns (uint256 newId) {
+                subscriptionId = newId;
+                scheduleIdAt[tsMillis] = newId;
+            } catch {
+                // No wake-up means no verdict for this window at all. Nobody has been charged and
+                // nobody holds a position, so this is a missed opportunity rather than a broken
+                // state — but it is still the reason nothing happened, and it is named.
+                emit Skipped(address(0), m.marketId, "DECISION_SCHEDULE_FAILED");
+                return;
+            }
+        }
+
+        _decisionBooked[m.marketId] = true;
+        _decisionAt[tsMillis].push(m.marketId);
+        emit DecisionScheduled(m.marketId, tsMillis, subscriptionId);
+    }
+
+    /// @dev The desks' half of a window that has reached its decision point: who still wants it, who
+    /// pays for the committee, and the settlement wake-up their positions oblige the router to book.
+    function _serveDesks(LucidTypes.MarketInfo memory m, uint256 tsMillis) private {
         address[] memory candidates = _candidates(m);
-        if (candidates.length == 0) return false;
+        if (candidates.length == 0) return;
+
+        // The brain refuses a window with less than `requiredSlack()` left — both of its stages
+        // have to finish and the desk still needs room to trade. Asking anyway would spend a
+        // request in order to be told no, so the question is not put. Every desk that would have
+        // paid is named, because "nobody wanted it" and "we ran out of window" are different facts.
+        if (_tooLateToAsk(m)) {
+            for (uint256 i; i < candidates.length; ++i) {
+                emit Skipped(candidates[i], m.marketId, "TOO_LATE");
+            }
+            return;
+        }
 
         // Checked before `_quote` rather than inside it, because a quote that never happened for
         // want of gas is not the same fact as a brain that is missing or broken, and "NO_BRAIN"
         // would send whoever reads this log to inspect a contract that was fine.
         if (_stipend(BOOK_GAS) == 0) {
             emit Skipped(address(0), m.marketId, "NO_GAS");
-            return false;
+            return;
         }
 
         (bool quoted, uint256 fee) = _quote();
         if (!quoted) {
             emit Skipped(address(0), m.marketId, "NO_BRAIN");
-            return false;
+            return;
         }
         // The bond is not spendable float. Dipping below it would silently disarm every
         // subscription this router owns, including the settlement wake-ups already promised.
         if (address(this).balance < SUBSCRIPTION_FLOOR + fee) {
             emit Skipped(address(0), m.marketId, "ROUTER_FLOAT");
-            return false;
+            return;
         }
 
         (address[] memory payers, uint256 share) = _resolvePayers(m.marketId, candidates, fee);
-        if (payers.length == 0) return false;
+        if (payers.length == 0) return;
 
         // The committee is shown the same two pieces of evidence a desk will later be judged
         // against: what the book thinks right now, and how this asset's recent windows resolved.
-        uint256 pBookBps = _pBookBps(m.pool);
+        uint256 pBookBps = _pBookForPrompt(m.pool);
         uint16[] memory recent = recentOf(m.assetKey);
 
         // Paid before anyone is charged: if the committee cannot be reached, no desk is on the hook
@@ -718,7 +880,7 @@ contract LucidRouter is SomniaEventHandler, Ownable {
             requestId = id;
         } catch {
             emit Skipped(address(0), m.marketId, "VERDICT_REQUEST_FAILED");
-            return false;
+            return;
         }
 
         // Zero is the brain refusing, not the brain failing. It declines a window it cannot price
@@ -733,7 +895,7 @@ contract LucidRouter is SomniaEventHandler, Ownable {
             for (uint256 i; i < payers.length; ++i) {
                 emit Skipped(payers[i], m.marketId, "NO_VERDICT");
             }
-            return false;
+            return;
         }
 
         emit VerdictRequested(m.marketId, fee, payers.length);
@@ -747,7 +909,6 @@ contract LucidRouter is SomniaEventHandler, Ownable {
         }
 
         _scheduleSettlement(m.marketId, tsMillis);
-        return true;
     }
 
     /// @dev Armed desks that want this market, capped at `MAX_FANOUT` considered. A desk whose
@@ -835,7 +996,14 @@ contract LucidRouter is SomniaEventHandler, Ownable {
 
     /// @dev One one-shot serves every market ending at the same millisecond, which on a venue that
     /// rolls BTC and ETH on the same 60-second grid halves the subscriptions outright.
+    ///
+    /// A market reaches here at most once. With a keeper attached it is booked at creation for the
+    /// whole venue; the desks' own path reaches it again at the decision point, and a second entry
+    /// in the same queue would call `onSettlement` twice on every holder in one firing — booking
+    /// the same window's result against the desk's loss streak and open-market count twice over.
     function _scheduleSettlement(bytes32 marketId, uint256 tsMillis) private {
+        if (_settlementBooked[marketId]) return;
+
         uint256 subscriptionId = scheduleIdAt[tsMillis];
 
         if (subscriptionId == 0) {
@@ -850,6 +1018,7 @@ contract LucidRouter is SomniaEventHandler, Ownable {
             }
         }
 
+        _settlementBooked[marketId] = true;
         _dueAt[tsMillis].push(marketId);
         emit SettlementScheduled(marketId, tsMillis, subscriptionId);
     }
@@ -858,8 +1027,23 @@ contract LucidRouter is SomniaEventHandler, Ownable {
     // Schedule branch
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @dev Every market that closed at this millisecond, and every desk holding one of them.
+    /// @dev Everything this router promised to do at this millisecond: price the windows that have
+    /// reached their decision point, then settle the windows that have closed.
+    ///
+    /// Both kinds of work can land on the same instant — one market's halfway point is another's
+    /// expiry — and the chain fires exactly one `Schedule` event for a millisecond however much was
+    /// queued against it. Which list a market is on is the only thing that says what happens to it,
+    /// which is why they are separate lists and not one tagged one.
     function _onSchedule(uint256 tsMillis) private {
+        bytes32[] storage decisions = _decisionAt[tsMillis];
+        uint256 decisionCount = decisions.length;
+        for (uint256 i; i < decisionCount; ++i) {
+            _onDecision(decisions[i]);
+        }
+        // Cleared before the settlement pass, so a market that somehow appears on both lists at the
+        // same millisecond cannot be priced twice.
+        delete _decisionAt[tsMillis];
+
         bytes32[] storage due = _dueAt[tsMillis];
         uint256 marketCount = due.length;
 
@@ -903,6 +1087,26 @@ contract LucidRouter is SomniaEventHandler, Ownable {
         // The chain removes a one-shot once it has fired, so the slot must be freed rather than
         // left pointing at a dead id: a later window closing at the same millisecond needs a new one.
         delete scheduleIdAt[tsMillis];
+    }
+
+    /// @dev A window has reached the point in its life where the question is worth asking. This is
+    /// what the `MarketCreated` branch used to do at the open, run now that spot has had half the
+    /// window to move away from the strike and there is a real disagreement to price.
+    function _onDecision(bytes32 marketId) private {
+        LucidTypes.MarketInfo memory m = _markets[marketId];
+        // A decision for a market this router never stored. Nothing to serve.
+        if (m.marketId == bytes32(0)) return;
+
+        // The desks that trade this window will have to be woken again when it closes, and a wake-up
+        // can only be booked in the future — so a window already past its settlement instant must
+        // not be traded, exactly as at creation.
+        uint256 tsMillis = (uint256(m.expiry) + SETTLEMENT_DELAY) * 1000;
+        if (tsMillis < ((block.timestamp + 1) * 1000) + 1) {
+            emit Skipped(address(0), marketId, "EXPIRED");
+            return;
+        }
+
+        _serveDesks(m, tsMillis);
     }
 
     /// @dev Runs DreamDEX's permissionless upkeep for a settled window, for the good of the whole
@@ -1139,6 +1343,49 @@ contract LucidRouter is SomniaEventHandler, Ownable {
         });
     }
 
+    /// @dev The instant a window is priced: `tradingStart` plus a fraction of its own length, in
+    /// milliseconds. Scaled off `intervalSec` rather than off a fixed number of seconds so a
+    /// one-hour window is asked about an hour in and a five-minute one five minutes in — the point
+    /// is a fraction of the price's travel, not a wall-clock delay.
+    function _decisionMillis(LucidTypes.MarketInfo memory m) private view returns (uint256) {
+        uint256 offset = (uint256(m.intervalSec) * uint256(decisionPointBps)) / LucidTypes.BPS;
+        return (uint256(m.tradingStart) + offset) * 1000;
+    }
+
+    /// @dev Whether the window has less left than the brain needs to answer at all.
+    ///
+    /// The threshold is read from the brain rather than kept here as a constant, because it is
+    /// self-calibrating on the brain's own measured round-trip latency and a copy in this contract
+    /// would drift out of agreement with it silently — the router would either stop asking for
+    /// windows the brain would happily have priced, or keep paying for ones it will refuse.
+    ///
+    /// An unreadable brain reads as "not too late", deliberately. This function's only job is to
+    /// avoid spending on a refusal that is already certain; a brain it cannot read makes nothing
+    /// certain, and the paths downstream already name a missing brain (`NO_BRAIN`) or a refused
+    /// request (`NO_VERDICT`) accurately. Guessing `TOO_LATE` here would blame the window for a
+    /// failure that belongs to the brain.
+    function _tooLateToAsk(LucidTypes.MarketInfo memory m) private view returns (bool) {
+        address b = brain;
+        // `requiredSlack` returns a value, so the compiler's `extcodesize` check raises outside the
+        // `catch`. A brain with no code has to be refused here or it takes the whole firing down.
+        if (b.code.length == 0) return false;
+
+        uint256 gasFor = _stipend(BOOK_GAS);
+        if (gasFor == 0) return false;
+
+        try ILucidBrain(b).requiredSlack{gas: gasFor}() returns (uint256 slack) {
+            // A window closes on wall-clock time, so block time is the only clock this contract
+            // has. A validator nudging it by seconds cannot manufacture anything here: it can only
+            // move a window a few seconds either side of a threshold the brain would apply itself
+            // a moment later anyway.
+            // forge-lint: disable-next-line(block-timestamp)
+            uint256 secondsLeft = m.expiry > block.timestamp ? uint256(m.expiry) - block.timestamp : 0;
+            return secondsLeft < slack;
+        } catch {
+            return false;
+        }
+    }
+
     /// @dev The committee's price, or a clear "no" when the brain is missing or broken.
     function _quote() private view returns (bool ok, uint256 fee) {
         address b = brain;
@@ -1154,21 +1401,51 @@ contract LucidRouter is SomniaEventHandler, Ownable {
         }
     }
 
-    /// @dev The book-implied UP probability, in bps.
+    /// @dev The book-implied UP probability in bps, and whether there was a book at all.
     ///
     /// A binary window's YES price is the market's own probability, so the mid of the best bid and
-    /// best ask is the number the committee's answer has to beat. Most live windows on this venue
-    /// have no book at all, and a one-sided book is still information, so both are handled rather
-    /// than collapsed into the fallback. The fallback itself is a coin flip: with no book there is
-    /// no market opinion to disagree with, and any other default would invent an edge.
-    function _pBookBps(address pool) private view returns (uint256) {
+    /// best ask is the number the committee's answer has to beat. One side is still an observation
+    /// — a resting bid is somebody's real opinion — so it is used on its own rather than discarded.
+    ///
+    /// No side is not an observation, and this function used to report it as 5000 anyway. That is
+    /// the one place in this codebase where a value nobody produced was passed off as a reading, and
+    /// it was not harmless: a desk comparing an 8800 verdict against the fallback measures a
+    /// 38-point edge against a price that does not exist, and stakes 38% of its equity on it. The
+    /// caller is now told the difference and can refuse, which is what every other read in this
+    /// contract already does.
+    ///
+    /// @return pBookBps The book mid in bps, meaningful only when `observed` is true.
+    /// @return observed Whether any side of the book quoted.
+    function _pBookBps(address pool) private view returns (uint256 pBookBps, bool observed) {
         (bool haveBid, uint256 bestBid) = _bestLevel(pool, true);
         (bool haveAsk, uint256 bestAsk) = _bestLevel(pool, false);
 
-        if (haveBid && haveAsk) return ((bestBid + bestAsk) * LucidTypes.BPS) / (2 * LucidTypes.ONE);
-        if (haveBid) return (bestBid * LucidTypes.BPS) / LucidTypes.ONE;
-        if (haveAsk) return (bestAsk * LucidTypes.BPS) / LucidTypes.ONE;
-        return uint256(LucidTypes.BPS) / 2;
+        if (haveBid && haveAsk) return (((bestBid + bestAsk) * LucidTypes.BPS) / (2 * LucidTypes.ONE), true);
+        if (haveBid) return ((bestBid * LucidTypes.BPS) / LucidTypes.ONE, true);
+        if (haveAsk) return ((bestAsk * LucidTypes.BPS) / LucidTypes.ONE, true);
+        // Zero, not a coin flip. There is no number to report, and every value inside the
+        // probability range would be read as one.
+        return (0, false);
+    }
+
+    /// @dev The book number the committee is given: the real mid, or the sentinel that says there
+    /// was no book at all.
+    ///
+    /// This used to substitute 5000 for an empty book, and that substitution is what broke the
+    /// committee. The prompt printed "Book-implied UP probability: 50.00%" as a fact, and the model
+    /// anchored on it and handed back 50 — every time, from validators that agreed, which is
+    /// precisely why every production verdict was exactly 50.00%. Measured on the live committee
+    /// with the same window and the book line deleted, the same question answered 95 on a +776 bps
+    /// distance to strike and 0 on the bearish case. The number was not weak evidence; it was our
+    /// own invention fed back to us.
+    ///
+    /// `LucidTypes.BOOK_UNOBSERVED` sits outside the probability range, so the brain's prompt
+    /// builder can drop the sentence entirely rather than print an impossible percentage. Asking
+    /// the committee to disagree with a price nobody quoted is the same error as letting a desk
+    /// measure an edge against one — this is that error, one step earlier.
+    function _pBookForPrompt(address pool) private view returns (uint256) {
+        (uint256 bps, bool observed) = _pBookBps(pool);
+        return observed ? bps : uint256(LucidTypes.BOOK_UNOBSERVED);
     }
 
     /// @dev Top of one side of a pool's book. Pools are recycled by the venue, so a dead or

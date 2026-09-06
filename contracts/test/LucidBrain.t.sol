@@ -220,6 +220,22 @@ contract LucidBrainTest is Test {
 
     // -- owner controls -------------------------------------------------------
 
+    /// @dev The default instruction names no probability. "50 means a coin flip" was true, already
+    /// implied by "the probability in percent", and bought nothing — while making the midpoint the
+    /// only number the committee read before it saw a single fact. That is the same anchor the book
+    /// sentence turned out to be (delete an asserted 50.00% from an unambiguous window and the live
+    /// committee's median moves from 50 to 95), only weaker, and there is no reason to keep the
+    /// weaker half of a bug. The 0..100 domain is enforced on the request and again in `_tally`, so
+    /// nothing depended on the gloss. This is a seed, not a commitment: `setPrompt` replaces it.
+    function test_the_default_prompt_names_no_probability() public view {
+        string memory p = brain.systemPrompt();
+
+        assertTrue(_contains(p, "a single integer from 0 to 100"), "the answer domain is still stated");
+        assertTrue(_contains(p, "strictly above the strike at expiry"), "and the question is still unambiguous");
+        assertFalse(_contains(p, "coin flip"), "no midpoint is offered before the facts are read");
+        assertFalse(_contains(p, "50"), "and no number at all that is not one of the two bounds");
+    }
+
     function test_only_owner_can_set_prompt() public {
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
@@ -364,6 +380,20 @@ contract LucidBrainTest is Test {
             results[i] = abi.encode(scores[i]);
         }
         _deliverRaw(id, results, status);
+    }
+
+    function _contains(string memory haystack, string memory needle) internal pure returns (bool) {
+        bytes memory h = bytes(haystack);
+        bytes memory n = bytes(needle);
+        if (n.length == 0 || n.length > h.length) return false;
+        for (uint256 i; i <= h.length - n.length; ++i) {
+            uint256 j;
+            while (j < n.length && h[i + j] == n[j]) {
+                ++j;
+            }
+            if (j == n.length) return true;
+        }
+        return false;
     }
 
     function _deliverRaw(uint256 id, bytes[] memory results, IAgentRequester.ResponseStatus status) internal {

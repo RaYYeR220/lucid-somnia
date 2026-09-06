@@ -15,6 +15,12 @@ contract MockBrain {
     uint256 public fee = 0.213 ether;
     bool public revertOnQuote;
     bool public revertOnRequest;
+    bool public revertOnSlack;
+
+    /// @dev What the real brain calls `requiredSlack()`: how much of a window has to remain before
+    /// it will spend anything on it. Zero by default so the fixtures reach the paying path, and
+    /// raised by the one test that pins the router's refusal to ask for a window already lost.
+    uint256 public slack;
 
     uint256 public requestCount;
     bytes32 public lastMarketId;
@@ -32,9 +38,22 @@ contract MockBrain {
         revertOnRequest = request_;
     }
 
+    function setSlack(uint256 slack_) external {
+        slack = slack_;
+    }
+
+    function setRevertOnSlack(bool on) external {
+        revertOnSlack = on;
+    }
+
     function quote() external view returns (uint256) {
         if (revertOnQuote) revert BrainIsDown();
         return fee;
+    }
+
+    function requiredSlack() external view returns (uint256) {
+        if (revertOnSlack) revert BrainIsDown();
+        return slack;
     }
 
     function requestVerdict(

@@ -153,11 +153,22 @@ contract LucidBrain is ILucidBrain, IAgentConsumer, IAgentPriceConsumer, Ownable
     /// because a validator that answers in prose produces a result this contract must discard, and
     /// it names what the strike actually is: these windows open at the strike, so the distance the
     /// prompt carries is the entire move the committee is being asked to extrapolate.
+    ///
+    /// It names no probability. It used to gloss the scale with "50 means a coin flip", which is
+    /// true, already implied by "the probability in percent", and therefore bought nothing — while
+    /// making the midpoint the single number the committee read before seeing any facts. That is
+    /// the same anchor the book sentence turned out to be (see `PromptLib._book`, where deleting an
+    /// asserted 50.00% moved the live committee's median from 50 to 95 on an unambiguous window),
+    /// only weaker, and there is no reason to keep the weaker half of a bug. The bounds are enforced
+    /// by `MIN_SCORE`/`MAX_SCORE` on the request and by `_tally` on the way back, so the domain
+    /// never rested on this sentence anyway.
+    ///
+    /// This is only the seed: `systemPrompt` lives in storage and `setPrompt` replaces it, so an
+    /// operator who measures otherwise can put a scale gloss back without a redeploy.
     string internal constant DEFAULT_SYSTEM_PROMPT = "You price short-dated binary crypto markets. The strike is the price the window opened at "
         "and the spot is the price now, so the distance between them is the move so far. Given the "
         "facts, reply with a single integer from 0 to 100: the probability in percent that the "
-        "settlement price is strictly above the strike at expiry. 50 means a coin flip. Reply with "
-        "the number only, no words, no symbols.";
+        "settlement price is strictly above the strike at expiry. Reply with the number only, no " "words, no symbols.";
 
     // ─────────────────────────────────────────────────────────────────────────
     // Deadline guard
@@ -537,7 +548,10 @@ contract LucidBrain is ILucidBrain, IAgentConsumer, IAgentPriceConsumer, Ownable
     /// returned id rather than the absence of a revert.
     /// @param marketId The venue's market identifier, used to key the verdict when it lands.
     /// @param m The market the committee is asked about.
-    /// @param pBookBps The book-implied UP probability at request time, in bps of probability.
+    /// @param pBookBps The book-implied UP probability at request time, in bps of probability, or
+    /// `LucidTypes.BOOK_UNOBSERVED` when the venue's book was empty and there was no price to read.
+    /// The sentinel is carried to the committee verbatim and costs the prompt its book sentence
+    /// entirely; callers must not substitute a midpoint for it. See `PromptLib._book`.
     /// @param recentOutcomes Past window results, oldest first; any non-zero entry means UP.
     /// @return requestId The platform request the price will arrive under, or zero if refused.
     function requestVerdict(
@@ -907,7 +921,15 @@ contract LucidBrain is ILucidBrain, IAgentConsumer, IAgentPriceConsumer, Ownable
         p.decimals = f.decimals;
         // Clamped on the way in rather than on the way out, so the stored fact is the one the
         // committee will be shown and a bad book reading cannot widen a storage slot.
-        p.pBookBps = uint32(pBookBps > LucidTypes.BPS ? LucidTypes.BPS : pBookBps);
+        //
+        // `BOOK_UNOBSERVED` is exempt, and must stay exempt: it sits above `BPS`, so the clamp
+        // alone would fold "there was no book" into a stored 10000 and the prompt would then tell
+        // the committee the market is quoting 100.00%. The sentinel travels through this record
+        // untouched precisely so `PromptLib` can leave the sentence out — which is the whole point,
+        // because a stated book probability is what the live committee was anchoring on.
+        p.pBookBps = pBookBps == LucidTypes.BOOK_UNOBSERVED
+            ? LucidTypes.BOOK_UNOBSERVED
+            : uint32(pBookBps > LucidTypes.BPS ? LucidTypes.BPS : pBookBps);
 
         uint256 n = recentOutcomes.length;
         uint256 start = n > PENDING_OUTCOMES ? n - PENDING_OUTCOMES : 0;

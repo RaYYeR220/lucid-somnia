@@ -59,7 +59,7 @@ contract MockDesk is ILucidDesk {
         return false;
     }
 
-    function onVerdict(LucidTypes.MarketInfo calldata, LucidTypes.Verdict calldata, uint256) external {}
+    function onVerdict(LucidTypes.MarketInfo calldata, LucidTypes.Verdict calldata, uint256, bool) external {}
     function onSettlement(LucidTypes.MarketInfo calldata) external {}
     function onLeaderTrade(LucidTypes.MarketInfo calldata, uint8, uint256) external {}
 
