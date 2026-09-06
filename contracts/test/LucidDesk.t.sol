@@ -71,6 +71,10 @@ contract LucidDeskTest is Test {
 
         market = new MockMarket();
 
+        // `arm` notifies the router for real, so the stand-in needs code behind it: a typed
+        // external call carries an extcodesize check that reverts before the call is even made.
+        vm.etch(router, hex"00");
+
         implementation = new LucidDesk();
         desk = LucidDesk(Clones.clone(address(implementation)));
 
@@ -618,12 +622,24 @@ contract LucidDeskArmSyncTest is Test {
         assertTrue(router.deskArmed(address(desk)));
     }
 
-    /// A router that rejects the notice must not brick the desk's own controls.
-    function test_arming_survives_a_router_that_refuses() public {
+    /// Arming is an explicit instruction, so a router that will not record it must fail the
+    /// transaction rather than leave the owner believing a silent desk is live.
+    function test_arming_fails_loudly_when_the_router_refuses() public {
         router.setShouldRevert(true);
         vm.prank(owner);
+        vm.expectRevert();
         desk.arm(true);
+    }
+
+    /// The opening policy is set by the factory before the desk is registered, so that path stays
+    /// best-effort or every desk creation would revert.
+    function test_setting_a_policy_survives_a_router_that_refuses() public {
+        router.setShouldRevert(true);
+        LucidTypes.Policy memory p;
+        p.armed = true;
+        p.maxStakePerWindow = 1e6;
+        vm.prank(owner);
+        desk.setPolicy(p);
         assertTrue(desk.policy().armed);
-        assertEq(router.calls(), 0);
     }
 }

@@ -184,9 +184,9 @@ contract LucidDesk is ILucidDesk {
     }
 
     /// @dev The router iterates its own list of armed desks, so a desk that only flips its local
-    /// flag is invisible to the fan-out and silently never trades. The call is best-effort because
-    /// the factory sets the opening policy before it registers the desk with the router; `arm` is
-    /// what makes it definitive afterwards.
+    /// flag is invisible to the fan-out and silently never trades. This path is best-effort only
+    /// because the factory sets the opening policy before it registers the desk with the router;
+    /// `arm` makes it definitive, and does so loudly.
     function _syncArmed(bool on) private {
         // The code check is not belt-and-braces: Solidity emits an `extcodesize` guard for a
         // typed external call, and that guard reverts OUTSIDE the try/catch, so `try` alone does
@@ -200,7 +200,12 @@ contract LucidDesk is ILucidDesk {
     function arm(bool on) external onlyOwner {
         _policy.armed = on;
         emit ArmedSet(on);
-        _syncArmed(on);
+        // Deliberately NOT best-effort. Arming is an explicit instruction, and a desk that arms
+        // itself without reaching the router is registered, funded, and silently never traded —
+        // the worst possible outcome to discover from a receipt that says success. It also keeps
+        // gas estimation honest: an estimator that sees a swallowed revert converges on the cheap
+        // failing path and hands the wallet a limit too small for the call to actually land.
+        ILucidRouter(_router).setDeskArmed(address(this), on);
     }
 
     /// @notice Pull collateral in from the owner. Requires a prior ERC-20 approval.
