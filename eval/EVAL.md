@@ -1,222 +1,301 @@
 # Evaluating the Lucid committee
 
 An observational, pre-registered grading of the verdicts `LucidBrain`
-(`0x37d0a2907242C09F0B445D655982dA4983345636`) has written on Somnia Shannon testnet, chain
-50312, against how those windows actually settled.
+(`0x0c640E3aFc627bEec7eDB9985696e12B50AdAd25`) has written on Somnia Shannon testnet, chain 50312,
+against how those windows actually settled.
+
+Snapshot: run **2026-09-06T22:19:02Z**, blocks **481 521 686 → 481 599 789**. Every number below is
+from that run. Re-running regrades from scratch and the numbers move; see
+[Re-running](#re-running-and-growing-the-sample).
 
 ---
 
 ## Headline
 
-**The committee shows no edge, because in this sample it does not express an opinion at all.**
-Every one of the 16 verdicts on chain is the same number: `probUpBps = 5000`, a flat 50 %, from
-three validators that each returned exactly `50`. Forecast dispersion is zero — one distinct
-value, standard deviation 0.0000. On the 14 verdicts whose window has since settled, the Brier
-score is **0.2500**, which is *identical* to the constant-50 % negative control and identical to
-the coin-flip control — not because the committee tied a contest, but because it is the same
-predictor. It beats neither control. Directional accuracy is undefined: with every forecast at
-exactly 50 %, the committee took a side zero times out of 14.
+**On this sample the committee gets the direction right more often than a coin flip and prices it
+far worse than saying nothing.** Directional accuracy is **72.2 % (13 of 18 decisive calls)**,
+one-sided exact binomial **p = 0.0481** under H₀ = 0.5, and only 4.84 % of 20 000 same-boldness
+random twins matched or beat it. Over the same 21 rows the **Brier score is 0.3653**, against **0.2500** for
+a predictor that says "50 %" to everything and knows nothing. Both halves are the result. The
+committee answers 0 % and 100 % where the truthful answer is nearer 60 %, and Brier punishes exactly
+that: it is often right about the sign and wildly overconfident about the magnitude.
 
-The desk behaved correctly in response. All 16 verdicts were refused with `LowEdge` — the book
-was also quoting 50 %, the committee agreed with it to the basis point, and the mandate refuses
-to pay spread for a forecast that says nothing. Zero trades were placed on committee signal. The
-policy layer is doing its job; the signal layer has not yet produced a signal.
+Two things immediately qualify the accuracy half, and they are in this paragraph rather than a
+footnote because they are decisive for how it should be read. **The sample drifted up**: 16 of 21
+windows closed UP (76.2 %; P(X ≥ 16 | n = 21, p = 0.5) = 0.0133). A rule as dumb as *always say UP*
+would have scored **14 of 18** on the identical decisive rows and a Brier of **0.2381** — better than
+the committee on both metrics. And **the directional result is carried entirely by eight barely
+decisive calls**: the committee's 51 % calls went 8 for 8, while every other decisive call together
+went 5 for 10 — exactly chance — and the nine confident 0 % calls contributed 0.2381 of the total
+0.3653 Brier on their own. So the p-value is against a fair-coin null in a sample whose own base rate
+was not a fair coin.
 
-**The sample is small — 14 graded verdicts over 43 minutes of chain — and must be read as small.**
-This is a first-hour reading of a deployment that is under an hour old, not a verdict on the
-committee. Re-running the harness later grows the sample automatically. What the number *does*
-establish today is that the harness is capable of returning bad news, and that this is the bad
-news it returned.
+**n = 21 is small.** Three of ten calibration deciles are populated, one of them by a single row. A
+one-sided p just under 0.05 at this size is suggestive and is not a finding.
 
 ---
 
-## Pre-registration
+## What changed since the previous report
 
-Stated as a protocol, before any result. Everything below was fixed in `run.ts` before the first
-scored run and has not been changed since; the code is the registration.
+The previous version of this file reported a degenerate forecast: every verdict at exactly 50.00 %,
+zero dispersion, a Brier identical to the constant-50 control. That was a real measurement of a
+broken pipeline, and two causes were found and fixed. Both explain the discontinuity in the data, so
+neither the old numbers nor the new ones are comparable across the fix.
 
-### 1. Why this is an observer and not a replayer
+1. **The committee was asked at the wrong moment.** The verdict was requested when the market was
+   created. For these markets the strike *is* the window's opening price, so at `tradingStart` spot
+   equals strike by construction and "will it close above the strike" has no answer but a coin flip.
+   The question is now put at the halfway point of the window, once the price has had time to move
+   away from the strike — `LucidRouter._decisionSec` and `DECISION_POINT_BPS`, with the case pinned
+   in `contracts/test/LucidRouter.t.sol::test_nothing_is_asked_at_creation_and_the_decision_is_booked_halfway_in`.
 
-The obvious way to build this — take settled windows, feed them back through the brain, compare —
-is worthless here, and quietly so. `LucidBrain` fetches the spot price at call time. Replaying a
-window that closed an hour ago would price it with the price *now*, produce a number, and that
-number would look exactly like a result. It would be a leak of the answer into the question.
+2. **The prompt was anchoring the committee.** When no side of the order book quoted, the router
+   substituted 5000 bps and the prompt then stated it as the market's implied probability — and then
+   asked the committee to disagree with a number the protocol had invented. Measured on the live
+   three-validator committee with everything else held identical: a window +776 bps through the
+   strike with eight seconds left scored a median of **50** with `Book-implied UP probability:
+   50.00%` in the prompt and **95** with that one sentence deleted; the mirror-image bearish twin
+   scored **0**. The sentence is now omitted entirely when no book was observed, and the sentinel
+   that says so (`LucidTypes.BOOK_UNOBSERVED`, 65535) sits outside the probability range so it can
+   never be clamped back into one. See the comments on `PromptLib._book` and
+   `LucidRouter._pBookForPrompt`, and `contracts/test/PromptLib.t.sol`.
 
-So this harness never calls the brain. It reads what the brain already committed to chain:
+Platform-level findings from the same deployment are in [`../SDK_FEEDBACK.md`](../SDK_FEEDBACK.md).
 
-- Each `VerdictReceived(marketId, requestId, probUpBps, responded, agreed, ok, scores)` is a
-  probability written into a block, with a timestamp, before the window closed.
-- The outcome is read separately, from the venue's own indexer, after settlement.
+---
 
-At the instant each verdict was written, the answer did not exist anywhere — not in the contract,
-not in the indexer, not in the world. **That is what makes this evaluation genuinely
-pre-registered**, and it is the only property that makes the resulting number worth anything.
-Nothing about the grading can be tuned after the fact without changing a number that is already
-immutable in a block.
+## 1. Method, pre-registered
 
-### 2. Sample rule
+Stated as a protocol, before any number. Everything below is fixed in `run.ts`; the code is the
+registration.
 
-The population is **every `VerdictReceived` log emitted by the deployed brain**, from its
-deployment block to chain head, with no selection of any kind. Logs are paged in 950-block
-windows because Somnia rejects an `eth_getLogs` span wider than 1000 blocks outright
-(`block range exceeds 1000`), and blocks here are ~100 ms.
+### Why this is genuinely pre-registered
 
-Two samples are graded, both declared here so neither is a post-hoc pick:
+The obvious way to build this — take settled windows, feed them back through the brain, compare — is
+worthless here, and quietly so. `LucidBrain` fetches spot at call time, so replaying a window that
+closed an hour ago prices it with the price *now* and returns something that looks exactly like a
+result. That is a leak of the answer into the question.
 
-- **PRIMARY** — verdicts the protocol itself marked tradeable (`ok == true`) whose market has
-  since settled. This is what a desk was actually allowed to act on.
-- **SECONDARY** — every verdict the committee actually answered (`responded > 0` and a non-empty
-  `scores` array) whose market has since settled, tradeable or not. This catches answers that
-  arrived too late to trade but were still real forecasts.
+So the harness never calls the brain. It reads what the brain already committed to a block:
+`VerdictReceived(marketId, requestId, probUpBps, responded, agreed, ok, scores)` is a probability
+written on chain with a timestamp, before the window closed. The outcome is read separately, from
+the venue's indexer, after settlement. **At the instant each verdict was written its outcome did not
+exist anywhere** — not in the contract, not in the indexer, not in the world. Nothing about the
+grading can be tuned after the fact without changing a number that is already immutable in a block.
 
-### 3. Exclusion rule
+The harness signs nothing, sends nothing and costs nothing.
+
+### Sample rule
+
+The population is **every `VerdictReceived` log the deployed brain emitted**, from its deployment
+block to chain head, with no selection of any kind. Logs are paged in 950-block windows because
+Somnia rejects an `eth_getLogs` span wider than 1000 blocks outright (`block range exceeds 1000`).
+
+Two samples, both declared here so neither is a post-hoc pick:
+
+- **PRIMARY** — verdicts the protocol itself marked tradeable (`ok == true`) whose market has since
+  settled. This is what a desk was actually allowed to act on.
+- **SECONDARY** — every verdict the committee answered (`responded > 0`, non-empty `scores`) whose
+  market has settled, tradeable or not. This catches answers that arrived too late to trade but were
+  still real forecasts.
+
+### Exclusion rules
 
 A verdict is excluded, and counted under its reason, when:
 
 - **`no-committee-answer`** — `responded == 0` or `scores` is empty. `handleResponse` writes
-  `probUpBps = 0` when the agent platform failed or timed out. That zero is a structural absence,
-  not a confident forecast of "0 % up". Grading it would invent an opinion the committee never
-  held, and would do so in the direction that flatters or damns it at random.
+  `probUpBps = 0` when the agent platform failed or timed out. That zero is a structural absence, not
+  a confident forecast of "0 % up"; grading it would invent an opinion the committee never held.
 - **`not-in-indexer`** — the brain priced a window the indexer has not surfaced yet.
-- **`not-finalized`** — `clobStatus` is not the terminal `"Finalized"`, or `finalized != true`.
-  The terminal status on this venue is the literal string **`"Finalized"`**. It is never
-  `"Resolved"` — that value does not exist in the schema, and a filter written against it returns
-  an empty set forever without ever erroring.
-- **`voided`** — the market was voided; both legs paid, so no side won.
-- **`no-payout`** — **finalized with an all-zero payout vector and a null `winningOutcome`.**
-  This happens when the oracle stopped publishing before the window closed. The market is
-  terminal, but nothing settled and no side won. Scoring these as losses would manufacture wrong
-  answers out of absent ones, so they are excluded and counted as unresolved.
-- **`inconsistent-payout`** — `winningOutcome` and `payoutNumerators` disagree. Two independent
-  statements of the same fact; when they conflict neither is trustworthy enough to grade against.
+- **`not-finalized`** — `clobStatus` is not the terminal `"Finalized"`, or `finalized != true`. The
+  terminal status on this venue is the literal string `"Finalized"`; it is never `"Resolved"`, a
+  value that does not exist in the schema and that a filter written against it matches forever
+  without erroring.
+- **`no-payout`** — **finalized with an all-zero payout vector and a null `winningOutcome`.** The
+  market is terminal but nothing settled and no side won. That is an unresolved window, not a loss.
+  Scoring these would manufacture wrong answers out of absent ones.
+- **`voided`** — both legs paid, so no side won.
+- **`inconsistent-payout`** — `winningOutcome` and `payoutNumerators` disagree; when two independent
+  statements of the same fact conflict, neither is trustworthy enough to grade against.
 
 Outcome index 0 is YES on this venue, and YES is "at or above the strike", i.e. UP.
 
-### 4. Metrics
+### Metrics
 
-All computed from observed rows only. Anything that cannot be computed is reported as `n/a`,
-never as a default.
+Computed from observed rows only. Anything that cannot be computed is `n/a`, never a default.
 
-- **Sample size**, and the `ok` / failed-closed split.
-- **Forecast dispersion** — distinct values, range, standard deviation. Declared up front because
-  it is the only thing that separates "the committee was wrong" from "the committee never said
-  anything", and a Brier score alone cannot tell those apart.
-- **Directional accuracy** against the 50 % line. A forecast of *exactly* 50 % is an abstention,
-  not a coin flip the committee happened to lose; it is excluded from the numerator and the
-  denominator and reported separately. Accompanied by a one-sided exact binomial p-value under
-  H₀ = 0.5, computed with integer coefficients.
-- **Brier score** — mean squared error against the realised binary outcome. Lower is better;
-  0.25 is what saying nothing scores.
-- **Calibration table** — ten deciles, each with its count, mean forecast and realised UP
-  frequency.
-- **Mean absolute deviation from the book-implied probability**, taken from the desk's own
-  `VerdictReceived(marketId, probUpBps, pBookBps, responded)`, which the router emits with the
-  pool's implied probability read at the moment it fanned the verdict out. Rows with no book
-  quote are excluded and counted.
-- **Refusal breakdown** — the desk's `Refused` events grouped by `LucidTypes.Refusal`, and the
-  router's `Skipped` events grouped by reason string. Refusals are a result, not an error log:
-  the rate at which a mandate declines to act is as much a measurement of the system as its hit
-  rate.
+- **Forecast dispersion** — distinct values, range, standard deviation. Declared first because it is
+  the only thing that separates "the committee was wrong" from "the committee never said anything",
+  and a Brier score alone cannot tell those apart.
+- **Directional accuracy** against the 50 % line. Exactly 50 % is an abstention, not a coin flip the
+  committee happened to lose: excluded from numerator and denominator, reported separately. With a
+  one-sided exact binomial p-value under H₀ = 0.5, computed with integer coefficients.
+- **Brier score** — mean squared error against the realised binary outcome. 0.25 is what saying
+  nothing scores.
+- **Calibration** — ten deciles, each with count, mean forecast and realised UP frequency.
+- **Mean absolute deviation from the book-implied probability**, from the desk's own
+  `VerdictReceived(marketId, probUpBps, pBookBps, responded)`. (This metric is broken in the current
+  harness — see [Defects](#defects-found-in-the-harness-itself).)
+- **Refusal and skip breakdown.** The rate at which a mandate declines to act is as much a
+  measurement of the system as its hit rate.
 
-### 5. Negative controls
+### Negative controls
 
-Declared before the fact, run on the identical sample, with a fixed seed (`0x1ec1d`) and 20 000
-draws so the numbers are reproducible rather than re-rollable.
+Fixed before the fact, run on the identical sample, seed `0x1ec1d`, 20 000 draws, so the numbers are
+reproducible rather than re-rollable.
 
-- **Constant 50 %** — predicts 0.5 on everything. Brier 0.25 by construction. This is the floor a
-  forecast must clear before it has said anything.
-- **Coin flip, same boldness** — for each row it keeps the committee's own distance from 50 % and
-  randomises only the sign. A flat-50 % twin would be a strawman: it can never be confidently
-  wrong, so beating it proves nothing. Keeping the confidence and destroying the direction
-  isolates the only thing under test — whether the direction carried information. Reported as a
-  mean Brier and a mean accuracy, plus the fraction of random twins that matched or beat the
-  committee, which is an empirical p-value.
-
-**If the committee does not beat both controls, that is the headline and it goes first.** A green
-check that a false twin also passes is worth nothing.
+- **Constant 50 %** — 0.5 on everything, Brier 0.25 by construction. The floor a forecast must clear
+  before it has said anything.
+- **Coin flip, same boldness** — keeps the committee's own distance from 50 % on each row and
+  randomises only the sign. A flat-50 % twin would be a strawman: it can never be confidently wrong,
+  so beating it proves nothing. Keeping the confidence and destroying the direction isolates the only
+  thing under test — whether the direction carried information. Reported as mean Brier, mean
+  accuracy, and the fraction of twins that matched or beat the committee, which is an empirical
+  p-value.
 
 ---
 
-## Results
+## 2. Pre-condition: does the committee discriminate at all?
 
-Run at **2026-09-06T16:57:42Z**, against live chain state.
+The previous report could not separate "the committee is broken" from "the question was empty". That
+needed a direct probe, so one was run against the same agent platform and the same agent id the
+product uses, three validators per request, median taken the same way:
+
+| Prompt | Committee scores | Median |
+|---|---|---|
+| `Reply with the integer 87 and nothing else.` | 87, 87, 87 | **87** |
+| `Reply with the integer 12 and nothing else.` | 12, 12, 12 | **12** |
+| `BTC trades at 80500. Threshold 60000. Settles in 3 seconds. Percent probability above?` | 85, 85, 85 | **85** |
+| `BTC trades at 80500. Threshold 99000. Settles in 3 seconds. Percent probability above?` | 0, 0, 0 | **0** |
+
+The committee follows instructions and it discriminates on the domain question. That establishes
+that the constant 50 in the earlier production sample was a property of the question being asked,
+not of the committee answering it.
+
+It also foreshadows the calibration result: **85 for a three-second window 34 % out of the money is
+already under-confident**, and 0 for the mirror case is over-confident in the other direction. The
+same shape shows up in production below.
+
+This probe writes on chain and is not part of `run.ts`, which is read-only and never asks the
+committee anything. It is reported here as a stated measurement, not as harness output.
+
+---
+
+## 3. Results
 
 | | |
 |---|---|
 | Chain | Somnia Shannon 50312 |
-| Brain | `0x37d0a2907242C09F0B445D655982dA4983345636` |
-| Router | `0x10bC10a861fBb61Cc26832110011766d8CfA958B` |
-| Desks discovered | 1 (`0x7a1b13b3531cd07e34df7ecc0f8a18652a92a4c4`) |
-| Blocks scanned | 481 381 284 → 481 407 041 (25 758 blocks, 28 pages of 950) |
-| Chain time covered | 2026-09-06T16:14:42Z → 16:57:38Z — **42.9 minutes** |
-| Block cadence observed | ~10 blocks/second |
+| Brain | `0x0c640E3aFc627bEec7eDB9985696e12B50AdAd25` |
+| Router | `0x6aE21a20444141552648C1f8443bAf171BCCcB99` |
+| Factory | `0xF82cC4219F6c7fe816155A8c3F0C9C3B1cc320eA` |
+| Desks discovered | 2 (`0x86d1…49ea` AiEdge, `0xd44b…6fac` maker) |
+| Blocks scanned | 481 521 686 → 481 599 789 (78 104 blocks, 83 pages of 950) |
+| Chain time covered | 2026-09-06T20:08:45Z → 22:18:57Z (2 h 10 m) |
+| Verdicts span | 20:17:31Z → 21:52:32Z (95 minutes), expiries 20:20Z → 21:55Z |
+| Markets | 300-second BTC/USDC and ETH/USDC windows only (11 BTC, 10 ETH) |
 
 ### Sample
 
 | | |
 |---|---|
-| `VerdictReceived` on the brain | **16** |
-| — with a committee answer | 16 |
+| `VerdictReceived` on the brain | **21** |
+| — with a committee answer | 21 |
 | — failed closed (no answer at all) | 0 |
 | — `ok == false` (never tradeable) | 0 |
-| **Graded, PRIMARY** (`ok`, market settled) | **14** |
-| **Graded, SECONDARY** (answered, settled) | **14** |
+| **Graded, PRIMARY** (`ok`, market settled) | **21** |
+| **Graded, SECONDARY** (answered, settled) | **21** |
+| Excluded | **none** |
 
-Excluded, by reason: `not-finalized` 2 — the two most recent windows had not closed when the scan
-ran. They are not dropped, only not settled yet, and the next run grades them.
+Every verdict came back `responded = 3`, `agreed = 3`, `ok = true`, and every window in the scan had
+settled by the time the harness ran, so PRIMARY and SECONDARY are the same 21 rows and every metric
+below is identical for both. They will diverge as soon as the platform times out or a verdict lands
+after expiry.
 
-No verdict was excluded for the all-zero-payout trap in this window. The exclusion path exists and
-is counted; it simply did not fire yet.
-
-PRIMARY and SECONDARY are identical here because every verdict came back `ok == true` and none
-arrived late. They will diverge as soon as the platform times out or a verdict lands after
-expiry.
-
-### Metrics — PRIMARY (n = 14)
+### Metrics — PRIMARY = SECONDARY (n = 21)
 
 | Metric | Value |
 |---|---|
-| Realised UP rate in sample | 42.9 % (6 of 14 windows closed up) |
-| **Forecast dispersion** | **1 distinct value**, 50.0 % … 50.0 %, sd **0.0000** |
-| **Brier score** | **0.2500** |
-| Directional accuracy | **n/a** — 0 of 14 decisive, 14 abstained at exactly 50 % |
-| Exact binomial p | n/a (no decisive calls to test) |
-| Mean \|committee − book\| | **0.0000** over 14 rows, 0 rows without a book quote |
+| Realised UP rate in sample | **76.2 %** (16 of 21 windows closed up) |
+| Forecast dispersion | **4 distinct values**, 0.0 % … 100.0 %, sd **0.2902** |
+| **Brier score** | **0.3653** |
+| **Directional accuracy** | **72.2 %** — 13 of 18 decisive, 3 abstained at exactly 50 % |
+| Exact binomial p (one-sided, H₀ = 0.5) | **0.0481** |
+| Mean \|committee − book\| | 6.1302 over 6 rows (15 carried no book quote) — **invalid, see Defects** |
 
 Calibration:
 
 | Bucket | n | Mean forecast | Realised UP |
 |---|---|---|---|
-| 0.5 – 0.6 | 14 | 50.0 % | 42.9 % |
+| 0.0 – 0.1 | 9 | 0.0 % | **55.6 %** |
+| 0.5 – 0.6 | 11 | 50.7 % | **90.9 %** |
+| 0.9 – 1.0 | 1 | 100.0 % | 100.0 % |
 
-Nine of ten deciles are empty. That is the finding, not a formatting artefact.
+Seven of ten deciles are empty and the top one holds a single row. The 0.0–0.1 line is the whole
+calibration story: the committee said 0 % nine times and those windows closed up more often than
+not.
 
 ### Negative controls — identical sample
 
 | Predictor | Brier | Directional accuracy |
 |---|---|---|
-| **Committee** | **0.2500** | n/a (never took a side) |
-| Constant 50 % | 0.2500 | n/a by construction |
-| Coin flip, same boldness (20 000 draws, seed `0x1ec1d`) | 0.2500 | n/a |
+| **Committee** | **0.3653** | **72.2 %** (13/18) |
+| Constant 50 % | **0.2500** | n/a by construction |
+| Coin flip, same boldness (20 000 draws, seed `0x1ec1d`) | 0.3695 | 49.9 % |
 
-Fraction of random twins scoring at least as well as the committee on Brier: **100.00 %**.
+| Empirical p | |
+|---|---|
+| P(random twin ≥ committee, Brier) | **37.70 %** |
+| P(random twin ≥ committee, accuracy) | **4.84 %** |
 
-**The committee beats neither control.** Not narrowly — exactly. With every forecast pinned at
-50 %, the coin-flip twin has zero edge to flip the sign of, so it reproduces the committee's
-predictions bit for bit. The controls are not losing to the committee; they *are* the committee.
+The committee **beats the coin flip on accuracy and loses to constant 50 % on Brier**. Note that its
+Brier win over the flip (0.3653 vs 0.3695) is noise: 37.7 % of twins scored at least as well. Only
+the accuracy column separates it from the false twin.
+
+### Where the forecast actually sat
+
+The four distinct values, with what happened to each:
+
+| Forecast | n | Windows up | Directional | Brier on the subset | Contribution to the 0.3653 |
+|---|---|---|---|---|---|
+| 0 % | 9 | 5 | **4 / 9 correct** | 0.5556 | **0.2381** |
+| 50 % | 3 | 2 | abstained | 0.2500 | 0.0357 |
+| 51 % | 8 | 8 | **8 / 8 correct** | 0.2401 | 0.0915 |
+| 100 % | 1 | 1 | 1 / 1 correct | 0.0000 | 0.0000 |
+
+Per asset: BTC 8 of 11 decisive calls correct (7 of 11 windows up); ETH 5 of 7 (9 of 10 windows up).
+
+**Every verdict was unanimous to the integer.** The three validators returned `[0,0,0]`,
+`[50,50,50]`, `[51,51,51]` or `[100,100,100]` — never a split, on any of the 21 rows. `agreed = 3` on
+all of them. The committee produced consensus but, in this sample, no ensemble diversity: the median
+equals every member's answer, so the three-validator structure bought agreement and no variance
+reduction.
 
 ### Refusals and skips
 
-| Source | Reason | Count |
-|---|---|---|
-| Desk `Refused` | `LowEdge` | **16** |
-| Router `Skipped` | — | 0 |
+| Source | Reason | Count | What it is |
+|---|---|---|---|
+| Desk `Refused` | `NoBook` | **6** | The AiEdge desk declining to measure an edge against a book nobody quoted. All six carry `pBookBps = 65535`, the unobserved sentinel. |
+| Desk `Refused` | `VenueRejected` | **6** | The maker desk turned away by the venue when it tried to stand up a two-sided quote. |
+| Router `Skipped` | `NO_CREDIT` | **50** | The router reporting that a desk had run out of gas credit rather than fanning out and pretending otherwise. |
+| Router `Skipped` | `ROUTER_FLOAT` | **4** | The router's own float below its reserve at that instant. |
 
-Every verdict reached a desk — no router skips, and the brain held 10.31 STT with the router at
-40.32 STT, so nothing was starved of float or gas — and every one was refused for insufficient
-edge. The mean absolute deviation from the book is 0.0000, so `LowEdge` is arithmetically the only
-refusal this data could have produced under any non-zero `minEdgeBps`. The refusal path is working
-as designed; there was simply nothing to trade.
+Float at run time: brain **7.928 STT**, router **32.634 STT**.
+
+Three things this says that the totals do not:
+
+- **Only 6 of the 21 verdicts reached a desk at all.** Both current desks were created at 21:41Z,
+  near the end of the sample, and each saw the same six verdicts (four at 51 %, one at 50 %, one at
+  0 %) and refused all six. Nothing was traded on committee signal in this window, so there is no
+  P&L here — only forecasts.
+- **`NoBook` is arithmetically the only refusal the AiEdge desk could have produced.** No side of the
+  book quoted on any of the six, so there was no edge to compute. `LucidDesk` refuses rather than
+  substituting a midpoint, which is the same discipline as the prompt fix above, one layer down.
+- **`VenueRejected` names the venue, not which check.** One enum value covers three distinct failures
+  in `_make`: the order-book parameter read, the quote pair, and the `mintSet` call. The event alone
+  does not say which of the three fired, so the honest reading is that the maker never got a
+  two-sided quote up — not why. That is a granularity gap in the refusal enum, not a finding about
+  the venue.
 
 ### Verbatim output
 
@@ -225,140 +304,193 @@ Lucid committee evaluation - observer, read-only
   chain                                  Somnia Shannon 50312
   rpc                                    https://api.infra.testnet.somnia.network
   indexer                                https://dev.smk.somnia.host/v1/graphql
-  brain                                  0x37d0a2907242C09F0B445D655982dA4983345636
-  router                                 0x10bC10a861fBb61Cc26832110011766d8CfA958B
-  scanned blocks                         481381284 -> 481407041 (25758 blocks, 28 pages of 950; start from cache)
-  head block time (UTC)                  2026-09-06T16:57:38.000Z
+  brain                                  0x0c640E3aFc627bEec7eDB9985696e12B50AdAd25
+  router                                 0x6aE21a20444141552648C1f8443bAf171BCCcB99
+  scanned blocks                         481521686 -> 481599789 (78104 blocks, 83 pages of 950; start from cache)
+  head block time (UTC)                  2026-09-06T22:18:57.000Z
 
 sample
-  VerdictReceived on the brain           16
-    with a committee answer              16
+  VerdictReceived on the brain           21
+    with a committee answer              21
     failed closed (no answer at all)     0
     ok = false (never tradeable)         0
-  graded PRIMARY (ok, market settled)    14
-  graded SECONDARY (answered, settled)   14
+  graded PRIMARY (ok, market settled)    21
+  graded SECONDARY (answered, settled)   21
 
 excluded from grading, by reason
-    not-finalized                        2
+                                         nothing excluded
 
 PRIMARY - verdicts the protocol marked tradeable (ok = true)
-  graded verdicts (n)                    14
-  realised UP rate in sample             42.9 %
-  forecast dispersion                    1 distinct value(s), 50.0 %..50.0 %, sd 0.0000
-  Brier score (lower is better)          0.2500
-  directional accuracy                   n/a (0/0 decisive, 14 abstained at exactly 50 %)
-    exact binomial p (one-sided)         n/a
-  mean |committee - book|                0.0000 over 14 rows (0 carried no book quote)
+  graded verdicts (n)                    21
+  realised UP rate in sample             76.2 %
+  forecast dispersion                    4 distinct value(s), 0.0 %..100.0 %, sd 0.2902
+  Brier score (lower is better)          0.3653
+  directional accuracy                   72.2 % (13/18 decisive, 3 abstained at exactly 50 %)
+    exact binomial p (one-sided)         0.0481
+  mean |committee - book|                6.1302 over 6 rows (15 carried no book quote)
 
   calibration (decile -> realised UP frequency)
     bucket          n    mean p  realised
-    0.5-0.6        14    50.0 %  42.9 %
+    0.0-0.1         9     0.0 %  55.6 %
+    0.5-0.6        11    50.7 %  90.9 %
+    0.9-1.0         1   100.0 %  100.0 %
 
   negative controls on the identical sample
     constant 50 % - Brier                0.2500
-    coin flip (same boldness) - Brier    0.2500 mean of 20000 draws
-    coin flip - directional accuracy     n/a
-    P(random twin >= committee, Brier)   100.00 %
-    P(random twin >= committee, acc.)    n/a
-    DEGENERATE FORECAST                  every verdict in this sample is the same number - no skill is measurable
-    verdict vs controls                  BEATS NEITHER CONTROL
-
-SECONDARY - every verdict the committee actually answered
-  graded verdicts (n)                    14
-  realised UP rate in sample             42.9 %
-  forecast dispersion                    1 distinct value(s), 50.0 %..50.0 %, sd 0.0000
-  Brier score (lower is better)          0.2500
-  directional accuracy                   n/a (0/0 decisive, 14 abstained at exactly 50 %)
-    exact binomial p (one-sided)         n/a
-  mean |committee - book|                0.0000 over 14 rows (0 carried no book quote)
-
-  calibration (decile -> realised UP frequency)
-    bucket          n    mean p  realised
-    0.5-0.6        14    50.0 %  42.9 %
-
-  negative controls on the identical sample
-    constant 50 % - Brier                0.2500
-    coin flip (same boldness) - Brier    0.2500 mean of 20000 draws
-    coin flip - directional accuracy     n/a
-    P(random twin >= committee, Brier)   100.00 %
-    P(random twin >= committee, acc.)    n/a
-    DEGENERATE FORECAST                  every verdict in this sample is the same number - no skill is measurable
-    verdict vs controls                  BEATS NEITHER CONTROL
+    coin flip (same boldness) - Brier    0.3695 mean of 20000 draws
+    coin flip - directional accuracy     49.9 %
+    P(random twin >= committee, Brier)   37.70 %
+    P(random twin >= committee, acc.)    4.84 %
+    verdict vs controls                  beats the coin flip only
 
 refusals - desk Refused, by reason
-    LowEdge                              16
+    NoBook                               6
+    VenueRejected                        6
 
 skips - router Skipped, by reason
-                                         none emitted in the scanned range
+    NO_CREDIT                            50
+    ROUTER_FLOAT                         4
 
 float (context for any funding-shaped refusal or skip)
-  brain                                  10.313178323 STT
-  router                                 40.321389516 STT
+  brain                                  7.9281084092 STT
+  router                                 32.633850218 STT
 ```
 
-Every row behind these numbers, including the raw per-validator scores and the settlement
-decision for each market, is in `results.json`.
+The SECONDARY block is identical and is omitted here; it is in `results.json` in full, along with
+every graded row, the raw per-validator scores and the settlement decision for each market.
 
 ---
 
-## Reading the result honestly
+## 4. Interpretation
 
-### What the data says without interpretation
+**The committee has some directional signal and is badly calibrated.** Those are two separate
+statements and both are supported by the table above.
 
-Sixteen verdicts. Every one: three validators responded, three agreed, each returned the integer
-`50`, median `50`, `probUpBps = 5000`, `ok = true`. The book quoted 5000 on every one of them.
-Fourteen of those windows have settled: six up, eight down. Every graded window is a 300-second
-BTC or ETH window.
+*Calibration.* This is unambiguous. The committee said **0 %** nine times, and those windows closed
+UP five times out of nine. A forecast of 0 % that is realised 56 % of the time is not a small error;
+it is the largest error the scale allows. Those nine rows alone contribute 0.2381 of the total Brier
+of 0.3653 — 65 % of the loss from 43 % of the sample. This is the same shape the discrimination
+probe showed at the top: the committee reaches for the rails. Nothing in the 21 rows sits between
+51 % and 100 %, or between 0 % and 50 %. It answers as if it were classifying, not pricing. That is
+why a predictor that always says 50 % beats it on Brier while knowing nothing: it never pays the
+price of a confident miss because it is never confident.
 
-### Two explanations, and the harness cannot separate them
+*Direction.* This is where the honesty has to be applied, because the number looks better than the
+evidence behind it.
 
-1. **The committee is defaulting.** Three independent validators returning the identical integer
-   on every window, across both BTC and ETH, is the shape of a fallback value rather than a
-   considered forecast.
-2. **50 % is the honest answer.** These are five-minute at-the-money windows: "will BTC be at or
-   above its opening price in five minutes". For a near-driftless asset over that horizon the true
-   probability really is close to a coin flip, and a well-behaved forecaster that refuses to
-   pretend otherwise would output 50 every time.
+- 13 of 18 decisive is p = 0.0481 against a fair coin, and 4.84 % of same-boldness random twins did
+  as well or better. Taken at face value, that clears the pre-registered control.
+- But the sample's own base rate was 76 % UP, which is itself unlikely under a fair coin
+  (P(X ≥ 16 | 21, 0.5) = 0.0133). Both assets drifted up across the 95 minutes sampled. Against that
+  background, **always saying UP scores 14 of 18 and a Brier of 0.2381** — better than the committee
+  on both. The fair-coin null is the wrong null for this sample, and it is the null the p-value uses.
+- The signal is also concentrated in the least confident calls. The 51 % cluster went 8 for 8; the
+  0 % cluster went 4 for 9. A committee whose near-midpoint calls are perfect and whose extreme calls
+  are coin flips is not obviously a committee with a view. In an up-drifting sample, a marginal
+  upward lean is nearly free.
 
-Both are consistent with fourteen identical rows. Distinguishing them needs either variance in the
-forecast or a window structure where the right answer is not 50 %, and this sample has neither.
-The harness reports that it cannot tell, rather than picking the flattering reading.
+The defensible statement is therefore narrower than the headline number: **on 21 windows over 95
+minutes the committee's forecasts were no longer degenerate, its direction beat a same-boldness
+random twin, its magnitude was worse than useless, and a trivial always-UP rule beat it on the same
+rows.** The first of those is new information — the pipeline now produces a forecast that varies.
+The rest is not yet a claim about skill.
 
-### What this does establish
+*What the run does establish regardless of sample size.*
 
-- The measurement path works end to end: verdicts are on chain, outcomes are joinable, the join
-  is honest, and the whole thing is reproducible from public data with no key and no cost.
-- The policy layer is sound under the worst realistic input. Handed a signal with no edge, the
-  desk refused sixteen times out of sixteen and traded nothing. A desk that had traded on this
-  input would be the actual finding, and a much worse one.
-- Under the pre-registered protocol, **the committee currently provides no measurable forecasting
-  edge over a coin flip.** That is the number as of this run, and it will stay the number until a
-  bigger sample with non-degenerate forecasts says otherwise.
+- The measurement path works end to end: verdicts are on chain, outcomes are joinable, the join is
+  honest, and the whole thing is reproducible from public data with no key and no cost.
+- The two fixes changed the data, not just the story. Dispersion moved from 1 distinct value to 4 and
+  sd from 0.0000 to 0.2902 over the same venue, the same assets and the same cadence.
+- The refusal path is doing its job. Six verdicts reached a desk, six were refused, and the reasons
+  name a missing book and a venue that would not take the quote. A desk that had traded on an
+  unobservable book would be the actual finding, and a much worse one.
+- The harness returns bad news. It returned "beats neither control" last time and "loses to constant
+  50 % on Brier" this time, both in the headline.
 
-### What would change the answer
+---
 
-The sample is 14. It grows on its own — the venue lists new five-minute windows continuously and
-the router prices them without intervention. Over the six minutes between two runs during this
-session the graded sample went from 10 to 14, which is the rate to expect: roughly two verdicts
-per five-minute window, one for BTC and one for ETH. Re-running the harness an hour, a day or a
-week later regrades everything settled since, with no state to reset and nothing to configure.
+## 5. What would change the conclusion
 
-The interesting threshold is the first run where forecast dispersion is greater than one distinct
-value. Until then, accuracy, calibration and the binomial test have nothing to bite on, and
-reporting them as anything other than `n/a` would be dressing up a constant as a prediction.
+- **A larger sample.** n = 21 has no power. The 51 %-cluster result (8/8; p = 0.0039 taken alone,
+  though that subset was chosen after seeing the data and the p-value is not honest as stated) is the
+  single most interesting number here and it rests on eight rows. Two verdicts per five-minute
+  window means roughly 24 an hour; a few hundred rows is one overnight gap. At n in the hundreds the
+  base-rate confound above washes out or does not, and the answer stops depending on which two hours
+  were sampled.
+- **A sample that is not one-directional.** Every conclusion here is entangled with a 76 % UP window.
+  A sample spanning both drifts would separate "predicts the market" from "leans up".
+- **A calibrated committee.** The Brier result is not a statement that the committee knows nothing;
+  it is a statement that its numbers are not probabilities. Two cheap interventions would test that
+  directly: an explicit instruction against the rails, or a post-hoc shrink toward the base rate
+  (mapping 0 → 0.2, 100 → 0.8, say) applied on chain and then graded by this same harness. If the
+  direction is real, shrinking alone moves the Brier below 0.25 without adding any information.
+- **A book to measure edge against.** Every one of the six desk-side rows carried the unobserved
+  sentinel. Until some side of the venue's book quotes, "edge versus the market" is unmeasurable and
+  `NoBook` will keep being the correct answer — which also means the `AiEdge` mandate has not yet
+  been exercised on a real quote.
+- **Funded desks.** 50 `NO_CREDIT` skips means most verdicts never reached a mandate at all. There is
+  no execution result in this document because there was no execution.
 
-### Limits of this evaluation, stated plainly
+---
 
-- **n = 14 is tiny.** Nothing here has the power to detect a real edge even if one existed. No
-  claim in this document should be read as evidence that the committee is *incapable*; it is
-  evidence about what it has emitted so far.
-- **42.9 minutes of chain, one venue, one asset pair, one cadence** (300 s). Every graded window
-  is a five-minute BTC or ETH window. Longer cadences are untested.
-- **The book-implied probability is a single pool read at fan-out time**, not a depth-weighted
-  mid. On books quoting a flat 0.50 with no trades it carries little information — which is itself
-  why the MAD is exactly zero.
-- **Settlement is taken from the venue's indexer.** If the indexer is wrong, this is wrong. The
-  payout vector and `winningOutcome` are cross-checked against each other, which catches
-  inconsistency but not a consistent error.
-- **Two verdicts are excluded and will be graded later**, awaiting finalization. They are not
-  dropped, just not settled yet.
+## Defects found in the harness itself
+
+Found while writing this report, from the same run. Both are in `eval/`, neither changes the
+committee metrics above, and both are stated here rather than quietly fixed.
+
+1. **`mean |committee − book|` is invalid in this sample.** All six rows carrying a `pBookBps`
+   carried **65535** — `LucidTypes.BOOK_UNOBSERVED`, the sentinel for "no side of the book quoted".
+   `metrics.ts::meanAbsoluteDeviation` treats it as a number, so 65535 bps enters the arithmetic as a
+   probability of 6.5535 and produces the reported 6.1302. The contracts guard against exactly this
+   (`LucidDesk`: "a value that encodes ABSENCE must never be an arithmetic input"); the harness does
+   not. The correct reading of that row is **zero rows had an observed book**, and the metric should
+   report `n/a`.
+2. **Desk discovery misses desks created before the brain's deployment block.** The scan window is
+   anchored on the brain, which has been redeployed; desks registered with the router before that
+   block are found neither by `DeskCreated` in range nor in `deployed.json`. In this run the router
+   fanned out to **four** desks and the harness scanned **two**. Verified directly against the same
+   block range: the two undiscovered desks (`0x7a31…58c0`, `0xb8d3…5644`) took 19 `NO_CREDIT` skips
+   each and emitted **30 further refusals** — 15 `NoBook`, 13 `CapExceeded`, 2 `InsufficientFunds` —
+   that the refusal table above does not include. The reported refusal breakdown is complete for the
+   two current desks and covers 12 of the 42 refusals actually emitted in the scanned range.
+
+---
+
+## Re-running and growing the sample
+
+```sh
+cd eval
+npm install     # once
+npm run eval    # or: npx tsx run.ts
+```
+
+Node 20+, `viem` the only dependency. There is no state to reset and no flag to pass. Each run
+rescans from the brain's deployment block to current head and regrades everything settled since,
+including rows excluded last time as `not-finalized` or `not-in-indexer` — those resolve on their own
+within minutes. Optional overrides: `LUCID_FROM_BLOCK`, `LUCID_RPC_URL`, `LUCID_INDEXER_URL`. After a
+redeploy, delete `.scan-cache.json`.
+
+The number that decides how much a run is worth is **graded PRIMARY**, printed first.
+
+**Everything in this file is a snapshot.** Chain 50312, blocks 481 521 686 → 481 599 789, head block
+time 2026-09-06T22:18:57Z, run 2026-09-06T22:19:02Z, n = 21. A later run covers a different and
+larger window and will produce different numbers; the ones here are not updated in place, and any
+number quoted from this document should be quoted with that block range attached.
+
+---
+
+## Limits, stated plainly
+
+- **n = 21.** No claim here has the power to detect a real edge or to rule one out.
+- **95 minutes, one venue, one cadence, two assets.** Every graded window is a 300-second BTC/USDC or
+  ETH/USDC window. Longer cadences and other assets are untested.
+- **The sample drifted up** (16 of 21). This is the dominant confound and it is not correctable
+  after the fact — only outgrown.
+- **The committee was unanimous on every row.** Whether three validators are adding anything over one
+  cannot be answered from a sample with zero within-committee dispersion.
+- **Zero trades on committee signal.** This measures forecasts, not execution, not P&L, not slippage.
+- **Settlement comes from the venue's indexer.** If the indexer is wrong, this is wrong. The payout
+  vector and `winningOutcome` are cross-checked against each other, which catches inconsistency but
+  not a consistent error.
+- **The discrimination probe in section 2 is not harness output** and is not reproduced by `run.ts`.
+  It is reported as measured.

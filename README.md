@@ -212,14 +212,14 @@ node scripts/sync-addresses.mjs            # refreshes the tables in this file a
 | --- | --- |
 | `LucidRouter` | [`0x6aE21a20444141552648C1f8443bAf171BCCcB99`](https://shannon-explorer.somnia.network/address/0x6aE21a20444141552648C1f8443bAf171BCCcB99) |
 | `LucidBrain` | [`0x0c640E3aFc627bEec7eDB9985696e12B50AdAd25`](https://shannon-explorer.somnia.network/address/0x0c640E3aFc627bEec7eDB9985696e12B50AdAd25) |
-| `LucidDesk (clone implementation)` | [`0x8D87D72A23Be0F9a07046b89113a7e615F629994`](https://shannon-explorer.somnia.network/address/0x8D87D72A23Be0F9a07046b89113a7e615F629994) |
-| `LucidFactory` | [`0xF36b6E1cf0D43563bC8874dd0cf8c24188eE2d94`](https://shannon-explorer.somnia.network/address/0xF36b6E1cf0D43563bC8874dd0cf8c24188eE2d94) |
+| `LucidDesk (clone implementation)` | [`0xc54d0BaA3310F77a164D17Fe10f32a567793489E`](https://shannon-explorer.somnia.network/address/0xc54d0BaA3310F77a164D17Fe10f32a567793489E) |
+| `LucidFactory` | [`0xF82cC4219F6c7fe816155A8c3F0C9C3B1cc320eA`](https://shannon-explorer.somnia.network/address/0xF82cC4219F6c7fe816155A8c3F0C9C3B1cc320eA) |
 | `LucidKeeper` | [`0x4757599dC9A5a089270373a66BEeeD6592788707`](https://shannon-explorer.somnia.network/address/0x4757599dC9A5a089270373a66BEeeD6592788707) |
 | `LucidRelay` | [`0xd9Eee9BE420E2CD777E55d890a940a637ed0bB7A`](https://shannon-explorer.somnia.network/address/0xd9Eee9BE420E2CD777E55d890a940a637ed0bB7A) |
 | `LucidSeries` | [`0x747fF3a7A6FE4912c96dCe7faA711dCB6fbd1CE4`](https://shannon-explorer.somnia.network/address/0x747fF3a7A6FE4912c96dCe7faA711dCB6fbd1CE4) |
 | `MarketCreator (ours)` | [`0x7Fa6Ac2a61C0b5A0FcC7E1d9b05a0F6AD84763b2`](https://shannon-explorer.somnia.network/address/0x7Fa6Ac2a61C0b5A0FcC7E1d9b05a0F6AD84763b2) |
-| `Desk Ai Edge` | [`0x7a3153D5f0142F12dDe38A16E550098AFf4f58c0`](https://shannon-explorer.somnia.network/address/0x7a3153D5f0142F12dDe38A16E550098AFf4f58c0) |
-| `Desk Maker` | [`0xb8d3d87cfF214A2c1DC56bdAbe182b8165Db5644`](https://shannon-explorer.somnia.network/address/0xb8d3d87cfF214A2c1DC56bdAbe182b8165Db5644) |
+| `Desk Ai Edge` | [`0x86D170169cde0b5ab4bb3B360E930625aBA849ea`](https://shannon-explorer.somnia.network/address/0x86D170169cde0b5ab4bb3B360E930625aBA849ea) |
+| `Desk Maker` | [`0xd44B2e952a29409eAfb940e42c7D2C20BA746faC`](https://shannon-explorer.somnia.network/address/0xd44B2e952a29409eAfb940e42c7D2C20BA746faC) |
 
 - Chain: Somnia Shannon, id `50312`.
 - Explorer: <https://shannon-explorer.somnia.network>

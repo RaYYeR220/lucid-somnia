@@ -6,11 +6,11 @@
 export const deployed = {
   chainId: 50312,
   /** ERC-1167 master copy every user desk is cloned from. Never call it directly. */
-  deskImplementation: '0x8D87D72A23Be0F9a07046b89113a7e615F629994',
+  deskImplementation: '0xc54d0BaA3310F77a164D17Fe10f32a567793489E',
   brain: '0x0c640E3aFc627bEec7eDB9985696e12B50AdAd25',
   /** Sole owner of every reactivity subscription; must hold >= 32 SOMI to keep them alive. */
   router: '0x6aE21a20444141552648C1f8443bAf171BCCcB99',
-  factory: '0xF36b6E1cf0D43563bC8874dd0cf8c24188eE2d94',
+  factory: '0xF82cC4219F6c7fe816155A8c3F0C9C3B1cc320eA',
   keeper: '0x4757599dC9A5a089270373a66BEeeD6592788707',
   relay: '0xd9Eee9BE420E2CD777E55d890a940a637ed0bB7A',
   series: '0x747fF3a7A6FE4912c96dCe7faA711dCB6fbd1CE4',
@@ -25,7 +25,7 @@ export const deployed = {
    * pre-render. The deploy script names them by strategy and the set changes between
    * deployments, so they are collected by shape rather than by a fixed key.
    */
-  seedDesks: ['0x7a3153D5f0142F12dDe38A16E550098AFf4f58c0', '0xb8d3d87cfF214A2c1DC56bdAbe182b8165Db5644'] as readonly string[],
+  seedDesks: ['0x86D170169cde0b5ab4bb3B360E930625aBA849ea', '0xd44B2e952a29409eAfb940e42c7D2C20BA746faC'] as readonly string[],
 } as const
 
 export const routerAbi = [
