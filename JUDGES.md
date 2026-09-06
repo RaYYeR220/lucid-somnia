@@ -1,5 +1,7 @@
 # Reviewing Lucid
 
+**Live interface:** https://lucid-somnia.vercel.app — reads Somnia Shannon directly, no wallet needed to look around.
+
 A guided path through this repository, in order, with the exact command for each step and what you
 should see. It runs end to end in about five minutes.
 
@@ -74,15 +76,16 @@ theirs, not ours.
 
 | contract | address |
 | --- | --- |
-| `LucidRouter` | [`0x10bC10a861fBb61Cc26832110011766d8CfA958B`](https://shannon-explorer.somnia.network/address/0x10bC10a861fBb61Cc26832110011766d8CfA958B) |
-| `LucidBrain` | [`0x37d0a2907242C09F0B445D655982dA4983345636`](https://shannon-explorer.somnia.network/address/0x37d0a2907242C09F0B445D655982dA4983345636) |
-| `LucidDesk (clone implementation)` | [`0xEdEB63CE4d24F315CE72236BbE2E27c2dc0d1769`](https://shannon-explorer.somnia.network/address/0xEdEB63CE4d24F315CE72236BbE2E27c2dc0d1769) |
-| `LucidFactory` | [`0xD7Dd1D363C0Cc5e3Bea6dbaC161d7D929E7d41ea`](https://shannon-explorer.somnia.network/address/0xD7Dd1D363C0Cc5e3Bea6dbaC161d7D929E7d41ea) |
-| `LucidKeeper` | [`0x40d3D34C0bC48a3A0A2a5eFB02b1db965CDa10cE`](https://shannon-explorer.somnia.network/address/0x40d3D34C0bC48a3A0A2a5eFB02b1db965CDa10cE) |
-| `LucidRelay` | [`0x7A5287597e43808A2E68090A776D0a3E71625fB8`](https://shannon-explorer.somnia.network/address/0x7A5287597e43808A2E68090A776D0a3E71625fB8) |
-| `LucidSeries` | [`0x5f9297DD99Bb24cfB6c9067cf0f12A19Bc44a70e`](https://shannon-explorer.somnia.network/address/0x5f9297DD99Bb24cfB6c9067cf0f12A19Bc44a70e) |
-| `Demo desk (clone)` | [`0x7a1B13b3531Cd07e34dF7ecc0f8a18652A92a4c4`](https://shannon-explorer.somnia.network/address/0x7a1B13b3531Cd07e34dF7ecc0f8a18652A92a4c4) |
+| `LucidRouter` | [`0x6aE21a20444141552648C1f8443bAf171BCCcB99`](https://shannon-explorer.somnia.network/address/0x6aE21a20444141552648C1f8443bAf171BCCcB99) |
+| `LucidBrain` | [`0x0c640E3aFc627bEec7eDB9985696e12B50AdAd25`](https://shannon-explorer.somnia.network/address/0x0c640E3aFc627bEec7eDB9985696e12B50AdAd25) |
+| `LucidDesk (clone implementation)` | [`0x8D87D72A23Be0F9a07046b89113a7e615F629994`](https://shannon-explorer.somnia.network/address/0x8D87D72A23Be0F9a07046b89113a7e615F629994) |
+| `LucidFactory` | [`0xF36b6E1cf0D43563bC8874dd0cf8c24188eE2d94`](https://shannon-explorer.somnia.network/address/0xF36b6E1cf0D43563bC8874dd0cf8c24188eE2d94) |
+| `LucidKeeper` | [`0x4757599dC9A5a089270373a66BEeeD6592788707`](https://shannon-explorer.somnia.network/address/0x4757599dC9A5a089270373a66BEeeD6592788707) |
+| `LucidRelay` | [`0xd9Eee9BE420E2CD777E55d890a940a637ed0bB7A`](https://shannon-explorer.somnia.network/address/0xd9Eee9BE420E2CD777E55d890a940a637ed0bB7A) |
+| `LucidSeries` | [`0x747fF3a7A6FE4912c96dCe7faA711dCB6fbd1CE4`](https://shannon-explorer.somnia.network/address/0x747fF3a7A6FE4912c96dCe7faA711dCB6fbd1CE4) |
 | `MarketCreator (ours)` | [`0x7Fa6Ac2a61C0b5A0FcC7E1d9b05a0F6AD84763b2`](https://shannon-explorer.somnia.network/address/0x7Fa6Ac2a61C0b5A0FcC7E1d9b05a0F6AD84763b2) |
+| `Desk Ai Edge` | [`0x7a3153D5f0142F12dDe38A16E550098AFf4f58c0`](https://shannon-explorer.somnia.network/address/0x7a3153D5f0142F12dDe38A16E550098AFf4f58c0) |
+| `Desk Maker` | [`0xb8d3d87cfF214A2c1DC56bdAbe182b8165Db5644`](https://shannon-explorer.somnia.network/address/0xb8d3d87cfF214A2c1DC56bdAbe182b8165Db5644) |
 
 - Chain: Somnia Shannon, id `50312`.
 - Explorer: <https://shannon-explorer.somnia.network>
