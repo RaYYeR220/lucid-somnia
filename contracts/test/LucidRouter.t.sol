@@ -2,7 +2,9 @@
 pragma solidity 0.8.30;
 
 import {Test} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 import {SomniaEventHandler} from "@somnia/reactivity/SomniaEventHandler.sol";
+import {SomniaExtensions} from "@somnia/reactivity/interfaces/SomniaExtensions.sol";
 import {ISomniaEventHandler} from "@somnia/reactivity/interfaces/ISomniaEventHandler.sol";
 import {ISomniaReactivityPrecompile} from "@somnia/reactivity/interfaces/ISomniaReactivityPrecompile.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
@@ -101,6 +103,29 @@ contract MockRelayForRouter {
         lastMax = max;
         if (address(witness) != address(0)) keepsWhenRelayed = witness.keepCalls();
     }
+}
+
+/// @notice A desk that reports the gas budget it was actually handed.
+/// @dev Kept here rather than in `test/mocks/` because it exists for exactly one property: a
+/// stipend is a promise about a number, and the only place that number is observable is inside the
+/// callee's own frame. Everything else — did it revert, did it emit — is downstream of it.
+contract MockGasWitnessDesk {
+    uint256 public lastVerdictGas;
+    uint256 public lastSettlementGas;
+
+    function preCheck(LucidTypes.MarketInfo calldata) external pure returns (bool) {
+        return true;
+    }
+
+    function onVerdict(LucidTypes.MarketInfo calldata, LucidTypes.Verdict calldata, uint256) external {
+        lastVerdictGas = gasleft();
+    }
+
+    function onSettlement(LucidTypes.MarketInfo calldata) external {
+        lastSettlementGas = gasleft();
+    }
+
+    function onLeaderTrade(LucidTypes.MarketInfo calldata, uint8, uint256) external {}
 }
 
 /// @title LucidRouterTest
@@ -209,7 +234,7 @@ contract LucidRouterTest is Test {
     function test_armVenue_uses_gas_limit_of_at_least_5m() public view {
         ISomniaReactivityPrecompile.SubscriptionData memory s = precompile.subscriptionAt(0);
         assertGe(s.gasLimit, 5_000_000, "below 5M the handler silently never runs");
-        assertEq(s.gasLimit, 8_000_000, "the value this protocol ships");
+        assertEq(s.gasLimit, 100_000_000, "the value this protocol ships");
         assertEq(s.priorityFeePerGas, 1 gwei, "priority fee");
         assertEq(s.maxFeePerGas, 20 gwei, "max fee clears the 6 gwei protocol floor");
     }
@@ -409,7 +434,7 @@ contract LucidRouterTest is Test {
         _fireBtc();
 
         vm.expectEmit(true, true, false, true, address(router));
-        emit LucidRouter.Skipped(address(bad), BTC_MARKET_ID, "VERDICT_FAILED");
+        emit LucidRouter.Skipped(address(bad), BTC_MARKET_ID, "DESK_REVERTED");
         vm.prank(address(brain));
         router.onVerdict(BTC_MARKET_ID, _verdict(6200));
 
@@ -418,7 +443,7 @@ contract LucidRouterTest is Test {
 
         vm.warp(EXPIRY + 5);
         vm.expectEmit(true, true, false, true, address(router));
-        emit LucidRouter.Skipped(address(bad), BTC_MARKET_ID, "SETTLE_FAILED");
+        emit LucidRouter.Skipped(address(bad), BTC_MARKET_ID, "SETTLEMENT_REVERTED");
         _fireSchedule(DUE_MS);
 
         assertEq(good.settlementCalls(), 1, "the healthy desk still settled");
@@ -839,19 +864,173 @@ contract LucidRouterTest is Test {
         assertEq(router.relay(), address(0), "and detach it again");
     }
 
+    // ── adaptive gas stipends ─────────────────────────────────────────────────
+    //
+    // The bug these pin was found live on Shannon. The router handed every desk a flat
+    // DESK_GAS = 1_000_000, a desk's `onVerdict` needed 1_314_773 against real chain state, and so
+    // every call ran out of gas, the `catch` swallowed it, and the router logged "VERDICT_FAILED" —
+    // which reads as "the committee failed" when the committee had answered 3/3 with ok = true and
+    // the only thing that was wrong was our own budget. Two separate defects: a stipend calibrated
+    // for mainnet-Ethereum gas costs on a chain where an SSTORE plus an event measures ~250_000,
+    // and a label that pointed at the wrong component.
+
+    /// @dev A fixed stipend is a promise the frame may not be able to keep. Asking for eight
+    /// million out of a three million frame does not fail loudly — the 63/64 rule truncates the
+    /// request, the callee quietly takes almost everything there is, and whatever the router still
+    /// had to do after the call is left with nothing. The cap makes the shortfall explicit, and
+    /// the reserve is what the loop finishes on.
+    function test_stipend_is_capped_by_remaining_gas() public {
+        MockGasWitnessDesk witness = new MockGasWitnessDesk();
+        _admitDesk(address(witness), 1 ether);
+
+        _fireBtc();
+
+        uint256 frame = 3_000_000;
+        assertLt(frame, router.DESK_GAS(), "the frame really is smaller than the ceiling asks for");
+
+        assertTrue(_callVerdict(frame), "the handler finished rather than running out of gas");
+
+        // Everything above the reserve, less the 64th the EVM keeps back on any call.
+        uint256 ceiling = ((frame - router.GAS_RESERVE()) * 63) / 64;
+        assertGt(witness.lastVerdictGas(), 0, "the desk was given a real budget");
+        assertLe(witness.lastVerdictGas(), ceiling, "sized against the frame, not against DESK_GAS");
+        assertLt(witness.lastVerdictGas(), frame - router.GAS_RESERVE(), "and the reserve was held back");
+    }
+
+    /// @dev Zero gas is not a budget. Calling with it and then reporting the revert would blame the
+    /// desk for a shortfall that was entirely ours, which is exactly the mistake that shipped.
+    function test_desk_is_skipped_with_NO_GAS_when_the_budget_is_exhausted() public {
+        MockDeskForRouter d = _newDesk(true, 1 ether);
+        _fireBtc();
+
+        // At the reserve there is nothing left to give away, by construction: the frame the router
+        // holds back for its own bookkeeping is the whole frame.
+        vm.expectEmit(true, true, false, true, address(router));
+        emit LucidRouter.Skipped(address(d), BTC_MARKET_ID, "NO_GAS");
+        assertTrue(_callVerdict(router.GAS_RESERVE()), "the fan-out still reported");
+
+        assertEq(d.verdictCalls(), 0, "and the desk was never called with a budget it could not use");
+    }
+
+    /// @dev The reason string is diagnostic output. "VERDICT_FAILED" named the committee; this one
+    /// names the contract that actually reverted.
+    function test_a_reverting_desk_is_labelled_DESK_REVERTED() public {
+        MockDeskForRouter bad = _newDesk(true, 1 ether);
+        bad.setRevertModes(false, true, false, false);
+        MockDeskForRouter good = _newDesk(true, 1 ether);
+
+        _fireBtc();
+
+        vm.expectEmit(true, true, false, true, address(router));
+        emit LucidRouter.Skipped(address(bad), BTC_MARKET_ID, "DESK_REVERTED");
+        vm.prank(address(brain));
+        router.onVerdict(BTC_MARKET_ID, _verdict(6200));
+
+        assertEq(bad.verdictCalls(), 0, "the broken desk did nothing");
+        assertEq(good.verdictCalls(), 1, "and its neighbour was untouched by the label");
+    }
+
+    function test_settlement_revert_is_labelled_SETTLEMENT_REVERTED() public {
+        MockDeskForRouter bad = _newDesk(true, 1 ether);
+        bad.setRevertModes(false, false, true, false);
+        MockDeskForRouter good = _newDesk(true, 1 ether);
+
+        _fireBtc();
+        vm.warp(EXPIRY + 5);
+
+        vm.expectEmit(true, true, false, true, address(router));
+        emit LucidRouter.Skipped(address(bad), BTC_MARKET_ID, "SETTLEMENT_REVERTED");
+        _fireSchedule(DUE_MS);
+
+        assertEq(good.settlementCalls(), 1, "the healthy desk still settled");
+    }
+
+    /// @dev The subscription ceiling is billed only when a handler actually runs out of gas, and
+    /// then it is billed in full — so headroom is free and a tight limit is not. It still has to
+    /// clear the precompile's own cap, which rejects the subscription outright.
+    function test_handler_gas_limit_is_within_the_precompile_maximum() public {
+        assertLe(
+            router.HANDLER_GAS_LIMIT(),
+            SomniaExtensions.MAXIMUM_HANDLER_GAS_LIMIT,
+            "above this the precompile refuses to subscribe at all"
+        );
+        assertLe(uint256(router.HANDLER_GAS_LIMIT()), 200_000_000, "the cap, spelled out");
+
+        _newDesk(true, 1 ether);
+        _fireBtc();
+
+        assertEq(precompile.subscriptionCount(), 2, "the venue log subscription and the settlement one-shot");
+        assertEq(precompile.subscriptionAt(0).gasLimit, router.HANDLER_GAS_LIMIT(), "venue log subscription");
+        assertEq(precompile.subscriptionAt(1).gasLimit, router.HANDLER_GAS_LIMIT(), "settlement one-shot");
+    }
+
+    /// @dev The property that matters when the budget runs out partway down a list: every desk is
+    /// accounted for. Served, or named in a skip. A desk that silently falls off the end is
+    /// indistinguishable from a desk that was never armed, and that is the failure mode the live
+    /// bug produced.
+    function test_the_whole_fanout_still_reports_when_gas_runs_short() public {
+        uint256 n = 5;
+        MockDeskForRouter[] memory desks = new MockDeskForRouter[](n);
+        for (uint256 i; i < n; ++i) {
+            desks[i] = _newDesk(true, 1 ether);
+            // Every desk asks for everything it is given, so the budget cannot reach the end of
+            // the list however it is sliced.
+            desks[i].setGasBombs(true, false);
+        }
+
+        _fireBtc();
+        assertEq(router.interestedIn(BTC_MARKET_ID).length, n, "all five are on the hook");
+
+        vm.recordLogs();
+        assertTrue(_callVerdict(4_000_000), "the fan-out finished rather than reverting");
+
+        uint256 skipped = _countSkipped(vm.getRecordedLogs());
+        uint256 served;
+        for (uint256 i; i < n; ++i) {
+            served += desks[i].verdictCalls();
+        }
+        assertEq(served, 0, "a frame this size serves nobody");
+        assertEq(skipped, n, "and every one of them is named rather than dropped");
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────────
+
+    /// @dev Delivers a verdict inside a frame of exactly `gasCap`, which is the only way to reach
+    /// the branches where the router runs out of budget mid-fan-out.
+    function _callVerdict(uint256 gasCap) internal returns (bool ok) {
+        bytes memory payload = abi.encodeCall(LucidRouter.onVerdict, (BTC_MARKET_ID, _verdict(6200)));
+
+        vm.prank(address(brain));
+        (ok,) = address(router).call{gas: gasCap}(payload);
+    }
+
+    /// @dev How many `Skipped` events the router emitted, whatever the reason on each.
+    function _countSkipped(Vm.Log[] memory logs) internal view returns (uint256 count) {
+        bytes32 topic0 = keccak256("Skipped(address,bytes32,string)");
+
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].emitter != address(router)) continue;
+            if (logs[i].topics.length == 0 || logs[i].topics[0] != topic0) continue;
+            ++count;
+        }
+    }
 
     function _newDesk(bool wants, uint256 credit) internal returns (MockDeskForRouter d) {
         d = new MockDeskForRouter(deskOwner, address(router));
         d.setWants(wants);
 
+        _admitDesk(address(d), credit);
+    }
+
+    /// @dev Registers, arms and funds any desk-shaped contract, so a test can bring its own.
+    function _admitDesk(address desk, uint256 credit) internal {
         vm.prank(owner);
-        router.registerDesk(address(d));
+        router.registerDesk(desk);
 
-        vm.prank(address(d));
-        router.setDeskArmed(address(d), true);
+        vm.prank(desk);
+        router.setDeskArmed(desk, true);
 
-        if (credit != 0) router.topUp{value: credit}(address(d));
+        if (credit != 0) router.topUp{value: credit}(desk);
     }
 
     /// @dev Publishes a copy-trade link in the factory, attaching the factory on first use so the

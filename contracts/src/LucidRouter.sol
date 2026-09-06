@@ -52,6 +52,12 @@ interface ILucidRelay {
 /// and given its own gas stipend, and every skipped desk is named in an event. A silent success is
 /// worse than a loud refusal: a desk owner who cannot tell the difference between "nothing
 /// happened" and "we decided not to" has no way to run this.
+///
+/// @dev The corollary, learned the expensive way: a skip reason has to name the component that
+/// actually failed. A stipend too small for the callee produces a caught revert that is
+/// indistinguishable from a broken callee, and a label that blames the callee sends whoever is
+/// reading the log to debug the wrong contract. Hence `_stipend`, which sizes every budget against
+/// what the frame can really give, and `"NO_GAS"`, which says plainly that the shortfall was ours.
 contract LucidRouter is SomniaEventHandler, Ownable {
     // ─────────────────────────────────────────────────────────────────────────
     // Constants
@@ -59,15 +65,26 @@ contract LucidRouter is SomniaEventHandler, Ownable {
 
     /// @notice How many armed desks one market firing may consider.
     /// @dev A handler runs inside a fixed gas limit, so the fan-out has to be bounded by
-    /// construction rather than by hope. Thirty-two desks fit comfortably inside 8M gas even when
-    /// several of them place orders.
+    /// construction rather than by hope. Thirty-two desks fit inside `HANDLER_GAS_LIMIT` even when
+    /// several of them place orders — and where they do not, `_stipend` degrades the tail of the
+    /// list into named skips rather than into a lost firing.
     uint256 public constant MAX_FANOUT = 32;
 
     /// @notice Callback gas provisioned for every subscription this router creates.
+    ///
     /// @dev Measured on Shannon, not guessed: at 2_000_000 the chain charged for the handler and
     /// never executed it — no revert, no logs, no state change, indistinguishable from a market
-    /// nobody wanted. 3M and 5M both worked. 8M leaves room for a full fan-out.
-    uint64 public constant HANDLER_GAS_LIMIT = 8_000_000;
+    /// nobody wanted. 3M and 5M both worked. 8M was then shipped, and 8M was still too tight: one
+    /// desk's `onVerdict` alone estimated at 1_314_773 on live state, because Somnia's gas schedule
+    /// is nothing like mainnet's — a single SSTORE plus an event measures around 250_000 there.
+    ///
+    /// @dev The ceiling is deliberately generous rather than tight, because the billing is
+    /// asymmetric. The subscription owner is charged for the gas a handler actually burns, so
+    /// headroom that is never touched costs nothing; but a handler that runs out of gas is billed
+    /// for the whole limit *and* loses the firing. An over-tight ceiling is therefore the expensive
+    /// mistake and an over-wide one is free. Half of `MAXIMUM_HANDLER_GAS_LIMIT`, which is the hard
+    /// cap `SomniaExtensions` enforces at subscribe time.
+    uint64 public constant HANDLER_GAS_LIMIT = 100_000_000;
 
     /// @notice Priority fee offered to validators for handler execution.
     uint64 public constant HANDLER_PRIORITY_FEE = 1 gwei;
@@ -87,34 +104,41 @@ contract LucidRouter is SomniaEventHandler, Ownable {
     /// desks are woken slightly late rather than exactly on time.
     uint256 public constant SETTLEMENT_DELAY = 5;
 
-    /// @notice Gas stipend for a desk's `preCheck`.
+    /// @notice The gas this contract keeps for itself, never offered to a callee.
+    /// @dev Held back so the loop can finish and still emit what happened. A handler that runs out
+    /// of gas mid-fan-out reports nothing at all, which is the one outcome worse than a skipped desk.
+    uint256 public constant GAS_RESERVE = 2_000_000;
+
+    /// @notice Ceiling on the gas stipend for a desk's `preCheck`.
     /// @dev It is a view over the desk's own policy; anything that needs more than this is either
     /// broken or hostile, and either way must not be allowed to spend the fan-out's budget.
-    uint256 public constant PRECHECK_GAS = 250_000;
+    uint256 public constant PRECHECK_GAS = 1_500_000;
 
-    /// @notice Gas stipend for a desk call that trades or settles.
+    /// @notice Ceiling on the gas stipend for a desk call that trades or settles.
     /// @dev The stipend, not `try`/`catch`, is what actually contains a runaway desk: a reverting
     /// call returns its gas, but a looping one would otherwise consume 63/64 of everything left.
-    uint256 public constant DESK_GAS = 1_000_000;
+    /// @dev Eight million, not one, because one was measured wrong: a live `onVerdict` estimated at
+    /// 1_314_773 against real chain state and every call in that window was cut off mid-flight.
+    uint256 public constant DESK_GAS = 8_000_000;
 
-    /// @notice Gas stipend for reading one side of a pool's book.
-    uint256 public constant BOOK_GAS = 200_000;
+    /// @notice Ceiling on the gas stipend for reading one side of a pool's book.
+    uint256 public constant BOOK_GAS = 1_000_000;
 
     /// @notice A follower may mirror at most the leader's own size.
     uint16 public constant MAX_SCALE_BPS = 10_000;
 
-    /// @notice Gas stipend for the venue-wide upkeep pass over one settled market.
+    /// @notice Ceiling on the gas stipend for the venue-wide upkeep pass over one settled market.
     /// @dev The keeper makes up to five external calls into contracts this protocol does not own.
     /// It is a public good, not a priority: it runs after every desk in the firing has been
     /// settled, and it is capped so it can never spend what those desks paid for.
-    uint256 public constant KEEPER_GAS = 1_500_000;
+    uint256 public constant KEEPER_GAS = 8_000_000;
 
-    /// @notice Gas stipend for draining one market's pre-signed exits after it settles.
+    /// @notice Ceiling on the gas stipend for draining one market's pre-signed exits after it settles.
     /// @dev Redemption is a token transfer per entry on a venue contract this protocol does not
     /// own, so the batch below is the expensive tenant of a settlement firing. It is still capped:
     /// the desks paid for this firing, and an auto-redeem that starved them would be a worse deal
     /// than no auto-redeem at all.
-    uint256 public constant RELAY_GAS = 4_000_000;
+    uint256 public constant RELAY_GAS = 12_000_000;
 
     /// @notice How many pre-signed exits one settlement firing redeems.
     /// @dev The relay's own queue holds up to 64, which was measured at roughly 16.5M gas — twice
@@ -472,9 +496,25 @@ contract LucidRouter is SomniaEventHandler, Ownable {
         // copy fan-out appends followers to the same list.
         address[] memory leaders = _interested[marketId];
         for (uint256 i; i < leaders.length; ++i) {
-            try ILucidDesk(leaders[i]).onVerdict{gas: DESK_GAS}(m, v, pBookBps) {}
+            address desk = leaders[i];
+
+            // A registered desk had code when it was admitted; this covers the case where it no
+            // longer does, which `try` cannot, and keeps a codeless address from reading as a
+            // silent success.
+            if (desk.code.length == 0) {
+                emit Skipped(desk, marketId, "NO_CODE");
+                continue;
+            }
+
+            uint256 gasFor = _stipend(DESK_GAS);
+            if (gasFor == 0) {
+                emit Skipped(desk, marketId, "NO_GAS");
+                continue;
+            }
+
+            try ILucidDesk(desk).onVerdict{gas: gasFor}(m, v, pBookBps) {}
             catch {
-                emit Skipped(leaders[i], marketId, "VERDICT_FAILED");
+                emit Skipped(desk, marketId, "DESK_REVERTED");
             }
         }
 
@@ -600,6 +640,14 @@ contract LucidRouter is SomniaEventHandler, Ownable {
         address[] memory candidates = _candidates(m);
         if (candidates.length == 0) return false;
 
+        // Checked before `_quote` rather than inside it, because a quote that never happened for
+        // want of gas is not the same fact as a brain that is missing or broken, and "NO_BRAIN"
+        // would send whoever reads this log to inspect a contract that was fine.
+        if (_stipend(BOOK_GAS) == 0) {
+            emit Skipped(address(0), m.marketId, "NO_GAS");
+            return false;
+        }
+
         (bool quoted, uint256 fee) = _quote();
         if (!quoted) {
             emit Skipped(address(0), m.marketId, "NO_BRAIN");
@@ -643,7 +691,9 @@ contract LucidRouter is SomniaEventHandler, Ownable {
 
     /// @dev Armed desks that want this market, capped at `MAX_FANOUT` considered. A desk whose
     /// `preCheck` reverts or runs away is treated as a decline: its own breakage is not everyone's.
-    function _candidates(LucidTypes.MarketInfo memory m) private view returns (address[] memory out) {
+    /// A desk this router could not afford to ask is also treated as a decline, but it is named:
+    /// "did not want it" and "we never asked" look the same from outside, and they are not the same.
+    function _candidates(LucidTypes.MarketInfo memory m) private returns (address[] memory out) {
         uint256 len = _deskList.length;
         address[] memory buffer = new address[](MAX_FANOUT);
         uint256 count;
@@ -654,7 +704,21 @@ contract LucidRouter is SomniaEventHandler, Ownable {
             if (!deskArmed[desk]) continue;
             ++considered;
 
-            try ILucidDesk(desk).preCheck{gas: PRECHECK_GAS}(m) returns (bool want) {
+            // `preCheck` returns a value, so the compiler checks `extcodesize` before the call and
+            // raises outside the `catch`. A desk with no code has to be refused here or it takes
+            // the whole firing down.
+            if (desk.code.length == 0) {
+                emit Skipped(desk, m.marketId, "NO_CODE");
+                continue;
+            }
+
+            uint256 gasFor = _stipend(PRECHECK_GAS);
+            if (gasFor == 0) {
+                emit Skipped(desk, m.marketId, "NO_GAS");
+                continue;
+            }
+
+            try ILucidDesk(desk).preCheck{gas: gasFor}(m) returns (bool want) {
                 if (want) buffer[count++] = desk;
             } catch {}
         }
@@ -746,9 +810,21 @@ contract LucidRouter is SomniaEventHandler, Ownable {
             uint256 holderCount = holders.length;
             for (uint256 j; j < holderCount; ++j) {
                 address desk = holders[j];
-                try ILucidDesk(desk).onSettlement{gas: DESK_GAS}(m) {}
+
+                if (desk.code.length == 0) {
+                    emit Skipped(desk, marketId, "NO_CODE");
+                    continue;
+                }
+
+                uint256 gasFor = _stipend(DESK_GAS);
+                if (gasFor == 0) {
+                    emit Skipped(desk, marketId, "NO_GAS");
+                    continue;
+                }
+
+                try ILucidDesk(desk).onSettlement{gas: gasFor}(m) {}
                 catch {
-                    emit Skipped(desk, marketId, "SETTLE_FAILED");
+                    emit Skipped(desk, marketId, "SETTLEMENT_REVERTED");
                 }
             }
 
@@ -776,7 +852,13 @@ contract LucidRouter is SomniaEventHandler, Ownable {
         address k = keeper;
         if (k == address(0) || k.code.length == 0) return;
 
-        try ILucidKeeper(k).keep{gas: KEEPER_GAS}(m) {}
+        uint256 gasFor = _stipend(KEEPER_GAS);
+        if (gasFor == 0) {
+            emit Skipped(k, m.marketId, "NO_GAS");
+            return;
+        }
+
+        try ILucidKeeper(k).keep{gas: gasFor}(m) {}
         catch {
             emit Skipped(k, m.marketId, "KEEPER_FAILED");
         }
@@ -796,7 +878,13 @@ contract LucidRouter is SomniaEventHandler, Ownable {
         address r = relay;
         if (r == address(0) || r.code.length == 0) return;
 
-        try ILucidRelay(r).relayUpTo{gas: RELAY_GAS}(marketId, RELAY_BATCH) {}
+        uint256 gasFor = _stipend(RELAY_GAS);
+        if (gasFor == 0) {
+            emit Skipped(r, marketId, "NO_GAS");
+            return;
+        }
+
+        try ILucidRelay(r).relayUpTo{gas: gasFor}(marketId, RELAY_BATCH) {}
         catch {
             emit Skipped(r, marketId, "RELAY_FAILED");
         }
@@ -810,7 +898,12 @@ contract LucidRouter is SomniaEventHandler, Ownable {
         // rather than inside it. Every call below that returns something is guarded the same way.
         if (m.market.code.length == 0) return;
 
-        try IBinaryMarket(m.market).payoutNumerators{gas: BOOK_GAS}() returns (uint256[] memory payouts) {
+        // Evidence for the next prompt, not work anybody paid for: if the frame is spent, the ring
+        // simply keeps one window less of history.
+        uint256 gasFor = _stipend(BOOK_GAS);
+        if (gasFor == 0) return;
+
+        try IBinaryMarket(m.market).payoutNumerators{gas: gasFor}() returns (uint256[] memory payouts) {
             if (payouts.length < 2) return;
 
             History storage h = _history[m.assetKey];
@@ -840,8 +933,14 @@ contract LucidRouter is SomniaEventHandler, Ownable {
             // a replayed verdict.
             delete _lastTrade[leader][m.marketId];
 
+            uint256 gasFor = _stipend(DESK_GAS);
+            if (gasFor == 0) {
+                emit Skipped(leader, m.marketId, "NO_GAS");
+                continue;
+            }
+
             address[] memory followers;
-            try IFactoryView(registry).followersOf{gas: DESK_GAS}(leader) returns (address[] memory list) {
+            try IFactoryView(registry).followersOf{gas: gasFor}(leader) returns (address[] memory list) {
                 followers = list;
             } catch {
                 continue;
@@ -858,8 +957,14 @@ contract LucidRouter is SomniaEventHandler, Ownable {
     function _copyOne(LucidTypes.MarketInfo memory m, address leader, address follower, Trade memory t) private {
         if (follower == leader || !isDesk[follower]) return;
 
+        uint256 readGas = _stipend(BOOK_GAS);
+        if (readGas == 0) {
+            emit Skipped(follower, m.marketId, "NO_GAS");
+            return;
+        }
+
         uint16 scaleBps;
-        try IFactoryView(factory).scaleOf{gas: BOOK_GAS}(leader, follower) returns (uint16 s) {
+        try IFactoryView(factory).scaleOf{gas: readGas}(leader, follower) returns (uint16 s) {
             scaleBps = s;
         } catch {
             return;
@@ -878,8 +983,19 @@ contract LucidRouter is SomniaEventHandler, Ownable {
             return;
         }
 
+        if (follower.code.length == 0) {
+            emit Skipped(follower, m.marketId, "NO_CODE");
+            return;
+        }
+
+        uint256 copyGas = _stipend(DESK_GAS);
+        if (copyGas == 0) {
+            emit Skipped(follower, m.marketId, "NO_GAS");
+            return;
+        }
+
         uint256 stake = (t.stake * scaleBps) / LucidTypes.BPS;
-        try ILucidDesk(follower).onLeaderTrade{gas: DESK_GAS}(m, t.kind, stake) {
+        try ILucidDesk(follower).onLeaderTrade{gas: copyGas}(m, t.kind, stake) {
             _debit(follower, m.marketId, SETTLEMENT_BUDGET);
             // A desk that took a position must be settled, so copying puts it on the list.
             _addInterested(m.marketId, follower);
@@ -891,6 +1007,21 @@ contract LucidRouter is SomniaEventHandler, Ownable {
     // ─────────────────────────────────────────────────────────────────────────
     // Internals
     // ─────────────────────────────────────────────────────────────────────────
+
+    /// @dev What a callee can actually be given right now, capped at what it is allowed to ask for.
+    ///
+    /// A fixed stipend cannot be right at both ends of a fan-out: sized for the first desk it
+    /// starves the last, and sized for the last it is too small for anybody. So the ceiling is a
+    /// ceiling, and this is the floor of what the frame can honour.
+    ///
+    /// The 63/64 rule means a callee can never receive everything that is left, so asking for
+    /// more than that silently truncates. Capping explicitly keeps the shortfall visible instead.
+    function _stipend(uint256 want) private view returns (uint256) {
+        uint256 left = gasleft();
+        if (left <= GAS_RESERVE) return 0;
+        uint256 available = ((left - GAS_RESERVE) * 63) / 64;
+        return want < available ? want : available;
+    }
 
     /// @dev Fee and gas controls shared by every subscription this router creates.
     function _options() private pure returns (SomniaExtensions.SubscriptionOptions memory) {
@@ -904,7 +1035,10 @@ contract LucidRouter is SomniaEventHandler, Ownable {
         address b = brain;
         if (b.code.length == 0) return (false, 0);
 
-        try ILucidBrain(b).quote{gas: BOOK_GAS}() returns (uint256 q) {
+        uint256 gasFor = _stipend(BOOK_GAS);
+        if (gasFor == 0) return (false, 0);
+
+        try ILucidBrain(b).quote{gas: gasFor}() returns (uint256 q) {
             return (true, q);
         } catch {
             return (false, 0);
@@ -933,7 +1067,10 @@ contract LucidRouter is SomniaEventHandler, Ownable {
     function _bestLevel(address pool, bool isBid) private view returns (bool, uint256) {
         if (pool.code.length == 0) return (false, 0);
 
-        try IBinaryPool(pool).getBookLevels{gas: BOOK_GAS}(isBid, 1) returns (IBinaryPool.Level[] memory levels) {
+        uint256 gasFor = _stipend(BOOK_GAS);
+        if (gasFor == 0) return (false, 0);
+
+        try IBinaryPool(pool).getBookLevels{gas: gasFor}(isBid, 1) returns (IBinaryPool.Level[] memory levels) {
             if (levels.length != 0 && levels[0].price != 0) return (true, levels[0].price);
         } catch {}
         return (false, 0);
