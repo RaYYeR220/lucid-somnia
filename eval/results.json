@@ -1,17 +1,21 @@
 {
   "meta": {
-    "generatedAt": "2026-09-07T02:14:01.008Z",
+    "generatedAt": "2026-09-07T04:36:34.307Z",
     "chainId": 50312,
     "rpcUrl": "https://api.infra.testnet.somnia.network",
     "indexerUrl": "https://dev.smk.somnia.host/v1/graphql",
     "brain": "0x0c640E3aFc627bEec7eDB9985696e12B50AdAd25",
     "router": "0x6aE21a20444141552648C1f8443bAf171BCCcB99",
-    "factory": "0xF82cC4219F6c7fe816155A8c3F0C9C3B1cc320eA",
+    "factory": "0x9c1EF0C429f1F88e8247f3539DeF8a1f8FCCEb84",
     "desks": [
       "0x7a3153d5f0142f12dde38a16e550098aff4f58c0",
       "0xb8d3d87cff214a2c1dc56bdabe182b8165db5644",
       "0x86d170169cde0b5ab4bb3b360e930625aba849ea",
-      "0xd44b2e952a29409eafb940e42c7d2c20ba746fac"
+      "0xd44b2e952a29409eafb940e42c7d2c20ba746fac",
+      "0x8216839bc31e32a028d1d758d984151892cac22c",
+      "0x85e34174fcd39c1c717724b3691d3e34ff265149",
+      "0x822548990ce81b626a3c3684b0c85f2fd9ec9fa7",
+      "0x3ffbb71aec0d5459677021ad888195042eda4aa2"
     ],
     "deskDiscovery": [
       {
@@ -29,13 +33,37 @@
       {
         "address": "0x86d170169cde0b5ab4bb3b360e930625aba849ea",
         "discoveredBy": [
+          "router allDesks()"
+        ]
+      },
+      {
+        "address": "0xd44b2e952a29409eafb940e42c7d2c20ba746fac",
+        "discoveredBy": [
+          "router allDesks()"
+        ]
+      },
+      {
+        "address": "0x8216839bc31e32a028d1d758d984151892cac22c",
+        "discoveredBy": [
+          "router allDesks()"
+        ]
+      },
+      {
+        "address": "0x85e34174fcd39c1c717724b3691d3e34ff265149",
+        "discoveredBy": [
+          "router allDesks()"
+        ]
+      },
+      {
+        "address": "0x822548990ce81b626a3c3684b0c85f2fd9ec9fa7",
+        "discoveredBy": [
           "router allDesks()",
           "deployed.json",
           "DeskCreated in range"
         ]
       },
       {
-        "address": "0xd44b2e952a29409eafb940e42c7d2c20ba746fac",
+        "address": "0x3ffbb71aec0d5459677021ad888195042eda4aa2",
         "discoveredBy": [
           "router allDesks()",
           "deployed.json",
@@ -45,57 +73,59 @@
     ],
     "scan": {
       "fromBlock": "481521686",
-      "toBlock": "481740583",
-      "blocks": "218898",
-      "pages": 231,
+      "toBlock": "481825872",
+      "blocks": "304187",
+      "pages": 321,
       "pageSize": 950,
       "startBlockSource": "cache",
       "startBlockExact": true,
-      "headBlockTimeUtc": "2026-09-07T02:13:40.000Z"
+      "headBlockTimeUtc": "2026-09-07T04:35:51.000Z"
     },
     "controls": {
       "trials": 20000,
       "seed": 125981
     },
     "balancesWei": {
-      "brain": "10373335269800000000",
-      "router": "36271037894000000000"
+      "brain": "13855464007400000000",
+      "router": "40727565841200000000"
     }
   },
   "counts": {
-    "verdicts": 39,
-    "answered": 39,
+    "verdicts": 64,
+    "answered": 64,
     "failedClosed": 0,
     "notOk": 0,
-    "gradedPrimary": 39,
-    "gradedSecondary": 39,
-    "excluded": {}
+    "gradedPrimary": 62,
+    "gradedSecondary": 62,
+    "excluded": {
+      "not-finalized": 2
+    }
   },
   "metrics": {
     "primary": {
-      "n": 39,
-      "upRate": 0.5641025641025641,
+      "n": 62,
+      "upRate": 0.532258064516129,
       "dispersion": {
-        "distinctForecasts": 7,
+        "distinctForecasts": 8,
         "min": 0,
         "max": 1,
-        "stdev": 0.2934834652560485
+        "stdev": 0.3156375376137707
       },
-      "brier": 0.32037948717948717,
+      "brier": 0.3597935483870966,
       "accuracy": {
-        "decisive": 30,
-        "abstained": 9,
-        "correct": 23,
-        "rate": 0.7666666666666667,
-        "pValue": 0.002611439675
+        "decisive": 46,
+        "abstained": 16,
+        "correct": 32,
+        "rate": 0.6956521739130435,
+        "pValue": 0.005675795718
       },
       "calibration": [
         {
           "from": 0,
           "to": 0.1,
-          "count": 13,
+          "count": 19,
           "meanForecast": 0,
-          "realisedUpRate": 0.38461538461538464
+          "realisedUpRate": 0.42105263157894735
         },
         {
           "from": 0.1,
@@ -121,16 +151,16 @@
         {
           "from": 0.4,
           "to": 0.5,
-          "count": 0,
-          "meanForecast": null,
-          "realisedUpRate": null
+          "count": 1,
+          "meanForecast": 0.49,
+          "realisedUpRate": 0
         },
         {
           "from": 0.5,
           "to": 0.6,
-          "count": 23,
-          "meanForecast": 0.5078260869565218,
-          "realisedUpRate": 0.6956521739130435
+          "count": 34,
+          "meanForecast": 0.5064705882352942,
+          "realisedUpRate": 0.6764705882352942
         },
         {
           "from": 0.6,
@@ -156,16 +186,16 @@
         {
           "from": 0.9,
           "to": 1,
-          "count": 3,
-          "meanForecast": 0.9866666666666667,
-          "realisedUpRate": 0.3333333333333333
+          "count": 8,
+          "meanForecast": 0.98625,
+          "realisedUpRate": 0.25
         }
       ],
       "bookComparison": {
         "n": 0,
         "meanAbsoluteDeviation": null,
         "noBookField": 0,
-        "bookUnobserved": 39,
+        "bookUnobserved": 62,
         "outOfRange": 0
       },
       "controls": {
@@ -176,37 +206,37 @@
         "coinFlip": {
           "trials": 20000,
           "seed": 125981,
-          "meanBrier": 0.35155699999998785,
-          "brierBeatenFraction": 0.2287,
-          "meanAccuracy": 0.4997966666666687,
-          "accuracyBeatenFraction": 0.00305
+          "meanBrier": 0.3574203870967608,
+          "brierBeatenFraction": 0.50135,
+          "meanAccuracy": 0.4995434782608713,
+          "accuracyBeatenFraction": 0.00575
         }
       }
     },
     "secondary": {
-      "n": 39,
-      "upRate": 0.5641025641025641,
+      "n": 62,
+      "upRate": 0.532258064516129,
       "dispersion": {
-        "distinctForecasts": 7,
+        "distinctForecasts": 8,
         "min": 0,
         "max": 1,
-        "stdev": 0.2934834652560485
+        "stdev": 0.3156375376137707
       },
-      "brier": 0.32037948717948717,
+      "brier": 0.3597935483870966,
       "accuracy": {
-        "decisive": 30,
-        "abstained": 9,
-        "correct": 23,
-        "rate": 0.7666666666666667,
-        "pValue": 0.002611439675
+        "decisive": 46,
+        "abstained": 16,
+        "correct": 32,
+        "rate": 0.6956521739130435,
+        "pValue": 0.005675795718
       },
       "calibration": [
         {
           "from": 0,
           "to": 0.1,
-          "count": 13,
+          "count": 19,
           "meanForecast": 0,
-          "realisedUpRate": 0.38461538461538464
+          "realisedUpRate": 0.42105263157894735
         },
         {
           "from": 0.1,
@@ -232,16 +262,16 @@
         {
           "from": 0.4,
           "to": 0.5,
-          "count": 0,
-          "meanForecast": null,
-          "realisedUpRate": null
+          "count": 1,
+          "meanForecast": 0.49,
+          "realisedUpRate": 0
         },
         {
           "from": 0.5,
           "to": 0.6,
-          "count": 23,
-          "meanForecast": 0.5078260869565218,
-          "realisedUpRate": 0.6956521739130435
+          "count": 34,
+          "meanForecast": 0.5064705882352942,
+          "realisedUpRate": 0.6764705882352942
         },
         {
           "from": 0.6,
@@ -267,16 +297,16 @@
         {
           "from": 0.9,
           "to": 1,
-          "count": 3,
-          "meanForecast": 0.9866666666666667,
-          "realisedUpRate": 0.3333333333333333
+          "count": 8,
+          "meanForecast": 0.98625,
+          "realisedUpRate": 0.25
         }
       ],
       "bookComparison": {
         "n": 0,
         "meanAbsoluteDeviation": null,
         "noBookField": 0,
-        "bookUnobserved": 39,
+        "bookUnobserved": 62,
         "outOfRange": 0
       },
       "controls": {
@@ -287,10 +317,10 @@
         "coinFlip": {
           "trials": 20000,
           "seed": 125981,
-          "meanBrier": 0.35155699999998785,
-          "brierBeatenFraction": 0.2287,
-          "meanAccuracy": 0.4997966666666687,
-          "accuracyBeatenFraction": 0.00305
+          "meanBrier": 0.3574203870967608,
+          "brierBeatenFraction": 0.50135,
+          "meanAccuracy": 0.4995434782608713,
+          "accuracyBeatenFraction": 0.00575
         }
       }
     }
@@ -298,11 +328,11 @@
   "refusals": [
     {
       "reason": "NoBook",
-      "count": 39
+      "count": 64
     },
     {
       "reason": "VenueRejected",
-      "count": 19
+      "count": 25
     },
     {
       "reason": "CapExceeded",
@@ -316,15 +346,19 @@
   "skips": [
     {
       "reason": "NO_CREDIT",
-      "count": 96
+      "count": 115
     },
     {
       "reason": "DECISION_SCHEDULE_FAILED",
-      "count": 30
+      "count": 36
+    },
+    {
+      "reason": "SCHEDULE_FAILED",
+      "count": 34
     },
     {
       "reason": "ROUTER_FLOAT",
-      "count": 4
+      "count": 6
     }
   ],
   "rows": [
@@ -1380,6 +1414,679 @@
       },
       "graded": true,
       "gradedOk": true
+    },
+    {
+      "marketId": "0x00000000000000000000000000000000000000000000000000000000000158ff",
+      "requestId": "13411567",
+      "blockNumber": "481757888",
+      "txHash": "0xe1fdb68b55db6ffd5cabd734cbadf83b37160b29d68cff32d6ee0d22f88990e3",
+      "probUpBps": 0,
+      "responded": 3,
+      "agreed": 3,
+      "ok": true,
+      "scores": [
+        "0",
+        "0",
+        "0"
+      ],
+      "pBookBps": 65535,
+      "asset": "BTC",
+      "question": "Pricefeed test: will BTC/USDC's price be at or above 80383.44 at unix time 1788749100?",
+      "intervalSec": 300,
+      "expiry": 1788749100,
+      "settlement": {
+        "resolved": true,
+        "up": false,
+        "resolvedAtTimestamp": 1788749100
+      },
+      "graded": true,
+      "gradedOk": true
+    },
+    {
+      "marketId": "0x0000000000000000000000000000000000000000000000000000000000015900",
+      "requestId": "13411568",
+      "blockNumber": "481757889",
+      "txHash": "0x610e4e87aa8d1f49efab50719ad59fdf6672f4cab3ce800cf28ad30b1f8d4bba",
+      "probUpBps": 9700,
+      "responded": 3,
+      "agreed": 3,
+      "ok": true,
+      "scores": [
+        "97",
+        "97",
+        "97"
+      ],
+      "pBookBps": 65535,
+      "asset": "ETH",
+      "question": "Pricefeed test: will ETH/USDC's price be at or above 2533.94 at unix time 1788749100?",
+      "intervalSec": 300,
+      "expiry": 1788749100,
+      "settlement": {
+        "resolved": true,
+        "up": false,
+        "resolvedAtTimestamp": 1788749100
+      },
+      "graded": true,
+      "gradedOk": true
+    },
+    {
+      "marketId": "0x000000000000000000000000000000000000000000000000000000000001590b",
+      "requestId": "13411876",
+      "blockNumber": "481760885",
+      "txHash": "0xa51530feb448e74a86acf5706f13881d59196c3cfbdf134cacfb0267d9ddc7f8",
+      "probUpBps": 0,
+      "responded": 3,
+      "agreed": 3,
+      "ok": true,
+      "scores": [
+        "0",
+        "0",
+        "0"
+      ],
+      "pBookBps": 65535,
+      "asset": "BTC",
+      "question": "Pricefeed test: will BTC/USDC's price be at or above 80252.90 at unix time 1788749400?",
+      "intervalSec": 300,
+      "expiry": 1788749400,
+      "settlement": {
+        "resolved": true,
+        "up": true,
+        "resolvedAtTimestamp": 1788749400
+      },
+      "graded": true,
+      "gradedOk": true
+    },
+    {
+      "marketId": "0x000000000000000000000000000000000000000000000000000000000001590c",
+      "requestId": "13411875",
+      "blockNumber": "481760885",
+      "txHash": "0x01f19d0d911efab789145bba70445bd50ebb4a58e27ec03185d5679b1d60af69",
+      "probUpBps": 5000,
+      "responded": 3,
+      "agreed": 3,
+      "ok": true,
+      "scores": [
+        "50",
+        "50",
+        "50"
+      ],
+      "pBookBps": 65535,
+      "asset": "ETH",
+      "question": "Pricefeed test: will ETH/USDC's price be at or above 2527.08 at unix time 1788749400?",
+      "intervalSec": 300,
+      "expiry": 1788749400,
+      "settlement": {
+        "resolved": true,
+        "up": false,
+        "resolvedAtTimestamp": 1788749400
+      },
+      "graded": true,
+      "gradedOk": true
+    },
+    {
+      "marketId": "0x0000000000000000000000000000000000000000000000000000000000015917",
+      "requestId": "13412176",
+      "blockNumber": "481763887",
+      "txHash": "0x1715102c7b1f20e87993b2196d214cd1fa112d2042183298bc770651068505b2",
+      "probUpBps": 5000,
+      "responded": 3,
+      "agreed": 3,
+      "ok": true,
+      "scores": [
+        "50",
+        "50",
+        "50"
+      ],
+      "pBookBps": 65535,
+      "asset": "BTC",
+      "question": "Pricefeed test: will BTC/USDC's price be at or above 80273.35 at unix time 1788749700?",
+      "intervalSec": 300,
+      "expiry": 1788749700,
+      "settlement": {
+        "resolved": true,
+        "up": false,
+        "resolvedAtTimestamp": 1788749700
+      },
+      "graded": true,
+      "gradedOk": true
+    },
+    {
+      "marketId": "0x0000000000000000000000000000000000000000000000000000000000015918",
+      "requestId": "13412175",
+      "blockNumber": "481763887",
+      "txHash": "0x62429ca4b89d7026df0203c5cddebd40cd8243cdede6a02a03597399aa8b7d52",
+      "probUpBps": 9700,
+      "responded": 3,
+      "agreed": 3,
+      "ok": true,
+      "scores": [
+        "97",
+        "97",
+        "97"
+      ],
+      "pBookBps": 65535,
+      "asset": "ETH",
+      "question": "Pricefeed test: will ETH/USDC's price be at or above 2526.20 at unix time 1788749700?",
+      "intervalSec": 300,
+      "expiry": 1788749700,
+      "settlement": {
+        "resolved": true,
+        "up": false,
+        "resolvedAtTimestamp": 1788749700
+      },
+      "graded": true,
+      "gradedOk": true
+    },
+    {
+      "marketId": "0x0000000000000000000000000000000000000000000000000000000000015923",
+      "requestId": "13412475",
+      "blockNumber": "481766883",
+      "txHash": "0xfafd1e053a34f76f758a2dd19107010a72d8988eb9574ab2dc52eee17968ab38",
+      "probUpBps": 5000,
+      "responded": 3,
+      "agreed": 3,
+      "ok": true,
+      "scores": [
+        "50",
+        "50",
+        "50"
+      ],
+      "pBookBps": 65535,
+      "asset": "BTC",
+      "question": "Pricefeed test: will BTC/USDC's price be at or above 80100.05 at unix time 1788750000?",
+      "intervalSec": 300,
+      "expiry": 1788750000,
+      "settlement": {
+        "resolved": true,
+        "up": false,
+        "resolvedAtTimestamp": 1788750000
+      },
+      "graded": true,
+      "gradedOk": true
+    },
+    {
+      "marketId": "0x0000000000000000000000000000000000000000000000000000000000015924",
+      "requestId": "13412476",
+      "blockNumber": "481766884",
+      "txHash": "0xd8e37e8a35d94cc8429232e563f2669a615ea99bb8e710fefead170f94ea98e7",
+      "probUpBps": 5000,
+      "responded": 3,
+      "agreed": 3,
+      "ok": true,
+      "scores": [
+        "50",
+        "50",
+        "50"
+      ],
+      "pBookBps": 65535,
+      "asset": "ETH",
+      "question": "Pricefeed test: will ETH/USDC's price be at or above 2516.96 at unix time 1788750000?",
+      "intervalSec": 300,
+      "expiry": 1788750000,
+      "settlement": {
+        "resolved": true,
+        "up": false,
+        "resolvedAtTimestamp": 1788750000
+      },
+      "graded": true,
+      "gradedOk": true
+    },
+    {
+      "marketId": "0x000000000000000000000000000000000000000000000000000000000001592f",
+      "requestId": "13412784",
+      "blockNumber": "481769889",
+      "txHash": "0x3ea2defc579c45363b54f514a232ae3841f345d782f93de093b0846b493824e0",
+      "probUpBps": 5100,
+      "responded": 3,
+      "agreed": 3,
+      "ok": true,
+      "scores": [
+        "51",
+        "51",
+        "51"
+      ],
+      "pBookBps": 65535,
+      "asset": "BTC",
+      "question": "Pricefeed test: will BTC/USDC's price be at or above 79874.88 at unix time 1788750300?",
+      "intervalSec": 300,
+      "expiry": 1788750300,
+      "settlement": {
+        "resolved": true,
+        "up": true,
+        "resolvedAtTimestamp": 1788750300
+      },
+      "graded": true,
+      "gradedOk": true
+    },
+    {
+      "marketId": "0x0000000000000000000000000000000000000000000000000000000000015930",
+      "requestId": "13412785",
+      "blockNumber": "481769891",
+      "txHash": "0x300b58df96e36e0665ef12d1e8aa6a56fa48da4e3c2185c49f686376c049533d",
+      "probUpBps": 5100,
+      "responded": 3,
+      "agreed": 3,
+      "ok": true,
+      "scores": [
+        "51",
+        "51",
+        "51"
+      ],
+      "pBookBps": 65535,
+      "asset": "ETH",
+      "question": "Pricefeed test: will ETH/USDC's price be at or above 2511.72 at unix time 1788750300?",
+      "intervalSec": 300,
+      "expiry": 1788750300,
+      "settlement": {
+        "resolved": true,
+        "up": true,
+        "resolvedAtTimestamp": 1788750300
+      },
+      "graded": true,
+      "gradedOk": true
+    },
+    {
+      "marketId": "0x000000000000000000000000000000000000000000000000000000000001593d",
+      "requestId": "13413086",
+      "blockNumber": "481772886",
+      "txHash": "0x465a86c2cf99f169f6e1fb531a87442485e522b00464ba57691aef040524074c",
+      "probUpBps": 9900,
+      "responded": 3,
+      "agreed": 3,
+      "ok": true,
+      "scores": [
+        "99",
+        "99",
+        "99"
+      ],
+      "pBookBps": 65535,
+      "asset": "BTC",
+      "question": "Pricefeed test: will BTC/USDC's price be at or above 79977.82 at unix time 1788750600?",
+      "intervalSec": 300,
+      "expiry": 1788750600,
+      "settlement": {
+        "resolved": true,
+        "up": false,
+        "resolvedAtTimestamp": 1788750600
+      },
+      "graded": true,
+      "gradedOk": true
+    },
+    {
+      "marketId": "0x000000000000000000000000000000000000000000000000000000000001593e",
+      "requestId": "13413087",
+      "blockNumber": "481772888",
+      "txHash": "0x08d88fbc5f0c54921a33a240f32e4e940042365bf03cd59bf71654ed62b9100a",
+      "probUpBps": 4900,
+      "responded": 3,
+      "agreed": 3,
+      "ok": true,
+      "scores": [
+        "49",
+        "49",
+        "49"
+      ],
+      "pBookBps": 65535,
+      "asset": "ETH",
+      "question": "Pricefeed test: will ETH/USDC's price be at or above 2515.51 at unix time 1788750600?",
+      "intervalSec": 300,
+      "expiry": 1788750600,
+      "settlement": {
+        "resolved": true,
+        "up": false,
+        "resolvedAtTimestamp": 1788750600
+      },
+      "graded": true,
+      "gradedOk": true
+    },
+    {
+      "marketId": "0x000000000000000000000000000000000000000000000000000000000001594a",
+      "requestId": "13413388",
+      "blockNumber": "481775884",
+      "txHash": "0x71c5b6135ec361f19cbd325a47f7869681a99418456a975df9f626a028e94ce9",
+      "probUpBps": 0,
+      "responded": 3,
+      "agreed": 3,
+      "ok": true,
+      "scores": [
+        "0",
+        "0",
+        "0"
+      ],
+      "pBookBps": 65535,
+      "asset": "ETH",
+      "question": "Pricefeed test: will ETH/USDC's price be at or above 2509.15 at unix time 1788750900?",
+      "intervalSec": 300,
+      "expiry": 1788750900,
+      "settlement": {
+        "resolved": true,
+        "up": false,
+        "resolvedAtTimestamp": 1788750900
+      },
+      "graded": true,
+      "gradedOk": true
+    },
+    {
+      "marketId": "0x00000000000000000000000000000000000000000000000000000000000159a4",
+      "requestId": "13415481",
+      "blockNumber": "481796885",
+      "txHash": "0x744f195f85a8837c190a6ef0da90cf574438d281dcbb96d8a2b9437b11e23999",
+      "probUpBps": 5100,
+      "responded": 3,
+      "agreed": 3,
+      "ok": true,
+      "scores": [
+        "51",
+        "51",
+        "51"
+      ],
+      "pBookBps": 65535,
+      "asset": "ETH",
+      "question": "Pricefeed test: will ETH/USDC's price be at or above 2497.75 at unix time 1788753000?",
+      "intervalSec": 300,
+      "expiry": 1788753000,
+      "settlement": {
+        "resolved": true,
+        "up": true,
+        "resolvedAtTimestamp": 1788753000
+      },
+      "graded": true,
+      "gradedOk": true
+    },
+    {
+      "marketId": "0x00000000000000000000000000000000000000000000000000000000000159a3",
+      "requestId": "13415482",
+      "blockNumber": "481796885",
+      "txHash": "0x5b1919e3ddf11cefca9689436aae2db2723f20bc57540753ec131355e0fcb307",
+      "probUpBps": 10000,
+      "responded": 3,
+      "agreed": 3,
+      "ok": true,
+      "scores": [
+        "100",
+        "100",
+        "100"
+      ],
+      "pBookBps": 65535,
+      "asset": "BTC",
+      "question": "Pricefeed test: will BTC/USDC's price be at or above 79634.55 at unix time 1788753000?",
+      "intervalSec": 300,
+      "expiry": 1788753000,
+      "settlement": {
+        "resolved": true,
+        "up": true,
+        "resolvedAtTimestamp": 1788753000
+      },
+      "graded": true,
+      "gradedOk": true
+    },
+    {
+      "marketId": "0x00000000000000000000000000000000000000000000000000000000000159b0",
+      "requestId": "13415780",
+      "blockNumber": "481799883",
+      "txHash": "0x5e170dbb00608b70eedaeca00c5cea4772b1b28206e5dbab52562d65c3bc5f18",
+      "probUpBps": 5000,
+      "responded": 3,
+      "agreed": 3,
+      "ok": true,
+      "scores": [
+        "50",
+        "50",
+        "50"
+      ],
+      "pBookBps": 65535,
+      "asset": "ETH",
+      "question": "Pricefeed test: will ETH/USDC's price be at or above 2498.15 at unix time 1788753300?",
+      "intervalSec": 300,
+      "expiry": 1788753300,
+      "settlement": {
+        "resolved": true,
+        "up": true,
+        "resolvedAtTimestamp": 1788753300
+      },
+      "graded": true,
+      "gradedOk": true
+    },
+    {
+      "marketId": "0x00000000000000000000000000000000000000000000000000000000000159af",
+      "requestId": "13415779",
+      "blockNumber": "481799885",
+      "txHash": "0x0c90616e5d4127815c9fa8d914fdf862319fbd659834a8b97f1e0ef49e297b57",
+      "probUpBps": 0,
+      "responded": 3,
+      "agreed": 3,
+      "ok": true,
+      "scores": [
+        "0",
+        "0",
+        "0"
+      ],
+      "pBookBps": 65535,
+      "asset": "BTC",
+      "question": "Pricefeed test: will BTC/USDC's price be at or above 79639.55 at unix time 1788753300?",
+      "intervalSec": 300,
+      "expiry": 1788753300,
+      "settlement": {
+        "resolved": true,
+        "up": true,
+        "resolvedAtTimestamp": 1788753300
+      },
+      "graded": true,
+      "gradedOk": true
+    },
+    {
+      "marketId": "0x00000000000000000000000000000000000000000000000000000000000159bc",
+      "requestId": "13416081",
+      "blockNumber": "481802878",
+      "txHash": "0xfa89d00858ac5180bea7daab40c25272fe323dfde418283c32b4fa857bd4dcbe",
+      "probUpBps": 0,
+      "responded": 3,
+      "agreed": 3,
+      "ok": true,
+      "scores": [
+        "0",
+        "0",
+        "0"
+      ],
+      "pBookBps": 65535,
+      "asset": "ETH",
+      "question": "Pricefeed test: will ETH/USDC's price be at or above 2499.72 at unix time 1788753600?",
+      "intervalSec": 300,
+      "expiry": 1788753600,
+      "settlement": {
+        "resolved": true,
+        "up": false,
+        "resolvedAtTimestamp": 1788753600
+      },
+      "graded": true,
+      "gradedOk": true
+    },
+    {
+      "marketId": "0x00000000000000000000000000000000000000000000000000000000000159bb",
+      "requestId": "13416080",
+      "blockNumber": "481802878",
+      "txHash": "0xa14dcb585b68a74f7fa2c9cad47de16f37b68f4da2c0320940513a86c2f429a0",
+      "probUpBps": 10000,
+      "responded": 3,
+      "agreed": 3,
+      "ok": true,
+      "scores": [
+        "100",
+        "100",
+        "100"
+      ],
+      "pBookBps": 65535,
+      "asset": "BTC",
+      "question": "Pricefeed test: will BTC/USDC's price be at or above 79652.18 at unix time 1788753600?",
+      "intervalSec": 300,
+      "expiry": 1788753600,
+      "settlement": {
+        "resolved": true,
+        "up": false,
+        "resolvedAtTimestamp": 1788753600
+      },
+      "graded": true,
+      "gradedOk": true
+    },
+    {
+      "marketId": "0x00000000000000000000000000000000000000000000000000000000000159cb",
+      "requestId": "13416425",
+      "blockNumber": "481805874",
+      "txHash": "0xec22854e1a2619ade09453233f0d3dfbe20eb6185a73ceca869daae40927e010",
+      "probUpBps": 5000,
+      "responded": 3,
+      "agreed": 3,
+      "ok": true,
+      "scores": [
+        "50",
+        "50",
+        "50"
+      ],
+      "pBookBps": 65535,
+      "asset": "ETH",
+      "question": "Pricefeed test: will ETH/USDC's price be at or above 2497.37 at unix time 1788753900?",
+      "intervalSec": 300,
+      "expiry": 1788753900,
+      "settlement": {
+        "resolved": true,
+        "up": true,
+        "resolvedAtTimestamp": 1788753900
+      },
+      "graded": true,
+      "gradedOk": true
+    },
+    {
+      "marketId": "0x00000000000000000000000000000000000000000000000000000000000159ca",
+      "requestId": "13416424",
+      "blockNumber": "481805875",
+      "txHash": "0x697562347452c45ba014f888d93607117288a45aa8395ba239d70c1dab275b44",
+      "probUpBps": 5100,
+      "responded": 3,
+      "agreed": 3,
+      "ok": true,
+      "scores": [
+        "51",
+        "51",
+        "51"
+      ],
+      "pBookBps": 65535,
+      "asset": "BTC",
+      "question": "Pricefeed test: will BTC/USDC's price be at or above 79589.23 at unix time 1788753900?",
+      "intervalSec": 300,
+      "expiry": 1788753900,
+      "settlement": {
+        "resolved": true,
+        "up": true,
+        "resolvedAtTimestamp": 1788753900
+      },
+      "graded": true,
+      "gradedOk": true
+    },
+    {
+      "marketId": "0x00000000000000000000000000000000000000000000000000000000000159dd",
+      "requestId": "13416733",
+      "blockNumber": "481808873",
+      "txHash": "0x815cfc526f9ec7c14e824ccc592c70aace65821cba90733e6e59fec6f71a3ed2",
+      "probUpBps": 5000,
+      "responded": 3,
+      "agreed": 3,
+      "ok": true,
+      "scores": [
+        "50",
+        "50",
+        "50"
+      ],
+      "pBookBps": 65535,
+      "asset": "BTC",
+      "question": "Pricefeed test: will BTC/USDC's price be at or above 79631.65 at unix time 1788754200?",
+      "intervalSec": 300,
+      "expiry": 1788754200,
+      "settlement": {
+        "resolved": true,
+        "up": true,
+        "resolvedAtTimestamp": 1788754200
+      },
+      "graded": true,
+      "gradedOk": true
+    },
+    {
+      "marketId": "0x00000000000000000000000000000000000000000000000000000000000159de",
+      "requestId": "13416732",
+      "blockNumber": "481808874",
+      "txHash": "0x6fbf130e49540b2042b2c7e99bf9395e9dc7a5628fa5d913b8d5b980e04cc8c3",
+      "probUpBps": 0,
+      "responded": 3,
+      "agreed": 3,
+      "ok": true,
+      "scores": [
+        "0",
+        "0",
+        "0"
+      ],
+      "pBookBps": 65535,
+      "asset": "ETH",
+      "question": "Pricefeed test: will ETH/USDC's price be at or above 2498.40 at unix time 1788754200?",
+      "intervalSec": 300,
+      "expiry": 1788754200,
+      "settlement": {
+        "resolved": true,
+        "up": true,
+        "resolvedAtTimestamp": 1788754200
+      },
+      "graded": true,
+      "gradedOk": true
+    },
+    {
+      "marketId": "0x00000000000000000000000000000000000000000000000000000000000159ea",
+      "requestId": "13417027",
+      "blockNumber": "481811874",
+      "txHash": "0xb370a65d0ea062663d7d26fbdbdb5be78c533e0d077d34e5d31ec77c35a61069",
+      "probUpBps": 5000,
+      "responded": 3,
+      "agreed": 3,
+      "ok": true,
+      "scores": [
+        "50",
+        "50",
+        "50"
+      ],
+      "pBookBps": 65535,
+      "asset": "ETH",
+      "question": "Pricefeed test: will ETH/USDC's price be at or above 2498.76 at unix time 1788754500?",
+      "intervalSec": 300,
+      "expiry": 1788754500,
+      "settlement": {
+        "resolved": false,
+        "reason": "not-finalized"
+      },
+      "graded": false,
+      "gradedOk": false
+    },
+    {
+      "marketId": "0x00000000000000000000000000000000000000000000000000000000000159e9",
+      "requestId": "13417028",
+      "blockNumber": "481811874",
+      "txHash": "0xe3c48cb71cb6f783ced3d78514a78555174edb6ec166e21b79032aae42398892",
+      "probUpBps": 9900,
+      "responded": 3,
+      "agreed": 3,
+      "ok": true,
+      "scores": [
+        "99",
+        "99",
+        "99"
+      ],
+      "pBookBps": 65535,
+      "asset": "BTC",
+      "question": "Pricefeed test: will BTC/USDC's price be at or above 79640.87 at unix time 1788754500?",
+      "intervalSec": 300,
+      "expiry": 1788754500,
+      "settlement": {
+        "resolved": false,
+        "reason": "not-finalized"
+      },
+      "graded": false,
+      "gradedOk": false
     }
   ]
 }

@@ -8,35 +8,47 @@ it. Nothing here is a screenshot and nothing here is a promise.
 - **RPC** — `https://api.infra.testnet.somnia.network`
 - **Indexer** — `https://dev.smk.somnia.host/v1/graphql` (DreamDEX's public Hasura, unauthenticated)
 
-Everything below was re-read off the chain on **2026-09-06, around 22:00–23:05 UTC**, head block
-≈ 481 623 000. Addresses come from [`contracts/deployed.json`](contracts/deployed.json), which is the
-authority. The address tables in `README.md` and `JUDGES.md` were written by
-`scripts/sync-addresses.mjs` before the last redeploy and still name the previous deployment; where
-they disagree with this page, `deployed.json` and the chain are right.
+Everything below was re-read off the chain on **2026-09-07, between 03:40 and 05:00 UTC**, head block
+≈ 481 841 000. Addresses come from [`contracts/deployed.json`](contracts/deployed.json), which is the
+authority; where anything disagrees with it, `deployed.json` and the chain are right.
+
+The deployment moved on 2026-09-07 at 03:42 UTC: the desk implementation and the factory were
+replaced, and each owner's desk was re-cloned from the new implementation. Router, brain, keeper,
+relay and series are the same contracts they have been throughout. Transactions in this document that
+belong to a **previous desk clone are labelled as such** — they are immutable and they still decode
+exactly as described, but the desk that produced them is not the desk running now.
 
 Related documents, not repeated here: [README.md](README.md) · [CLAIMS.md](CLAIMS.md) ·
-[MOCKS.md](MOCKS.md) · [JUDGES.md](JUDGES.md) · [SDK_FEEDBACK.md](SDK_FEEDBACK.md) ·
-[eval/EVAL.md](eval/EVAL.md).
+[MOCKS.md](MOCKS.md) · [SDK_FEEDBACK.md](SDK_FEEDBACK.md) · [eval/EVAL.md](eval/EVAL.md).
 
 ---
 
 ## 1. The addresses
 
 Runtime-code sizes are the ones `eth_getCode` returned during the run of `verify-onchain.sh`
-reproduced in [section 10](#10-reproduce-it-yourself).
+reproduced in [section 12](#12-reproduce-it-yourself).
 
 | what | address | one line |
 | --- | --- | --- |
 | `LucidRouter` | [`0x6aE21a20444141552648C1f8443bAf171BCCcB99`](https://shannon-explorer.somnia.network/address/0x6aE21a20444141552648C1f8443bAf171BCCcB99) | Owns the reactivity subscription, wakes on the venue's `MarketCreated`, books the decision and settlement one-shots, fans out to armed desks. 24 112 bytes. |
 | `LucidBrain` | [`0x0c640E3aFc627bEec7eDB9985696e12B50AdAd25`](https://shannon-explorer.somnia.network/address/0x0c640E3aFc627bEec7eDB9985696e12B50AdAd25) | Two-stage question to Somnia's on-chain agent committees: price first, then the probability verdict. 20 621 bytes. |
-| `LucidDesk` (clone implementation) | [`0xc54d0BaA3310F77a164D17Fe10f32a567793489E`](https://shannon-explorer.somnia.network/address/0xc54d0BaA3310F77a164D17Fe10f32a567793489E) | The desk logic every desk clone delegates to: mandate enforcement, sizing, order placement, settlement booking. 14 147 bytes. |
-| `LucidFactory` | [`0xF82cC4219F6c7fe816155A8c3F0C9C3B1cc320eA`](https://shannon-explorer.somnia.network/address/0xF82cC4219F6c7fe816155A8c3F0C9C3B1cc320eA) | Mints ERC-1167 desk clones, one per owner address, and registers them with the router. 4 943 bytes. |
+| `LucidDesk` (clone implementation) | [`0xa659b03e2349559f2d56D17F246e66e79467c17e`](https://shannon-explorer.somnia.network/address/0xa659b03e2349559f2d56D17F246e66e79467c17e) | The desk logic every desk clone delegates to: mandate enforcement, sizing, order placement, cancellation, settlement booking. 14 940 bytes. |
+| `LucidFactory` | [`0x9c1EF0C429f1F88e8247f3539DeF8a1f8FCCEb84`](https://shannon-explorer.somnia.network/address/0x9c1EF0C429f1F88e8247f3539DeF8a1f8FCCEb84) | Mints ERC-1167 desk clones, one per owner address, and registers them with the router. 4 943 bytes. |
 | `LucidKeeper` | [`0x4757599dC9A5a089270373a66BEeeD6592788707`](https://shannon-explorer.somnia.network/address/0x4757599dC9A5a089270373a66BEeeD6592788707) | Runs the venue's permissionless upkeep (`finalizeMarket`, `releasePool`, `syncSettlement`, `pokeOracle`) for every market, not only ours. 3 736 bytes. |
 | `LucidRelay` | [`0xd9Eee9BE420E2CD777E55d890a940a637ed0bB7A`](https://shannon-explorer.somnia.network/address/0xd9Eee9BE420E2CD777E55d890a940a637ed0bB7A) | Queue of signed redemption authorisations anyone may drain, so a winner does not have to be online to be paid. 6 565 bytes. |
 | `LucidSeries` | [`0x747fF3a7A6FE4912c96dCe7faA711dCB6fbd1CE4`](https://shannon-explorer.somnia.network/address/0x747fF3a7A6FE4912c96dCe7faA711dCB6fbd1CE4) | Failover: watches the venue's cadence and rolls a window on our own `MarketCreator` if the venue's scheduler stops. 5 452 bytes. |
-| Desk `AiEdge` | [`0x86D170169cde0b5ab4bb3B360E930625aBA849ea`](https://shannon-explorer.somnia.network/address/0x86D170169cde0b5ab4bb3B360E930625aBA849ea) | Live desk, clone of the implementation above, owner [`0xc84C24F7…`](https://shannon-explorer.somnia.network/address/0xc84C24F751c686568A907650FD59b1a3AC1a5E67). Takes the book when the committee disagrees with it. Holds 5 000.000000 tUSDC. |
-| Desk `Maker` | [`0xd44B2e952a29409eAfb940e42c7D2C20BA746faC`](https://shannon-explorer.somnia.network/address/0xd44B2e952a29409eAfb940e42c7D2C20BA746faC) | Live desk, a *different* owner [`0x3F396B9e…`](https://shannon-explorer.somnia.network/address/0x3F396B9e1E203d95BA5Be32f4115eaa435cb9dde) — the factory allows one desk per address. Mints a complete set and quotes both sides. Holds 5 000.100000 tUSDC. |
+| Desk `AiEdge` | [`0x822548990ce81b626a3c3684B0c85f2fd9EC9Fa7`](https://shannon-explorer.somnia.network/address/0x822548990ce81b626a3c3684B0c85f2fd9EC9Fa7) | Live desk, ERC-1167 clone (45 bytes), owner [`0xc84C24F7…`](https://shannon-explorer.somnia.network/address/0xc84C24F751c686568A907650FD59b1a3AC1a5E67). Takes the book when the committee disagrees with it. Holds 5 000.000000 tUSDC. |
+| Desk `Maker` | [`0x3ffbB71aec0D5459677021Ad888195042eDA4AA2`](https://shannon-explorer.somnia.network/address/0x3ffbB71aec0D5459677021Ad888195042eDA4AA2) | Live desk, a *different* owner [`0x3F396B9e…`](https://shannon-explorer.somnia.network/address/0x3F396B9e1E203d95BA5Be32f4115eaa435cb9dde) — the factory allows one desk per address. Mints a complete set and quotes both sides. Holds 5 000.200000 tUSDC. |
 | `MarketCreator` (ours) | [`0x7Fa6Ac2a61C0b5A0FcC7E1d9b05a0F6AD84763b2`](https://shannon-explorer.somnia.network/address/0x7Fa6Ac2a61C0b5A0FcC7E1d9b05a0F6AD84763b2) | DreamDEX's own creator contract, deployed and owned by an ordinary account of ours, running series 1 (BTC, 300 s) on our own venue. 13 903 bytes. |
+
+The four transactions that put the current deployment on chain, all on 2026-09-07:
+
+| UTC | block | transaction | what |
+| --- | --- | --- | --- |
+| 03:42:25 | 481 793 828 | [`0x33127ac5…`](https://shannon-explorer.somnia.network/tx/0x33127ac5be9fd72f575220d275ddd6a13d71c7be279df3ddcc46edab10f8ccee) | `LucidDesk` implementation deployed. |
+| 03:42:34 | 481 793 917 | [`0x5bfdccd2…`](https://shannon-explorer.somnia.network/tx/0x5bfdccd2a299f302fd47f717bcf2c7647e631e39dd8c9b1af49528d22079ec32) | `LucidFactory` deployed against it. |
+| 03:42:40 | 481 793 979 | [`0x5eb60957…`](https://shannon-explorer.somnia.network/tx/0x5eb60957b2bc16edecbdb14238bc2f1fa903d25bdca86d1bb1a12f2a1c5df481) | The `AiEdge` desk cloned and registered. |
+| 03:42:50 | 481 794 074 | [`0x8ce5155d…`](https://shannon-explorer.somnia.network/tx/0x8ce5155dd65063ca7099358cbebb3eb59896cd8c355496f00d806335e875a616) | The `Maker` desk cloned and registered, by its own separate owner. |
 
 Third-party addresses this document refers to:
 
@@ -46,6 +58,7 @@ Third-party addresses this document refers to:
 | Somnia agent platform (`IAgentRequester`) | [`0x037Bb9C718F3f7fe5eCBDB0b600D607b52706776`](https://shannon-explorer.somnia.network/address/0x037Bb9C718F3f7fe5eCBDB0b600D607b52706776) |
 | Somnia reactivity precompile | `0x0000000000000000000000000000000000000100` |
 | Settlement collateral `tUSDC` (6 decimals) | [`0x70a86D8842FB63C4Ad2b7cdddF530eBf1BB25d8E`](https://shannon-explorer.somnia.network/address/0x70a86D8842FB63C4Ad2b7cdddF530eBf1BB25d8E) |
+| `OutcomeToken6909` | [`0xb52C5934113AF5c0Bb20eb3c72290c8215F755b9`](https://shannon-explorer.somnia.network/address/0xb52C5934113AF5c0Bb20eb3c72290c8215F755b9) |
 | DreamDEX venue registry (`MarketsCore`) | [`0x2802504314685D89bF6C992CA5a8e7cC78bc0294`](https://shannon-explorer.somnia.network/address/0x2802504314685D89bF6C992CA5a8e7cC78bc0294) |
 | DreamDEX `MarketCreator` factory | [`0xE6bEE93cE87c9E6e62aCb621caa7832EE47b4F6B`](https://shannon-explorer.somnia.network/address/0xE6bEE93cE87c9E6e62aCb621caa7832EE47b4F6B) |
 | Venue the router serves | `0x1a1e6821cde7d0159c0d293177871e09677b4e42307c7db3ba94f8648a5a050f` |
@@ -53,57 +66,65 @@ Third-party addresses this document refers to:
 
 ### Source verification
 
-Do not take our word for it. One command per address, no key:
+**All seven Lucid contracts are source-verified on Blockscout right now.** Do not take our word for
+it. One command per address, no key:
 
 ```bash
-curl -s https://shannon-explorer.somnia.network/api/v2/addresses/<address> \
-  | python -c "import json,sys;d=json.load(sys.stdin);print(d['is_verified'], d['name'])"
+curl -s https://shannon-explorer.somnia.network/api/v2/smart-contracts/<address> \
+  | python -c "import json,sys;d=json.load(sys.stdin);print(d['is_verified'], d['name'], d['compiler_version'], d['verified_at'])"
 ```
 
-Observed at 2026-09-06 23:02 UTC:
+Observed at 2026-09-07 04:50 UTC:
 
-| contract | `is_verified` |
-| --- | --- |
-| `LucidRouter` | `True` — `LucidRouter` |
-| `LucidBrain` | `True` — `LucidBrain` |
-| `LucidKeeper` | `True` — `LucidKeeper` |
-| `LucidRelay` | `True` — `LucidRelay` |
-| `LucidSeries` | `True` — `LucidSeries` |
-| `LucidDesk` (implementation) | **`False`** — verification of this deployment's copy had not landed when this was checked |
-| `LucidFactory` | **`False`** — same |
+| contract | `is_verified` | verified at |
+| --- | --- | --- |
+| `LucidRouter` | `True` — `LucidRouter` | 2026-09-06T20:12:04Z |
+| `LucidBrain` | `True` — `LucidBrain` | 2026-09-06T20:11:45Z |
+| `LucidKeeper` | `True` — `LucidKeeper` | 2026-09-06T20:12:28Z |
+| `LucidRelay` | `True` — `LucidRelay` | 2026-09-06T20:12:31Z |
+| `LucidSeries` | `True` — `LucidSeries` | 2026-09-06T20:12:34Z |
+| `LucidDesk` (implementation) | `True` — `LucidDesk` | 2026-09-07T03:43:38Z |
+| `LucidFactory` | `True` — `LucidFactory` | 2026-09-07T03:44:17Z |
 
-Stated rather than smoothed over. The identical source *is* verified at the previous deployment's
-addresses — [`LucidDesk` `0x8D87D72A…`](https://shannon-explorer.somnia.network/address/0x8D87D72A23Be0F9a07046b89113a7e615F629994)
-and [`LucidFactory` `0xF36b6E1c…`](https://shannon-explorer.somnia.network/address/0xF36b6E1cf0D43563bC8874dd0cf8c24188eE2d94) —
-so a reviewer can read the code today, but the two live addresses above are, right now, unverified
-bytecode and should be treated as such. Re-run the command; if it now says `True`, this paragraph is
-stale, and the command is the authority, not the paragraph.
+All seven report compiler `v0.8.30+commit.73712a01` with the optimizer at 200 runs. An earlier
+version of this page recorded `LucidDesk` and `LucidFactory` as unverified, because at that moment
+they were; the two verifications above landed shortly after the redeploy. Re-run the command — it is
+the authority, not the paragraph.
 
-The two desks are ERC-1167 minimal proxies (45 bytes each); the explorer reports their
-implementation as `0xc54d0BaA…`, which is why verifying that one address covers both. The
-`MarketCreator` is DreamDEX's contract, deployed through their factory — its source is theirs.
+The two desks are ERC-1167 minimal proxies (45 bytes each). The explorer resolves both to
+implementation [`0xa659b03e…`](https://shannon-explorer.somnia.network/address/0xa659b03e2349559f2d56D17F246e66e79467c17e)
+and reports them verified through it, which is why verifying that one address covers both:
+
+```bash
+curl -s https://shannon-explorer.somnia.network/api/v2/addresses/0x3ffbB71aec0D5459677021Ad888195042eDA4AA2 \
+  | python -c "import json,sys;d=json.load(sys.stdin);print(d['is_verified'], d['proxy_type'], d['implementations'])"
+# True eip1167 [{'address_hash': '0xa659b03e2349559f2d56D17F246e66e79467c17e', 'name': 'LucidDesk'}]
+```
+
+The `MarketCreator` is DreamDEX's contract, deployed through their factory — its source is theirs,
+and it is not verified on this explorer.
 
 ---
 
 ## 2. The loop, proven end to end
 
-One window: market `0x…015633`, BTC, 300 seconds, on the venue the router serves. Six transactions,
-in order, all on chain.
+One window: market `0x…0159cb`, ETH, 300 seconds, on the venue the router serves. Six transactions,
+in order, all on chain, all on the current deployment.
 
 | # | block | UTC | transaction | what happened |
 | --- | --- | --- | --- | --- |
-| 1 | 481 582 418 | 21:50:00 | [`0xf623ec36…`](https://shannon-explorer.somnia.network/tx/0xf623ec36594f229aca9a216048ef25c48346b90287f59651e96244e1359c98cd) | The venue creates the window. `BinaryMarketsModule` emits `MarketCreated` with `topics[1] = 0x…015633` (and three sibling markets in the same transaction). |
-| 2 | **481 582 418** | 21:50:00 | [`0x0273f912…`](https://shannon-explorer.somnia.network/tx/0x0273f912dc86e7da29ca4a48a23e6cc06d269d69f0a8b43d9b6e4248efed3ac8) | **Same block.** A validator runs the router's handler as a synthetic transaction — `from` and `to` are both the router. It emits `MarketSeen(0x…015633, intervalSec 300, BTC)` and `DecisionScheduled(0x…015633, tsMillis 1788731550000, subscriptionId 16549137)`. The decision is booked for 21:52:30, the halfway point of a window that runs 21:50:05 → 21:55:05. |
-| 3 | 481 583 918 | 21:52:30 | [`0xc4c1464e…`](https://shannon-explorer.somnia.network/tx/0xc4c1464ee2f0e81a7a81aa5d5047a89a228f21bfbf76389dd5af39128a54334c) | The one-shot fires — again `from == to == router`. The router emits `VerdictRequested(fee 0.36 SOMI, deskCount 2)`, debits 0.19 SOMI of prepaid credit from each desk, and books `SettlementScheduled(tsMillis 1788731705000, subscriptionId 16549569)`. The brain emits `PriceRequested(requestId 13394188, deposit 0.12 SOMI)`. In the same block the precompile logs the creation of subscription `0xfc86c1` owned by the router. |
-| 4 | 481 583 924 | 21:52:30 | [`0xc15bb46d…`](https://shannon-explorer.somnia.network/tx/0xc15bb46de3a6ad7d5bed730860f459e075287e53f9c1c82a452f722e9967d2a1) | **The price committee answers.** `PriceReceived(spot 7992414, used 3, prices [7992414, 7992414, 7992414])` — BTC 79 924.14, three validator readings, all agreeing. `LatencyObserved(stage 1, observed 0 s)`. The brain immediately buys stage two: `VerdictRequested(requestId 13394191, size 3, threshold 2, deposit 0.24 SOMI)`. |
-| 5 | 481 583 935 | 21:52:31 | [`0xa4bdae59…`](https://shannon-explorer.somnia.network/tx/0xa4bdae5926dbe8d0477bc65ae52e39d480c7cdb748f8873190ef8ecca2d0c1ea) | **The inference committee answers**, and the policy gate decides. `VerdictReceived(probUpBps 0, responded 3, agreed 3, ok true, scores [0, 0, 0])`, `LatencyObserved(stage 2, observed 1 s)` — six blocks, about one second, from question to answer. Then both desks act. This is [hero #1](#3-hero-1--one-transaction-two-mandates-two-outcomes). |
-| 6 | 481 585 467 | 21:55:05 | [`0x4d4e9f0d…`](https://shannon-explorer.somnia.network/tx/0x4d4e9f0d8ea3ca8412cadf1d9a749c55acb52c5720d8b742d15387a000d4d014) | The settlement one-shot fires (`from == to == router`), the position is redeemed and the result is booked. This is [hero #2](#4-hero-2--a-loss-booked-on-chain). |
+| 1 | 481 804 366 | 04:00:00 | [`0xde6c833e…`](https://shannon-explorer.somnia.network/tx/0xde6c833efd83e6ffbb1379e46811534d080fbf343ebded965167934faf2aa384) | The venue creates the window. `BinaryMarketsModule` emits `MarketCreated` with `topics[1] = 0x…0159cb`, and three sibling markets in the same transaction. |
+| 2 | **481 804 366** | 04:00:00 | [`0x6fc665db…`](https://shannon-explorer.somnia.network/tx/0x6fc665db5091d165585f8ad61e6407ae83fcd6d45432e1c0b314c21445b32050) | **Same block.** A validator runs the router's handler as a synthetic transaction — `from` and `to` are both the router, 2 740 027 gas, three logs. `MarketSeen(0x…0159cb, intervalSec 300, ETH)`, `DecisionScheduled(tsMillis 1788753750000, subscriptionId 16613080)` for 04:02:30 — the halfway point of a window that runs 04:00:05 → 04:05:05 — and `SettlementScheduled(tsMillis 1788753905000, subscriptionId 16613081)` for 04:05:05. |
+| 3 | 481 805 866 | 04:02:30 | [`0xe906edfb…`](https://shannon-explorer.somnia.network/tx/0xe906edfb19c4bae0f748baa1949101b0b3f6a9449e44d2d25ec773c95e41fb85) | The decision one-shot fires — again `from == to == router`, 3 620 925 gas, and it carries two windows at once. For `0x…0159cb` the router emits `VerdictRequested(fee 0.36 SOMI, deskCount 2)` and two `Debited(desk, 0.19 SOMI)` lines, one per desk; the brain emits `PriceRequested(requestId 13416423, deposit 0.12 SOMI)`. |
+| 4 | 481 805 869 | 04:02:30 | [`0x1830ef33…`](https://shannon-explorer.somnia.network/tx/0x1830ef332ff751df76b7e65ce3dc789008f58cb4f2bfa6881c718a74a72e2868) | **The price committee answers.** `PriceReceived(spot 249686, used 3, prices [249686, 249686, 249686])` — ETH 2 496.86, three validator readings, all agreeing — and `LatencyObserved(stage 1, observed 0 s)`. The brain immediately buys stage two: `VerdictRequested(requestId 13416425, size 3, threshold 2, deposit 0.24 SOMI)`. Sent by a validator account, `to` the agent platform. |
+| 5 | 481 805 874 | 04:02:30 | [`0xec22854e…`](https://shannon-explorer.somnia.network/tx/0xec22854e1a2619ade09453233f0d3dfbe20eb6185a73ceca869daae40927e010) | **The inference committee answers**, and both policy gates decide. `VerdictReceived(probUpBps 5000, responded 3, agreed 3, ok true, scores [50, 50, 50])`, `LatencyObserved(stage 2, observed 0 s)` — five blocks from question to answer. This is [hero #1](#3-hero-1--one-transaction-two-mandates-two-outcomes). |
+| 6 | 481 807 415 | 04:05:05 | [`0xc50c6095…`](https://shannon-explorer.somnia.network/tx/0xc50c60958e32f6beca5c63c992294c168cb7e64b403a101f8a1553deef6063db) | The settlement one-shot fires (`from == to == router`), 9 185 925 gas, 38 logs. For each of the two windows it carries: `OrdersCancelled(count 2)` — the desk pulling its own resting legs back out of the venue — then the redemption, then `Settled(pnl 0.000000, equityAfter 5000.200000)`. |
 
-The decision one-shot is gone now, as a consumed one-shot should be:
+The two decision one-shots are gone now, as consumed one-shots should be:
 
 ```bash
 curl -s -X POST https://api.infra.testnet.somnia.network -H 'content-type: application/json' \
-  --data '{"jsonrpc":"2.0","id":1,"method":"somnia_reactivityGetSubscriptionInfo","params":["0xfc8511"]}'
+  --data '{"jsonrpc":"2.0","id":1,"method":"somnia_reactivityGetSubscriptionInfo","params":["0xfda77f"]}'
 # {"jsonrpc":"2.0","id":1,"result":[]}
 ```
 
@@ -111,31 +132,30 @@ curl -s -X POST https://api.infra.testnet.somnia.network -H 'content-type: appli
 
 ## 3. Hero #1 — one transaction, two mandates, two outcomes
 
-[`0xa4bdae5926dbe8d0477bc65ae52e39d480c7cdb748f8873190ef8ecca2d0c1ea`](https://shannon-explorer.somnia.network/tx/0xa4bdae5926dbe8d0477bc65ae52e39d480c7cdb748f8873190ef8ecca2d0c1ea)
+[`0xec22854e1a2619ade09453233f0d3dfbe20eb6185a73ceca869daae40927e010`](https://shannon-explorer.somnia.network/tx/0xec22854e1a2619ade09453233f0d3dfbe20eb6185a73ceca869daae40927e010)
 
-Block 481 583 935 · status `1` · 7 544 372 gas · `from` [`0x1Cb38b3e…`](https://shannon-explorer.somnia.network/address/0x1Cb38b3ee632B5dCc0347dB81766606d6Aad4926),
+Block 481 805 874 · 04:02:30 UTC · status `1` · 4 134 265 gas · `from` [`0x05f1fE2D…`](https://shannon-explorer.somnia.network/address/0x05f1fE2DDF9B65576D3165E37C6A60e6c5Ba93De),
 a Somnia validator delivering the committee's answer · `to` the agent platform `0x037Bb9C7…`, which
-calls back into `LucidBrain`, which calls the router, which fans out. One transaction, twenty-three
+calls back into `LucidBrain`, which calls the router, which fans out. One transaction, twenty-seven
 logs. Decoded, in order:
 
 | # | emitter | event | value |
 | --- | --- | --- | --- |
-| 0 | `LucidBrain` | `LatencyObserved` | stage 2, observed 1 s, EMA 0 s |
-| 1 | `LucidBrain` | `VerdictReceived` | market `0x…015633`, requestId 13394191, `probUpBps 0`, responded 3, agreed 3, `ok true`, `scores [0, 0, 0]` |
-| 2 | `AiEdge` | `Considered` | market `0x…015633`, 300 s, BTC |
-| 3 | `AiEdge` | `VerdictReceived` | `probUpBps 0`, `pBookBps 65535`, responded 3 |
-| **4** | **`AiEdge`** | **`Refused`** | **reason `NoBook` (15)**, `probUpBps 0`, `pBookBps 65535` |
+| 0 | `LucidBrain` | `LatencyObserved` | stage 2, observed 0 s, EMA 0 s |
+| 1 | `LucidBrain` | `VerdictReceived` | market `0x…0159cb`, requestId 13416425, `probUpBps 5000`, responded 3, agreed 3, `ok true`, `scores [50, 50, 50]` |
+| 2 | `AiEdge` | `Considered` | market `0x…0159cb`, 300 s, ETH |
+| 3 | `AiEdge` | `VerdictReceived` | `probUpBps 5000`, `pBookBps 65535`, responded 3 |
+| **4** | **`AiEdge`** | **`Refused`** | **reason `NoBook` (15)**, `probUpBps 5000`, `pBookBps 65535` |
 | 5–6 | `Maker` | `Considered`, `VerdictReceived` | the same market, the same instant, the same verdict |
-| 7 | `tUSDC` | `Approval` | `Maker` → the market's pool `0x9253c714…` |
+| 7 | `tUSDC` | `Approval` | `Maker` → the market's pool `0x9cb6f4d5…` |
 | 8–9 | `OutcomeToken6909` | `OperatorSet` | `Maker` approves the pool and the module to move its legs |
 | 10 | `tUSDC` | `Transfer` | `Maker` → pool, **5.000000 tUSDC** |
-| 11–12 | `OutcomeToken6909` | `Transfer` ×2 | **from `0x0`** to `Maker`: 5.000000 of token id `…1400` and 5.000000 of id `…1401` — one complete set minted, no counterparty involved |
-| 13 | pool `0x9253c714…` | order lifecycle | the first leg reaching the venue |
-| **14** | **`Maker`** | **`Refused`** | **reason `VenueRejected` (12)** — the second leg never got up |
-| 15 | `OutcomeToken6909` | `Transfer` | `Maker` → pool, 5.000000 of id `…1401` — the NO leg escrowed behind the resting quote |
-| 16–18 | pool `0x9253c714…` | order placed / rested | |
-| **19** | **`Maker`** | **`Executed`** | `SELL_NO` at price `1000` (0.001), quantity `5000000` (5.000000 contracts), orderId `202914184810805070236` |
-| 20–22 | agent platform | request settled, per-validator receipts | |
+| 11–12 | `OutcomeToken6909` | `Transfer` ×2 | **from `0x0`** to `Maker`: 5.000000 of the YES id and 5.000000 of the NO id — one complete set minted, no counterparty involved |
+| 13–17 | pool `0x9cb6f4d5…` | escrow and order lifecycle | the first leg reaching the venue |
+| **18** | **`Maker`** | **`Executed`** | `SELL_YES` at price `520000` (0.520), quantity `5000000` (5.000000 contracts), orderId 166020696663385998780 |
+| 19–22 | pool `0x9cb6f4d5…` | escrow and order lifecycle | the second leg |
+| **23** | **`Maker`** | **`Executed`** | `SELL_NO` at price `480000` (0.480), quantity `5000000`, orderId 36893488147419137469 |
+| 24–26 | agent platform | request settled, per-validator receipts | |
 
 `pBookBps 65535` is `LucidTypes.BOOK_UNOBSERVED` — the sentinel for *there was no book*, which sits
 outside the 0–10000 probability range on purpose so it can never be mistaken for a price somebody
@@ -143,88 +163,276 @@ quoted.
 
 Same market. Same block. Same committee answer, delivered to both desks in the same call frame.
 `AiEdge`'s mandate needs a market price to measure an edge against, finds none, and refuses by name.
-`Maker`'s mandate does not need a counterparty at all, mints a complete set out of collateral and
-puts a leg on the book. The model proposes; each desk's own policy contract disposes.
+`Maker`'s mandate does not need a counterparty at all: it mints a complete set out of collateral and
+rests **both** legs, 0.480 bid and 0.520 ask, around the committee's 50 %. The model proposes; each
+desk's own policy contract disposes.
+
+[`0x5e170dbb…`](https://shannon-explorer.somnia.network/tx/0x5e170dbb00608b70eedaeca00c5cea4772b1b28206e5dbab52562d65c3bc5f18)
+(block 481 799 883, 03:52:31, 5 579 887 gas) is the same shape on the same pair of desks, and it is
+the window whose quote a counterparty actually took — see [section 4](#4-hero-2--a-settlement-booked-honestly).
+
+**The earlier clone.** [`0xa4bdae59…`](https://shannon-explorer.somnia.network/tx/0xa4bdae5926dbe8d0477bc65ae52e39d480c7cdb748f8873190ef8ecca2d0c1ea)
+(block 481 583 935, 2026-09-06 21:52:31, 7 544 372 gas, twenty-three logs) is the first transaction
+that ever showed this shape, and it still decodes exactly as described: the committee answered
+`probUpBps 0` with `scores [0, 0, 0]`, the `AiEdge` clone `0x86D17016…` refused with `NoBook`, and
+the `Maker` clone `0xd44B2e95…` minted a set and got a single `SELL_NO` leg up at 0.001 after the
+other leg emitted `Refused(VenueRejected)`. Those are **superseded desk clones** — the desks running
+today are the ones in [section 1](#1-the-addresses) — and that transaction is kept here because it is
+immutable evidence of the fan-out, not because it describes the current desks.
 
 ---
 
-## 4. Hero #2 — a loss booked on chain
+## 4. Hero #2 — a settlement booked honestly
 
-[`0x4d4e9f0d8ea3ca8412cadf1d9a749c55acb52c5720d8b742d15387a000d4d014`](https://shannon-explorer.somnia.network/tx/0x4d4e9f0d8ea3ca8412cadf1d9a749c55acb52c5720d8b742d15387a000d4d014)
+[`0x67c42a3edf14e32586f46ea528346859ff8ed015a3d9f4b8ea901632b7d0ff9a`](https://shannon-explorer.somnia.network/tx/0x67c42a3edf14e32586f46ea528346859ff8ed015a3d9f4b8ea901632b7d0ff9a)
 
-Block 481 585 467 · 21:55:05 UTC · status `1` · 2 691 006 gas · `from` and `to` both the router —
-a validator-executed reactivity handler, the settlement one-shot booked in step 3 above.
+Block 481 801 417 · 03:55:05 UTC · status `1` · 8 426 015 gas · `from` and `to` both the router —
+a validator-executed reactivity handler, the settlement one-shot booked when the windows were seen.
 
 | # | emitter | event | value |
 | --- | --- | --- | --- |
-| 0–1 | `OutcomeToken6909` | `Transfer` ×2 | `Maker` → module, then burned: 5.000000 of market `0x…015634`'s NO leg |
-| 2 | `tUSDC` | `Transfer` | pool → `Maker`, **5.000000** |
-| 4 | `BinaryMarketsModule` | redemption | market `0x…015634`, owner `Maker`, amount 5.000000, payout 5.000000 |
-| **5** | **`Maker`** | **`Settled`** | market `0x…015634`, **`pnl = 0.000000`**, `equityAfter = 5005.100000` |
-| **7** | **`Maker`** | **`Settled`** | market `0x…015633`, **`pnl = -5.000000`**, `equityAfter = 5000.100000` |
+| 6 | `Maker` | `OrdersCancelled` | market `0x…0159af`, **count 1** — the desk pulling its own resting leg back out of the pool before it redeems anything |
+| 7–8 | `OutcomeToken6909` | `Transfer` ×2 | the returned leg, then the burn |
+| 9 | `tUSDC` | `Transfer` | pool → `Maker`, **5.000000** |
+| 11 | `BinaryMarketsModule` | redemption | market `0x…0159af`, owner `Maker` |
+| **12** | **`Maker`** | **`Settled`** | market `0x…0159af`, **`pnl = +0.000000`**, `equityAfter = 5005.200000` |
+| **17** | **`Maker`** | **`Settled`** | market `0x…0159b0`, **`pnl = -5.000000`**, `equityAfter = 5000.200000` |
 
-Two windows closed in one transaction. One broke even. The other lost the whole 5.000000 tUSDC the
-desk had committed: there is exactly one redemption in this transaction and it belongs to `015634`.
-For `015633` — the window where the committee answered 0 % and the desk sold its NO leg at 0.001 —
-nothing came back, and the desk booked it as a loss rather than leaving the position dangling.
-Equity **5005.100000 → 5000.100000**.
+Two windows closed in one transaction, and they are the two cases the settlement path has to tell
+apart.
 
-That number is in this document because a system that only ever shows its wins is not showing
-anything. The desk's current equity is readable at any time:
+`0x…0159af` is the ordinary one. One leg was still resting, the desk cancelled it, the returned leg
+was burned back into collateral, 5.000000 tUSDC came home, and the window booked **`+0.000000`** —
+the desk got back exactly what it put in.
+
+`0x…0159b0` is the interesting one, and it is the first time anything on this venue traded with us.
+The desk had rested **both** legs on it at 03:52:31 in
+[`0x5e170dbb…`](https://shannon-explorer.somnia.network/tx/0x5e170dbb00608b70eedaeca00c5cea4772b1b28206e5dbab52562d65c3bc5f18),
+and a third party lifted them: 2.600000 tUSDC arrived from the pool one second later in
+[`0xa9cd5fec…`](https://shannon-explorer.somnia.network/tx/0xa9cd5fec1ffe759d4f087b84a560143d180b8ff2663687a47252dde4b9856795)
+and another 2.600000 eight seconds after that in
+[`0xd003bb3c…`](https://shannon-explorer.somnia.network/tx/0xd003bb3cba2afa70176334ad4dbe96ad44a4126e817b8bf3a6d4081495119a70),
+both taken by an ordinary account that has nothing to do with this project. By expiry the desk held
+neither leg and had nothing to cancel and nothing to redeem — which is why there is no
+`OrdersCancelled` and no redemption on that row — so `pnl = _free() − before − cost` booked the
+5.000000 the mint had cost as a loss.
+
+Read those two numbers together, not apart. Across the whole run the desk's collateral went
+**5 000.000000 → 5 000.200000**, and every bit of that movement is the 5.200000 those two fills paid
+for a set that cost 5.000000. The per-window `pnl` cannot see it, because the money arrived before
+the settlement snapshot was taken; that is a real limitation of the accounting and it is written up
+in [section 11](#11-honest-limits). Twelve windows is not a track record and there is no P&L claim
+anywhere in this repository — see [CLAIMS.md](CLAIMS.md) § NOT CLAIMED.
+
+The desk's current collateral is readable at any time:
 
 ```bash
 cast call 0x70a86D8842FB63C4Ad2b7cdddF530eBf1BB25d8E 'balanceOf(address)(uint256)' \
-  0xd44B2e952a29409eAfb940e42c7D2C20BA746faC \
+  0x3ffbB71aec0D5459677021Ad888195042eDA4AA2 \
   --rpc-url https://api.infra.testnet.somnia.network
-# 5000100000  (6 decimals)
+# 5000200000  (6 decimals)
 ```
 
-There is no P&L claim anywhere in this repository. Six executions is not a track record. See
-[CLAIMS.md](CLAIMS.md) § NOT CLAIMED.
+**The earlier clone.** [`0x4d4e9f0d…`](https://shannon-explorer.somnia.network/tx/0x4d4e9f0d8ea3ca8412cadf1d9a749c55acb52c5720d8b742d15387a000d4d014)
+(block 481 585 467, 2026-09-06 21:55:05, 2 691 006 gas) is the first loss this protocol ever booked
+on chain: two `Settled` rows on the **superseded** `Maker` clone `0xd44B2e95…`, one at
+`pnl = 0.000000` and one at `pnl = -5.000000`, equity 5005.100000 → 5000.100000. It still resolves
+and still decodes as described. It is also, as it turned out, an instance of the defect written up in
+[section 5](#5-the-defect-the-desks-found-live) rather than a real trading loss — which is exactly
+why it is still here.
 
 ---
 
-## 5. Executions and settlements
+## 5. The defect the desks found live
 
-Every trade the deployment has placed, 21:42–21:55 UTC on 2026-09-06. All by `Maker`; `AiEdge`
-refused all six with `NoBook`, correctly — the venue's book was empty on every one of them.
+A protocol that only shows the runs where nothing went wrong is showing a demo. This one found a real
+accounting defect in its own settlement path, on chain, with money, and the fix is in the deployed
+bytecode.
 
-| market | committee `probUpBps` | side | price | quantity | block | transaction |
-| --- | --- | --- | --- | --- | --- | --- |
-| `0x…01561b` | 5100 (`[51, 51, 51]`) | `SELL_NO` | 0.490 | 5.000000 | 481 577 936 | [`0xc6161328…`](https://shannon-explorer.somnia.network/tx/0xc6161328d4986b3ced6e1985245684c0af2784f28fb3f359e34c50ac2ad6bdd6) |
-| `0x…01561c` | 5100 | `SELL_NO` | 0.490 | 5.000000 | 481 577 936 | [`0x12f44b11…`](https://shannon-explorer.somnia.network/tx/0x12f44b117a6dae948c80ded0f0323f91f16f12ab04275d8fe652cd074ab18a97) |
-| `0x…015628` | 5100 | `SELL_NO` | 0.490 | 5.000000 | 481 580 932 | [`0xe7cff68b…`](https://shannon-explorer.somnia.network/tx/0xe7cff68be9e037fd4576e4ba04bc116320d6797ba289817b4f8fa91994c33704) |
-| `0x…015627` | 5100 | `SELL_NO` | 0.490 | 5.000000 | 481 580 932 | [`0xdb66bc8d…`](https://shannon-explorer.somnia.network/tx/0xdb66bc8dc569254af0f349f270d5220f88d83889beb8d03f221124e978ee5a18) |
-| `0x…015633` | **0** (`[0, 0, 0]`) | `SELL_NO` | **0.001** | 5.000000 | 481 583 935 | [`0xa4bdae59…`](https://shannon-explorer.somnia.network/tx/0xa4bdae5926dbe8d0477bc65ae52e39d480c7cdb748f8873190ef8ecca2d0c1ea) |
-| `0x…015634` | 5000 (`[50, 50, 50]`) | `SELL_YES` | 0.520 | 5.000000 | 481 583 939 | [`0x2ae507e7…`](https://shannon-explorer.somnia.network/tx/0x2ae507e7375e57e86258bb8151a65849c859dbda46d519f94bf6c838f518d4a5) |
+**The symptom.** A `Maker` clone of the previous implementation,
+[`0x85e34174…`](https://shannon-explorer.somnia.network/address/0x85e34174fcd39c1c717724b3691d3e34ff265149),
+was armed at 02:38:15 on 2026-09-07 with 5 000.000000 tUSDC. It quoted six windows and every single
+one of them settled at **`pnl = -5.000000`**:
 
-Prices are raw six-decimal collateral units divided by `oneCollateral = 1e6`; quantity likewise.
-`SELL_NO` at 0.001 on the `015633` row is the desk quoting where the committee told it to — a
-verdict of 0 % up means the NO leg is worth almost everything, and the desk marked its ask a tick
-above zero. That is the quote that produced the −5.000000 in [hero #2](#4-hero-2--a-loss-booked-on-chain).
-
-Settlements — three transactions, six windows, all validator-executed handlers with the router as
-both `from` and `to`:
-
-| block | UTC | transaction | booked |
+| UTC | block | transaction | booked |
 | --- | --- | --- | --- |
-| 481 579 468 | 21:45:05 | [`0xfba1695d…`](https://shannon-explorer.somnia.network/tx/0xfba1695d169c8cc91f66af58933cdacc54088239c4c9e910b06d7069984559ab) | `0x…01561b` pnl 0.000000 · `0x…01561c` pnl 0.000000 · equity 5005.100000 |
-| 481 582 468 | 21:50:05 | [`0x570b424d…`](https://shannon-explorer.somnia.network/tx/0x570b424de8dea85aaab8b120935a7bca9d26db09593562e3cc7ee74398a6bdb6) | `0x…015627` pnl 0.000000 · `0x…015628` pnl 0.000000 · equity 5005.100000 |
-| 481 585 467 | 21:55:05 | [`0x4d4e9f0d…`](https://shannon-explorer.somnia.network/tx/0x4d4e9f0d8ea3ca8412cadf1d9a749c55acb52c5720d8b742d15387a000d4d014) | `0x…015634` pnl 0.000000 · **`0x…015633` pnl −5.000000** · equity 5000.100000 |
+| 02:45:05 | 481 759 426 | [`0xd3219ea0…`](https://shannon-explorer.somnia.network/tx/0xd3219ea0a4d1fb003fcc9d7b1bb549a80625a87ec46cf354a552f32155a05aef) | `0x…015900` −5.000000 → 4995.000000 · `0x…0158ff` −5.000000 → 4990.000000 |
+| 02:50:05 | 481 762 426 | [`0x588ed9ff…`](https://shannon-explorer.somnia.network/tx/0x588ed9ff4db4cdb046e5a01593267c643fbdeaeb06134afa827b30fc9a201af6) | `0x…01590c` −5.000000 → 4985.000000 · `0x…01590b` −5.000000 → 4980.000000 |
+| 02:55:05 | 481 765 425 | [`0x19992789…`](https://shannon-explorer.somnia.network/tx/0x199927896a07b8185df2556c93453d0b7dc86e2f27269312481a40390585f4b9) | `0x…015918` −5.000000 → 4975.000000 · `0x…015917` −5.000000 → 4970.000000 |
 
-Pull them yourself. Shannon caps `eth_getLogs` at 1000 blocks and mints a block roughly every
+Equity **5 000.000000 → 4 970.000000**, six for six, the whole stake every time, with the committee
+answering across a range of values. A strategy that loses exactly its entire mint on every window
+regardless of the outcome is not losing; it is not measuring.
+
+**The cause.** A resting order escrows its leg with the pool. The maker mints a complete set and
+rests both legs, so between placement and expiry the desk's own balance of both outcome tokens is
+zero — the pool is holding them. The old `onSettlement` went straight to redemption, `_redeemLeg`
+found nothing to redeem, and
+
+```solidity
+int256 pnl = int256(_free()) - int256(before) - int256(uint256(h.cost));
+```
+
+reduced to `−cost` every time. The loss was not a market outcome. It was the desk failing to ask for
+its own inventory back before valuing it.
+
+**The fix**, in `contracts/src/LucidDesk.sol`, is that the cancel now comes first and the snapshot
+comes before the cancel:
+
+```solidity
+uint256 before = _free();
+_cancelResting(m.marketId, m.pool);
+```
+
+`_cancelResting` walks the desk's own order ids for that window, calls `cancelOrder` on each inside a
+`try`, and emits `OrdersCancelled(marketId, count)` when at least one came back. Every failure is
+swallowed on purpose: a cancel legitimately fails when the order already filled, already expired, or
+was swept by the venue's own `cancelExpiredOrders`, and none of those is an error. The absence of the
+event is itself readable — a settlement with no `OrdersCancelled` beside it is a settlement where
+nothing came back.
+
+**The evidence it works.** In the run in [section 7](#7-the-run) every window where a leg was still
+resting settled at **`+0.000000`** with an `OrdersCancelled` line beside it, and the only `-5.000000`
+in the whole run is `0x…0159b0`, where the legs really were gone because somebody bought them. Same
+strategy, same venue, same cadence, same size.
+
+Pinned in the suite, so it cannot come back:
+
+```bash
+cd contracts && forge test --match-contract LucidDeskTest --match-test cancel -vv
+# test_a_settling_maker_cancels_both_legs_before_it_redeems_anything
+# test_a_cancel_that_reverts_does_not_stop_the_settlement
+# test_a_taker_order_that_rested_is_cancelled_too
+```
+
+---
+
+## 6. The desk that halted itself
+
+This is the part worth reading twice, because it is what the safety spine is for and it fired against
+a real defect rather than a contrived one.
+
+Nobody stopped the desk in [section 5](#5-the-defect-the-desks-found-live). **It stopped itself, six
+windows in, before anyone had looked at it.**
+
+Its mandate carried `maxConsecutiveLosses = 5`. `PolicyLib._staticChecks` reads:
+
+```solidity
+if (s.consecutiveLosses >= p.maxConsecutiveLosses) return LucidTypes.Refusal.RiskHalt;
+```
+
+and `_staticChecks` is reached from `preCheck`, which the router calls in `_candidates` **before it
+will even include a desk in the fan-out**. So once the counter crossed the line, the desk was not
+refusing trades — it was no longer being asked.
+
+Settlements on this venue arrive two windows at a time, so the streak went 2 → 4 → 6 and the third
+settlement transaction carried it past the limit of 5 in one step. Read the state yourself; both
+values are public:
+
+```bash
+RPC=https://api.infra.testnet.somnia.network
+D=0x85e34174fcd39c1c717724b3691d3e34ff265149
+cast call $D 'state()((uint64,uint64,uint64,uint16,uint8))'  --rpc-url $RPC
+# (20703, 30000000, 5000000000, 0, 6)   <- consecutiveLosses = 6
+cast call $D 'policy()((uint64,uint64,uint16,uint16,uint8,uint16,uint32,uint32,uint8,bool))' --rpc-url $RPC
+# (5000000, 200000000, 5, 3000, 5, 200, 3, 14, 1, false)   <- maxConsecutiveLosses = 5
+cast call 0x70a86D8842FB63C4Ad2b7cdddF530eBf1BB25d8E 'balanceOf(address)(uint256)' $D --rpc-url $RPC
+# 4970000000
+```
+
+**The desk stayed armed for another 47 minutes and never took another window.** Its last settlement
+was 02:55:05. Its owner disarmed it at 03:42:20 in
+[`0x57a5dd34…`](https://shannon-explorer.somnia.network/tx/0x57a5dd34f217aa184beddfb01e3241e41d7ce3cf2f88b8af32cee3ed7c53c8f7),
+as part of the redeploy. Between those two moments, blocks 481 765 425 → 481 793 777, the router was
+fully alive and spending: **112 `MarketSeen`, 18 `DecisionScheduled`, 7 `VerdictRequested`**, and the
+other armed desk was `Considered` seven times. The halted desk was considered **zero** times.
+
+```bash
+RPC=https://api.infra.testnet.somnia.network
+# not one Considered on the halted desk in that whole span
+cast logs --rpc-url $RPC --from-block 481765426 --to-block 481766375 \
+  --address 0x85e34174fcd39c1c717724b3691d3e34ff265149 \
+  'Considered(bytes32,uint32,bytes32)'
+```
+
+A `preCheck` that declines emits nothing, deliberately — on a venue rolling two assets a minute, a
+log line per uninterested desk per market would bury every line that matters — so the evidence here
+is the state read plus the absence, together, rather than a log that says "halted".
+
+Three things this establishes that a green run cannot:
+
+- **The guard fires on the real failure, not on the modelled one.** Nobody wrote a losing strategy to
+  demonstrate a risk limit. A genuine defect produced genuine losses and the limit caught them.
+- **The blast radius was 30.000000 tUSDC of 5 000.000000 — 0.6 %** — and it was bounded by a number
+  the desk's owner chose, enforced by a contract, with no operator awake.
+- **The halt is sticky, and that is the design.** `consecutiveLosses` only clears on a settlement
+  that does not lose, and a halted desk is never offered another window, so it cannot clear itself.
+  The owner's only lever is `setPolicy` — changing the mandate, in public, in a transaction. A risk
+  limit that a running strategy can reset is not a risk limit.
+
+---
+
+## 7. The run
+
+Everything the current deployment did between **03:47:31 and 04:15:05 UTC on 2026-09-07**, twelve
+windows, from the watcher's own counters and re-read off the chain: **12 committee verdicts, 12 price
+fetches, 18 executions, 12 settlements, 12 `NoBook` refusals from `AiEdge`, 6 `VenueRejected` from
+`Maker`.** That timestamp is a cut, not an ending — the deployment is still running, and a scan taken
+later covers more windows than the table below. The five distinct committee medians in those twelve windows were **0, 50, 51, 99 and
+100**, every one of them unanimous to the integer across three validators.
+
+| market | asset | committee | legs rested | refused | cancelled at settlement | booked |
+| --- | --- | --- | --- | --- | --- | --- |
+| `0x…0159a3` | BTC | 100 % | `SELL_YES` 0.999 | `VenueRejected` | 1 | +0.000000 |
+| `0x…0159a4` | ETH | 51 % | `SELL_NO` 0.490 | `VenueRejected` | 1 | +0.000000 |
+| `0x…0159b0` | ETH | 50 % | `SELL_YES` 0.520, `SELL_NO` 0.480 | — | — | **−5.000000** |
+| `0x…0159af` | BTC | 0 % | `SELL_NO` 0.001 | `VenueRejected` | 1 | +0.000000 |
+| `0x…0159bc` | ETH | 0 % | `SELL_NO` 0.001 | `VenueRejected` | 1 | +0.000000 |
+| `0x…0159bb` | BTC | 100 % | `SELL_YES` 0.999 | `VenueRejected` | 1 | +0.000000 |
+| `0x…0159cb` | ETH | 50 % | `SELL_YES` 0.520, `SELL_NO` 0.480 | — | 2 | +0.000000 |
+| `0x…0159ca` | BTC | 51 % | `SELL_YES` 0.530, `SELL_NO` 0.490 | — | 2 | +0.000000 |
+| `0x…0159dd` | BTC | 50 % | `SELL_YES` 0.520, `SELL_NO` 0.480 | — | 2 | +0.000000 |
+| `0x…0159de` | ETH | 0 % | `SELL_YES` 0.020, `SELL_NO` 0.001 | — | 2 | +0.000000 |
+| `0x…0159e9` | BTC | 99 % | `SELL_YES` 0.999 | `VenueRejected` | 1 | +0.000000 |
+| `0x…0159ea` | ETH | 50 % | `SELL_YES` 0.520, `SELL_NO` 0.480 | — | 2 | +0.000000 |
+
+Prices are raw six-decimal collateral units divided by `oneCollateral = 1e6`; quantity was 5.000000
+contracts on every row. `AiEdge` was `Considered` on all twelve and refused all twelve with `NoBook`,
+correctly — no side of the venue's book quoted on any of them, and `pBookBps` carried the 65535
+sentinel every time. `Maker` ended the run holding **5 000.200000 tUSDC**.
+
+Six of the twelve got both legs up and six got one leg plus `Refused(VenueRejected)`. The split does
+not line up with the committee's number: a 0 % window appears on both sides of it, and so does a
+51 % one. What can be said is narrower and is said in [section 11](#11-honest-limits).
+
+Then the router ran out of float, and said so by name rather than failing quietly:
+
+| UTC | block | log | transaction |
+| --- | --- | --- | --- |
+| 04:17:30 | 481 814 864 | `Skipped … ROUTER_FLOAT` ×2 | [`0xc8bfff1c…`](https://shannon-explorer.somnia.network/tx/0xc8bfff1c01e664dbb87cf4894105a922b24cc6f5e05833290b17606007bc3f33) |
+| 04:18:00 | 481 815 163 | `Skipped … SCHEDULE_FAILED`, first of 34 | [`0xaeec9c5a…`](https://shannon-explorer.somnia.network/tx/0xaeec9c5a600f7e05d733853370534cbfc8492ebde88a4ff4cabc7d6c31b0779d) |
+| 04:20:00 | 481 816 363 | `Skipped … DECISION_SCHEDULE_FAILED`, first of 6 | [`0x9ca4ed87…`](https://shannon-explorer.somnia.network/tx/0x9ca4ed875872428bf42b1b8e9bb470f77ec6192aa6e05e82b7d552e68adffa37) |
+
+The precompile checks the 32 SOMI subscription floor against the *calling* contract on every booking,
+so once the router's own balance crossed it, new one-shots stopped being accepted. The router did not
+pretend otherwise for a single block: it published the reason and spent nothing. It has since been
+topped up — `verify-onchain.sh` read 37.612101 SOMI at 05:00 UTC — and the loop resumed at 04:37:31
+without anyone touching the contracts. **Reporting funding exhaustion is the behaviour; a green
+screenshot would have been worth less.**
+
+Pull any of it yourself. Shannon caps `eth_getLogs` at 1000 blocks and mints a block roughly every
 100 ms, so one call covers about ninety seconds:
 
 ```bash
 RPC=https://api.infra.testnet.somnia.network
-cast logs --rpc-url $RPC --from-block 481583900 --to-block 481583999 \
-  --address 0xd44B2e952a29409eAfb940e42c7D2C20BA746faC \
+cast logs --rpc-url $RPC --from-block 481805800 --to-block 481805899 \
+  --address 0x3ffbB71aec0D5459677021Ad888195042eDA4AA2 \
   'Executed(bytes32,uint8,uint256,uint256,uint128)'
 ```
 
 ---
 
-## 6. There is no server
+## 8. There is no server
 
 This is the claim that matters, so here is the evidence rather than the assertion.
 
@@ -234,13 +442,17 @@ This is the claim that matters, so here is the evidence rather than the assertio
 curl -s -X POST https://api.infra.testnet.somnia.network -H 'content-type: application/json' \
   --data '{"jsonrpc":"2.0","id":1,"method":"somnia_reactivityGetSubscriptions",
            "params":["0x6aE21a20444141552648C1f8443bAf171BCCcB99"]}'
-# {"jsonrpc":"2.0","id":1,"result":["0xfc4163"]}
-
-curl -s -X POST https://api.infra.testnet.somnia.network -H 'content-type: application/json' \
-  --data '{"jsonrpc":"2.0","id":1,"method":"somnia_reactivityGetSubscriptionInfo","params":["0xfc4163"]}'
+# {"jsonrpc":"2.0","id":1,"result":["0xfc4163","0xfda77f","0xfda780","0xfda82e"]}
 ```
 
-Subscription **`0xfc4163` (16 531 811)**, decoded field by field:
+Four ids, all owned by the router, and they are not four subscriptions to the venue. **`0xfc4163` is
+the only standing one**; the other three are the router's own `Schedule` one-shots, of which
+`0xfda780` was still pending at 05:00 UTC and the other two had already been consumed and return an
+empty result. `0xfda780` decodes as emitter `0x…0100` — the precompile itself — topic0
+`0x67aa3d75…` = `Schedule(uint256)`, `topics[1] = 0x1a07a4173e8` = 1 788 757 505 000 ms = 05:05:05
+UTC, which is the next settlement wake-up.
+
+`0xfc4163` (16 531 811), decoded field by field:
 
 | field | value | means |
 | --- | --- | --- |
@@ -259,58 +471,61 @@ A reactivity handler is a synthetic transaction the validator set executes. Its 
 the subscription owner appears as **both `from` and `to`**, because no external account sent it:
 
 ```bash
-cast receipt 0x0273f912dc86e7da29ca4a48a23e6cc06d269d69f0a8b43d9b6e4248efed3ac8 \
+cast receipt 0x6fc665db5091d165585f8ad61e6407ae83fcd6d45432e1c0b314c21445b32050 \
   --rpc-url https://api.infra.testnet.somnia.network | grep -E '^(from|to)'
 # from  0x6aE21a20444141552648C1f8443bAf171BCCcB99
 # to    0x6aE21a20444141552648C1f8443bAf171BCCcB99
 ```
 
 The same holds for every handler transaction in this document:
-[`0x0273f912…`](https://shannon-explorer.somnia.network/tx/0x0273f912dc86e7da29ca4a48a23e6cc06d269d69f0a8b43d9b6e4248efed3ac8) (market seen),
-[`0xc4c1464e…`](https://shannon-explorer.somnia.network/tx/0xc4c1464ee2f0e81a7a81aa5d5047a89a228f21bfbf76389dd5af39128a54334c) (decision wake-up),
-[`0xfba1695d…`](https://shannon-explorer.somnia.network/tx/0xfba1695d169c8cc91f66af58933cdacc54088239c4c9e910b06d7069984559ab),
-[`0x570b424d…`](https://shannon-explorer.somnia.network/tx/0x570b424de8dea85aaab8b120935a7bca9d26db09593562e3cc7ee74398a6bdb6),
-[`0x4d4e9f0d…`](https://shannon-explorer.somnia.network/tx/0x4d4e9f0d8ea3ca8412cadf1d9a749c55acb52c5720d8b742d15387a000d4d014) (settlements),
-[`0x0cd9c425…`](https://shannon-explorer.somnia.network/tx/0x0cd9c425852520fa550d137ab94802aa74f3a87c5f68347990a7144c1be3f5ff) (a refusal to spend).
+[`0x6fc665db…`](https://shannon-explorer.somnia.network/tx/0x6fc665db5091d165585f8ad61e6407ae83fcd6d45432e1c0b314c21445b32050) (market seen),
+[`0xe906edfb…`](https://shannon-explorer.somnia.network/tx/0xe906edfb19c4bae0f748baa1949101b0b3f6a9449e44d2d25ec773c95e41fb85) (decision wake-up),
+[`0x5c9e2b27…`](https://shannon-explorer.somnia.network/tx/0x5c9e2b2750774eca0edbde1893df56da5fc162c7ffc185a28758fdd1de5c2c02),
+[`0x67c42a3e…`](https://shannon-explorer.somnia.network/tx/0x67c42a3edf14e32586f46ea528346859ff8ed015a3d9f4b8ea901632b7d0ff9a),
+[`0xc50c6095…`](https://shannon-explorer.somnia.network/tx/0xc50c60958e32f6beca5c63c992294c168cb7e64b403a101f8a1553deef6063db) (settlements),
+[`0xc8bfff1c…`](https://shannon-explorer.somnia.network/tx/0xc8bfff1c01e664dbb87cf4894105a922b24cc6f5e05833290b17606007bc3f33) (a refusal to spend).
 
 The other half of the loop — the committee answers — are submitted by validator accounts to Somnia's
-agent platform, not by us: [`0x05f1fE2D…`](https://shannon-explorer.somnia.network/address/0x05f1fE2DDF9B65576D3165E37C6A60e6c5Ba93De)
-and [`0x1Cb38b3e…`](https://shannon-explorer.somnia.network/address/0x1Cb38b3ee632B5dCc0347dB81766606d6Aad4926)
-delivered the six verdicts in [section 5](#5-executions-and-settlements), each `to`
-`0x037Bb9C7…`. Open any of those transactions and read the `from` field.
+agent platform, not by us. Four different validators appear in the run above:
+[`0x3e05e290…`](https://shannon-explorer.somnia.network/address/0x3e05e29029c60e000c8f01eb5ac9cee6b242d7e0),
+[`0x55acbe37…`](https://shannon-explorer.somnia.network/address/0x55acbe370872c7d90f504ef169217a00c29e2a33),
+[`0x05f1fE2D…`](https://shannon-explorer.somnia.network/address/0x05f1fE2DDF9B65576D3165E37C6A60e6c5Ba93De) and
+[`0x1Cb38b3e…`](https://shannon-explorer.somnia.network/address/0x1Cb38b3ee632B5dCc0347dB81766606d6Aad4926),
+each `to` `0x037Bb9C7…`. Open any committee transaction and read the `from` field.
 
 ### The invitation
 
 Nothing of ours is running. Check it:
 
-- Nothing subscribed to that emitter belongs to any address of ours except the router — the
-  subscription list above has exactly one entry.
+- Nothing subscribed to that emitter belongs to any address of ours except the router, and the
+  router holds exactly one standing subscription to it.
 - Not one transaction in the operating loop — sections [2](#2-the-loop-proven-end-to-end) through
-  [5](#5-executions-and-settlements) — was signed by a key of ours. Every `from` is either the router
-  itself or a Somnia validator. The only transactions here we signed are the one-off setup calls in
-  [section 8](#8-our-own-venue-resolves), and nothing repeats them.
+  [7](#7-the-run) — was signed by a key of ours. Every `from` is either the router itself or a Somnia
+  validator. The only transactions we signed are the deployment and arming calls in
+  [section 1](#1-the-addresses), the one-off venue setup in [section 10](#10-our-own-venue-resolves),
+  and the top-ups; nothing repeats them on a schedule.
 - The router is still reacting **now**, with no help. Run
   [`verify-onchain.sh`](contracts/verify-onchain.sh) and read section 4/5 — at the run reproduced in
-  [section 10](#10-reproduce-it-yourself) it found 24 `MarketSeen` logs in the last 5 700 blocks, the
-  newest 110 blocks (about 11 seconds) old.
+  [section 12](#12-reproduce-it-yourself) it found 6 `MarketSeen` and 6 `SettlementScheduled` in the
+  last 950 blocks, the newest 73 blocks (about seven seconds) old.
 - Turn off every machine we own and the loop does not change. There is no endpoint to switch off:
   the router's address is the process.
 
 ---
 
-## 7. Self-calibration
+## 9. Self-calibration
 
 The brain refuses windows it cannot finish in time, and it decides what "in time" means by measuring
-itself. Four reads, no key:
+itself. Five reads, no key:
 
 ```bash
 RPC=https://api.infra.testnet.somnia.network
 B=0x0c640E3aFc627bEec7eDB9985696e12B50AdAd25
-cast call $B 'feedObserved()(bool)'        --rpc-url $RPC   # true
-cast call $B 'verdictObserved()(bool)'     --rpc-url $RPC   # true
-cast call $B 'feedLatencyEma()(uint256)'   --rpc-url $RPC   # 0
-cast call $B 'verdictLatencyEma()(uint256)' --rpc-url $RPC  # 0
-cast call $B 'requiredSlack()(uint256)'    --rpc-url $RPC   # 90
+cast call $B 'feedObserved()(bool)'         --rpc-url $RPC   # true
+cast call $B 'verdictObserved()(bool)'      --rpc-url $RPC   # true
+cast call $B 'feedLatencyEma()(uint256)'    --rpc-url $RPC   # 0
+cast call $B 'verdictLatencyEma()(uint256)' --rpc-url $RPC   # 0
+cast call $B 'requiredSlack()(uint256)'     --rpc-url $RPC   # 90
 ```
 
 Both stages are marked observed, both exponential moving averages have settled at 0 seconds, and
@@ -323,12 +538,13 @@ working perfectly.
 The requirement came down to 90 because the contract measured its own two committee stages on chain
 and found them fast — not because anyone edited a constant. The measurements are public:
 `LatencyObserved(stage, observed, ema)` in
-[`0xc15bb46d…`](https://shannon-explorer.somnia.network/tx/0xc15bb46de3a6ad7d5bed730860f459e075287e53f9c1c82a452f722e9967d2a1)
+[`0x1830ef33…`](https://shannon-explorer.somnia.network/tx/0x1830ef332ff751df76b7e65ce3dc789008f58cb4f2bfa6881c718a74a72e2868)
 (stage 1, observed 0 s) and
-[`0xa4bdae59…`](https://shannon-explorer.somnia.network/tx/0xa4bdae5926dbe8d0477bc65ae52e39d480c7cdb748f8873190ef8ecca2d0c1ea)
-(stage 2, observed 1 s). The general rule that came out of it: a self-calibrating guard must never be
-able to prevent its own calibration, so an unobserved stage contributes its floor rather than its
-seed.
+[`0xec22854e…`](https://shannon-explorer.somnia.network/tx/0xec22854e1a2619ade09453233f0d3dfbe20eb6185a73ceca869daae40927e010)
+(stage 2, observed 0 s); a slower one at 1 s is in
+[`0x5e170dbb…`](https://shannon-explorer.somnia.network/tx/0x5e170dbb00608b70eedaeca00c5cea4772b1b28206e5dbab52562d65c3bc5f18).
+The general rule that came out of it: a self-calibrating guard must never be able to prevent its own
+calibration, so an unobserved stage contributes its floor rather than its seed.
 
 The quote it charges for those two stages is re-derived from the platform's own deposit function
 rather than taken on the brain's word, in section 10 of `verify-onchain.sh`:
@@ -337,7 +553,7 @@ stage 1 **0.12 SOMI** = deposit 0.03 + 3 × 0.03 · stage 2 **0.24 SOMI** = depo
 
 ---
 
-## 8. Our own venue resolves
+## 10. Our own venue resolves
 
 DreamDEX's venue registration is open. The interesting question is not whether an ordinary account
 can register one — it is whether the venue's oracle then actually answers the windows that come out
@@ -402,84 +618,93 @@ the shared venue stopped for hours because the SDK's advertised testnet `MarketC
 float to zero, and every protocol pointed at it stopped at the same instant. The way out is not a
 support ticket; it is your own creator, your own venue, and the venue's oracle answering it exactly
 as it answers DreamDEX's own. The deployment runs in `Failover` mode — mode `1`, confirmed by section
-11 of `verify-onchain.sh` — so it spends nothing while the venue's own scheduler is healthy.
+11 of `verify-onchain.sh` — so it spends nothing while the venue's own scheduler is healthy. At the
+run in [section 12](#12-reproduce-it-yourself) the watcher reported the venue healthy, 0 rolls of the
+12 allowed today, and a creator float of 9.223132 SOMI against a 6 SOMI roll floor.
 
 ---
 
-## 9. Honest limits
+## 11. Honest limits
 
 Stated here, at the same size as everything else.
 
-**Only one leg ever rests.** The maker quotes both sides; one leg gets on the book and the other
-emits `Refused(VenueRejected)` — six times out of six, in every execution row in
-[section 5](#5-executions-and-settlements). What that refusal does **not** tell you is *why*.
-`VenueRejected` currently covers several distinct failures inside the maker's quoting path — an
-unreadable book, an unquotable pair, a failed mint, and a genuine rejection by the pool — and the log
-does not distinguish them. The obvious explanation — the venue's own market maker quotes around 0.87
-while the committee said 0.51, so our ask crosses its bid and post-only correctly refuses to post a
-crossing quote — is plausible and **not established**: on the `015633` window the committee said
-0 %, which clamps the bid up a tick and makes the pair postable, and the leg failed anyway. The
-supported statement is the narrow one: *the maker never got a two-sided quote up, and the event does
-not say which of the four causes fired.* The fix — splitting the enum into `BookUnreadable`,
-`Unquotable`, `MintFailed` and a `VenueRejected` that means only "the pool turned the order down" —
-is in `contracts/src/types/LucidTypes.sol` and appended, so every historical log keeps its meaning.
-It is not in the deployed bytecode that produced the logs above. Until a run on the new code exists,
-nobody should read a market-structure story into this refusal.
+**Both legs now rest about half the time, and we cannot say why the other half fails.** The old
+statement here was "only one leg ever rests, six times out of six", and it is no longer true: in
+[section 7](#7-the-run) six of twelve windows got a two-sided quote up and six got one leg plus
+`Refused(VenueRejected)`. The refusal enum has since been split, so `VenueRejected` now means only
+what its comment says — *the pool was shown a completely described order and turned it down* — and
+`BookUnreadable`, `Unquotable` and `MintFailed` have their own values. None of those three fired in
+the run, which narrows the cause but does not name it. The tempting story, that the ask crosses the
+venue market maker's bid at extreme committee values and post-only correctly declines, **does not
+survive the data**: a 0 % window and a 51 % window each appear on both sides of the split. The
+supported statement is the narrow one: *the pool accepts both legs on some windows and one leg on
+others, and the event says which order it turned down but not why.*
 
-**The committee is over-confident at the extremes, and the sample is small.** The pre-registered
-harness in [eval/EVAL.md](eval/EVAL.md) graded n = 21 verdicts and published what it found, including
-against itself. Four distinct forecasts (0 % ×9, 50 % ×3, 51 % ×8, 100 % ×1); Brier **0.3653**
-against **0.2500** for a forecaster that says "50 %" to everything; directional accuracy 72.2 %
-(13/18) with a one-sided binomial p = 0.0481. **That p-value does not survive contact with the
-sample**: 16 of 21 windows closed UP, and a rule as dumb as *always say UP* scores 14/18 with a
-Brier of 0.2381 — better on both metrics. The directional result is carried entirely by the eight
-barely-decisive 51 % calls, which went 8 for 8; every other decisive call together went 5 for 10,
-exactly chance. The nine confident 0 % calls contribute 0.2381 of the total 0.3653 Brier on their
-own. **No directional skill is claimed here.** All 21 verdicts were unanimous to the integer, so the
-committee bought consensus and no variance reduction in this sample.
+**Twelve windows is not a sample.** [Section 7](#7-the-run) covers 33 minutes on one venue, two
+assets, one cadence and one size. It shows that the mechanism works end to end. It shows nothing
+about whether the strategy works, and no P&L claim is made from it.
 
-**The desks ran out of gas credit mid-run, and the router said so by name.** The degradation is on
-chain, in order, each step naming the component that actually failed:
+**The per-window `pnl` cannot see a maker fill.** `pnl = _free() − before − cost`, and `before` is
+snapshotted at the start of settlement. Collateral that a counterparty paid for a filled leg arrives
+*during the window*, long before that snapshot, so it lifts `equityAfter` and enters no window's
+`pnl` at all. That is exactly what produced the `-5.000000` on `0x…0159b0` in
+[section 4](#4-hero-2--a-settlement-booked-honestly) alongside a run that ended 0.200000 tUSDC up.
+The event stream is complete and the equity figure is right; the per-window attribution is not, and
+anyone reading `Settled.pnl` as trade P&L for a maker will read it wrong. It is stated rather than
+patched because the fix changes an accounting convention that historical logs were written under.
 
-| UTC | block | `Skipped` reason | transaction |
-| --- | --- | --- | --- |
-| 21:57:30 | 481 586 917 | `NO_CREDIT` (both desks) | [`0x0cd9c425…`](https://shannon-explorer.somnia.network/tx/0x0cd9c425852520fa550d137ab94802aa74f3a87c5f68347990a7144c1be3f5ff) |
-| 22:12:30 | 481 595 915 | `ROUTER_FLOAT` | [`0xea98470e…`](https://shannon-explorer.somnia.network/tx/0xea98470ec59eff4b42a249103dd283aa5b0e3f5f79591f5217d3cd26a87f48b5) |
-| 22:55:00 | 481 621 409 | `DECISION_SCHEDULE_FAILED` | [`0xa0f02d81…`](https://shannon-explorer.somnia.network/tx/0xa0f02d815d95a31e7b9cd0c674a1765e0b92c20a0cbf9080887772d873fbe845) |
+**The committee is badly calibrated, and its direction is carried by one bucket.** The pre-registered
+harness in [eval/EVAL.md](eval/EVAL.md) graded **n = 62** verdicts across 8 hours and published what
+it found, including against itself. Eight distinct forecasts, realised UP rate 53.2 %; Brier
+**0.3598** against **0.2500** for a forecaster that says "50 %" to everything and **0.3574** for a
+same-boldness coin flip — it loses to both, and the harness prints `BEATS NEITHER CONTROL`.
+Directional accuracy is 69.6 % (32 of 46 decisive, 16 abstentions at exactly 50 %), but the
+committee's seventeen 51 % calls went 17 for 17 and everything else together went 15 of 29, which is
+chance. Its confident calls are anti-calibrated: the 0 % bucket realised 42.1 % UP and the 90–100 %
+bucket realised 25 %. **No predictive edge is claimed here.** Read EVAL.md before assuming anything.
 
-Each desk's prepaid credit is 0.06 SOMI against the 0.19 a verdict costs
-(`cast call <router> 'gasCreditOf(address)(uint256)' <desk>`), and the router's own balance —
-**31.200088 SOMI** when `verify-onchain.sh` ran, **31.136753 SOMI** a few minutes later, still
-falling as each firing pays its own gas — is under the precompile's 32 SOMI subscription floor, so
-the precompile now refuses to book new one-shots. The router did not pretend otherwise for a
-single block: it published the reason and spent nothing. That is the behaviour under funding exhaustion, and it is worth more than a
-green screenshot.
+**The keeper is attached and has completed nothing.** `router.keeper()` now reads the keeper, so the
+router runs venue-wide upkeep on every firing, and its public counters say what that has produced:
 
-**The keeper is currently detached.** `router.keeper()` reads zero, so the router schedules a
-settlement only for markets its own desks asked about and runs no venue-wide upkeep. Venue-wide
-upkeep measured about 8.3 SOMI/hour on this deployment — 40 markets per 15 minutes at roughly
-0.017 SOMI per firing — which a testnet float does not survive continuously. The mechanism is not
-bursty; the funding is.
+```bash
+cast call 0x4757599dC9A5a089270373a66BEeeD6592788707 'counts()(uint64,uint64,uint64,uint64,uint64,uint64)' \
+  --rpc-url https://api.infra.testnet.somnia.network
+# 0 0 0 0 0 1026    finalized · released · synced · poked · voided · failures
+```
+
+Zero finalized, zero released, zero synced, zero poked, and 1 026 upkeep calls that reverted or could
+not be attempted. On a venue whose own machinery keeps up, being beaten to every call is the expected
+case and the counter is documented as such — but it means **the upkeep path has not been observed
+doing useful work on this venue**, and nobody should read those 1 026 as work performed. Venue-wide
+upkeep also measured about 8.3 SOMI/hour on this deployment, which a testnet float does not survive
+continuously.
+
+**Funding is the binding constraint, and it is visible.** The router must hold 32 SOMI and stops
+booking one-shots below it, re-checked on every booking rather than once at setup; it crossed that
+line at 04:17:30 and logged `ROUTER_FLOAT`, `SCHEDULE_FAILED` and `DECISION_SCHEDULE_FAILED` until it
+was topped up. Each desk's prepaid gas credit currently reads 0.15 SOMI against the 0.19 a verdict
+debits (`cast call <router> 'gasCreditOf(address)(uint256)' <desk>`), which is why `NO_CREDIT` skips
+resume between top-ups. Nothing about the mechanism is bursty; the funding is.
 
 **Sixty-second windows can never be traded.** `requiredSlack()` floors at 90 seconds, which exceeds
 the whole window. A desk may allow the cadence and will refuse every one of those windows with
 `WindowTooShort`. Documented, not masked.
 
-**Testnet only, unaudited.** Shannon, chain 50312, faucet tUSDC. Neither these contracts nor the
-DreamDEX binary contracts underneath them have been audited — the published Hacken audit covered the
-spot venue only. Two of the seven contracts are unverified bytecode on the explorer at the time of
-writing; see [section 1](#1-the-addresses).
+**Testnet only, unaudited.** Shannon, chain 50312, faucet tUSDC. All seven contracts are
+source-verified on the explorer, which is not an audit and is not offered as one. Neither these
+contracts nor the DreamDEX binary contracts underneath them have been audited — the published Hacken
+audit covered the spot venue only.
 
 ---
 
-## 10. Reproduce it yourself
+## 12. Reproduce it yourself
 
 No wallet, no key, no funds. Node 20+ and Foundry.
 
 ### The on-chain audit
 
 ```bash
-DESK=0xd44B2e952a29409eAfb940e42c7D2C20BA746faC bash contracts/verify-onchain.sh
+DESK=0x3ffbB71aec0D5459677021Ad888195042eDA4AA2 bash contracts/verify-onchain.sh
 ```
 
 `deployed.json` records two desks rather than a single `demoDesk`, so pass `DESK=`; without it the
@@ -489,23 +714,19 @@ is reacting right now, its wiring matches `deployed.json`, the desk is registere
 mandate is printed in words, the brain's quote is re-derived from the platform's own deposit
 function, the failover watcher's status, and our own venue's resolution through the indexer.
 
-Observed at 2026-09-06 23:00 UTC, head block 481 622 119:
+Observed at 2026-09-07 05:00 UTC, head block 481 841 032:
 
 ```
-40 checks: 37 passed, 3 failed, 0 skipped
-NOT OK — see the FAIL/SKIP lines above.
+40 checks: 40 passed, 0 failed, 0 skipped
+OK — every claim was checked against the chain and held.
 ```
 
-The three failures are the funding exhaustion documented in [section 9](#9-honest-limits), and the
-script is doing exactly what it should by refusing to call them anything else:
-
-- `router balance — 31.200088 SOMI held, floor is 32 SOMI (-0.799912)`
-- `SettlementScheduled — 0 logs in the last 5700 blocks` (no keeper attached, no desk positions open)
-- `router.keeper() = zero — the keeper is detached`
-
-`MarketSeen` in the same run: **24 logs, newest 110 blocks ago.** The reactivity loop is alive; only
-the spending is stopped. A skip counts as a failure in the exit code on purpose — a green line for
-something nobody looked at is worse than a red one.
+A skip counts as a failure in the exit code on purpose — a green line for something nobody looked at
+is worse than a red one. An earlier version of this page recorded 37 passed and 3 failed: the router
+was below the 32 SOMI floor, no settlement had been scheduled, and `router.keeper()` read zero. The
+router has since been topped up and the keeper has since been attached — what that attachment has and
+has not achieved is in [section 11](#11-honest-limits) — and the script, not this paragraph, is the
+authority on whether it stays that way.
 
 ### The test suite
 
@@ -514,12 +735,16 @@ bash contracts/setup.sh          # forge install: forge-std + OpenZeppelin v5.4.
 cd contracts && forge test
 ```
 
-Observed at 2026-09-06 22:45 UTC: **391 passed, 0 failed, 0 skipped, across 14 suites.** No network,
+Observed at 2026-09-07 04:35 UTC: **402 passed, 0 failed, 0 skipped, across 14 suites.** No network,
 no key. The counts move as tests are added; the line that has to hold is `0 failed`. Per suite:
-`PolicyLibTest` 85 · `LucidRouterTest` 77 · `LucidBrainStageTest` 49 · `LucidDeskTest` 38 ·
+`PolicyLibTest` 85 · `LucidRouterTest` 77 · `LucidBrainStageTest` 49 · `LucidDeskTest` 49 ·
 `LucidSeriesTest` 33 · `LucidBrainTest` 21 · `LucidRelayTest` 19 · `PromptLibTest` 15 ·
 `LucidFactoryTest` 14 · `LucidKeeperTest` 13 · `PolicyLibInvariantTest` 11 · `MarketDecoderTest` 7 ·
 `LucidDeskArmSyncTest` 5 · `TypesTest` 4.
+
+Eleven of those are new since the escrow defect in [section 5](#5-the-defect-the-desks-found-live):
+`LucidDeskTest` went from 38 to 49, covering the cancel-before-redeem order, a cancel that reverts,
+and a taker order that ended up resting.
 
 `PolicyLibInvariantTest` is an invariant campaign with `fail_on_revert = true` and a pinned seed;
 each of its 11 invariants ran 128 campaigns of 32 768 calls with **0 reverts**, and the handler
@@ -544,8 +769,8 @@ cd kit && npm install && npm run build
 npx lucid status                                              # addresses, router balance vs the 32 SOMI floor
 npx lucid subs 0x6aE21a20444141552648C1f8443bAf171BCCcB99     # decode the subscription into English
 npx lucid markets                                             # live windows a desk could still enter
-npx lucid desk status 0xd44B2e952a29409eAfb940e42c7D2C20BA746faC
+npx lucid desk status 0x3ffbB71aec0D5459677021Ad888195042eDA4AA2
 ```
 
-`lucid subs` is the shortest path to the point of [section 6](#6-there-is-no-server): it turns four
+`lucid subs` is the shortest path to the point of [section 8](#8-there-is-no-server): it turns four
 opaque topics and a selector into a sentence naming the emitter, the handler and the gas limit.

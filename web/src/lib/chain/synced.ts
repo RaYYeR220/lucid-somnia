@@ -6,11 +6,11 @@
 export const deployed = {
   chainId: 50312,
   /** ERC-1167 master copy every user desk is cloned from. Never call it directly. */
-  deskImplementation: '0xc54d0BaA3310F77a164D17Fe10f32a567793489E',
+  deskImplementation: '0xa659b03e2349559f2d56D17F246e66e79467c17e',
   brain: '0x0c640E3aFc627bEec7eDB9985696e12B50AdAd25',
   /** Sole owner of every reactivity subscription; must hold >= 32 SOMI to keep them alive. */
   router: '0x6aE21a20444141552648C1f8443bAf171BCCcB99',
-  factory: '0xF82cC4219F6c7fe816155A8c3F0C9C3B1cc320eA',
+  factory: '0x9c1EF0C429f1F88e8247f3539DeF8a1f8FCCEb84',
   keeper: '0x4757599dC9A5a089270373a66BEeeD6592788707',
   relay: '0xd9Eee9BE420E2CD777E55d890a940a637ed0bB7A',
   series: '0x747fF3a7A6FE4912c96dCe7faA711dCB6fbd1CE4',
@@ -25,7 +25,7 @@ export const deployed = {
    * pre-render. The deploy script names them by strategy and the set changes between
    * deployments, so they are collected by shape rather than by a fixed key.
    */
-  seedDesks: ['0x86D170169cde0b5ab4bb3B360E930625aBA849ea', '0xd44B2e952a29409eAfb940e42c7D2C20BA746faC'] as readonly string[],
+  seedDesks: ['0x822548990ce81b626a3c3684B0c85f2fd9EC9Fa7', '0x3ffbB71aec0D5459677021Ad888195042eDA4AA2'] as readonly string[],
 } as const
 
 export const routerAbi = [
@@ -160,6 +160,7 @@ export const deskAbi = [
   {"type":"function","name":"owner","inputs":[],"outputs":[{"name":"","type":"address"}],"stateMutability":"view"},
   {"type":"function","name":"policy","inputs":[],"outputs":[{"name":"","type":"tuple","components":[{"name":"maxStakePerWindow","type":"uint64"},{"name":"dailyBudget","type":"uint64"},{"name":"maxOpenMarkets","type":"uint16"},{"name":"maxDrawdownBps","type":"uint16"},{"name":"maxConsecutiveLosses","type":"uint8"},{"name":"minEdgeBps","type":"uint16"},{"name":"allowedAssets","type":"uint32"},{"name":"allowedCadences","type":"uint32"},{"name":"strategy","type":"uint8"},{"name":"armed","type":"bool"}]}],"stateMutability":"view"},
   {"type":"function","name":"preCheck","inputs":[{"name":"m","type":"tuple","components":[{"name":"marketId","type":"bytes32"},{"name":"market","type":"address"},{"name":"pool","type":"address"},{"name":"operatorId","type":"uint32"},{"name":"venueId","type":"bytes32"},{"name":"yesId","type":"uint256"},{"name":"noId","type":"uint256"},{"name":"tradingStart","type":"uint64"},{"name":"expiry","type":"uint64"},{"name":"nonce","type":"uint64"},{"name":"strike","type":"uint256"},{"name":"assetKey","type":"bytes32"},{"name":"intervalSec","type":"uint32"}]}],"outputs":[{"name":"","type":"bool"}],"stateMutability":"view"},
+  {"type":"function","name":"restingOrders","inputs":[{"name":"marketId","type":"bytes32"}],"outputs":[{"name":"","type":"uint128[2]"}],"stateMutability":"view"},
   {"type":"function","name":"router","inputs":[],"outputs":[{"name":"","type":"address"}],"stateMutability":"view"},
   {"type":"function","name":"setPolicy","inputs":[{"name":"p","type":"tuple","components":[{"name":"maxStakePerWindow","type":"uint64"},{"name":"dailyBudget","type":"uint64"},{"name":"maxOpenMarkets","type":"uint16"},{"name":"maxDrawdownBps","type":"uint16"},{"name":"maxConsecutiveLosses","type":"uint8"},{"name":"minEdgeBps","type":"uint16"},{"name":"allowedAssets","type":"uint32"},{"name":"allowedCadences","type":"uint32"},{"name":"strategy","type":"uint8"},{"name":"armed","type":"bool"}]}],"outputs":[],"stateMutability":"nonpayable"},
   {"type":"function","name":"state","inputs":[],"outputs":[{"name":"","type":"tuple","components":[{"name":"dayKey","type":"uint64"},{"name":"spentToday","type":"uint64"},{"name":"highWaterMark","type":"uint64"},{"name":"openMarkets","type":"uint16"},{"name":"consecutiveLosses","type":"uint8"}]}],"stateMutability":"view"},
@@ -167,6 +168,7 @@ export const deskAbi = [
   {"type":"event","name":"ArmedSet","inputs":[{"name":"on","type":"bool","indexed":false}],"anonymous":false},
   {"type":"event","name":"Considered","inputs":[{"name":"marketId","type":"bytes32","indexed":true},{"name":"intervalSec","type":"uint32","indexed":false},{"name":"assetKey","type":"bytes32","indexed":false}],"anonymous":false},
   {"type":"event","name":"Executed","inputs":[{"name":"marketId","type":"bytes32","indexed":true},{"name":"kind","type":"uint8","indexed":false},{"name":"price","type":"uint256","indexed":false},{"name":"quantity","type":"uint256","indexed":false},{"name":"orderId","type":"uint128","indexed":false}],"anonymous":false},
+  {"type":"event","name":"OrdersCancelled","inputs":[{"name":"marketId","type":"bytes32","indexed":true},{"name":"count","type":"uint256","indexed":false}],"anonymous":false},
   {"type":"event","name":"PolicySet","inputs":[{"name":"policy","type":"tuple","indexed":false,"components":[{"name":"maxStakePerWindow","type":"uint64"},{"name":"dailyBudget","type":"uint64"},{"name":"maxOpenMarkets","type":"uint16"},{"name":"maxDrawdownBps","type":"uint16"},{"name":"maxConsecutiveLosses","type":"uint8"},{"name":"minEdgeBps","type":"uint16"},{"name":"allowedAssets","type":"uint32"},{"name":"allowedCadences","type":"uint32"},{"name":"strategy","type":"uint8"},{"name":"armed","type":"bool"}]}],"anonymous":false},
   {"type":"event","name":"Refused","inputs":[{"name":"marketId","type":"bytes32","indexed":true},{"name":"reason","type":"uint8","indexed":false},{"name":"probUpBps","type":"uint16","indexed":false},{"name":"pBookBps","type":"uint16","indexed":false}],"anonymous":false},
   {"type":"event","name":"Settled","inputs":[{"name":"marketId","type":"bytes32","indexed":true},{"name":"pnl","type":"int256","indexed":false},{"name":"equityAfter","type":"uint256","indexed":false}],"anonymous":false},
