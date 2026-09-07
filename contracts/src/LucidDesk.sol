@@ -62,6 +62,13 @@ contract LucidDesk is ILucidDesk {
     event Refused(bytes32 indexed marketId, LucidTypes.Refusal reason, uint16 probUpBps, uint16 pBookBps);
     /// @notice A window closed, was redeemed, and the result was booked.
     event Settled(bytes32 indexed marketId, int256 pnl, uint256 equityAfter);
+    /// @notice Resting legs this desk actually pulled back out of the venue before redeeming.
+    /// @dev Only emitted when `count` is non-zero, which is the whole point of the log: the venue
+    /// is allowed to have taken a leg away already — filled, expired, or swept by its own
+    /// `cancelExpiredOrders` — and a settlement with no `OrdersCancelled` beside it is a
+    /// settlement where nothing came back. Absence and a count are the two readable states; a
+    /// zero on every settled window would only be noise.
+    event OrdersCancelled(bytes32 indexed marketId, uint256 count);
     /// @notice The owner turned the desk on or off.
     event ArmedSet(bool on);
     /// @notice The owner replaced the mandate.
@@ -80,6 +87,15 @@ contract LucidDesk is ILucidDesk {
 
     /// @dev `expireTimestampNs` is in NANOseconds. Passing seconds reverts `OrderAlreadyExpired`.
     uint64 internal constant NS_PER_SEC = 1e9;
+
+    /// @dev How many venue order ids one window can have on file. A `Maker` rests exactly two —
+    /// one leg each side of the set it minted — and the taker path leaves at most one, so two
+    /// slots hold every order this contract can have outstanding on a single window.
+    ///
+    /// Deliberately a fixed array rather than a list. This record is written and walked inside a
+    /// gas-metered handler that fans out to every armed desk in the block, and an unbounded list
+    /// would let one window's history decide whether every other desk in that block gets its turn.
+    uint256 internal constant MAX_RESTING = 2;
 
     // -- storage ---------------------------------------------------------------
 
@@ -112,6 +128,11 @@ contract LucidDesk is ILucidDesk {
 
     /// @notice What this desk holds per market window.
     mapping(bytes32 => Holding) public held;
+
+    /// @dev Venue order ids this desk still has on file per window, zero-padded. Zero is never a
+    /// live id — the venue numbers orders from one, and `_place` reports a rejection as id zero —
+    /// so it doubles as the empty slot. Read through `restingOrders`.
+    mapping(bytes32 => uint128[MAX_RESTING]) internal _restingOrders;
 
     // -- modifiers -------------------------------------------------------------
 
@@ -177,6 +198,16 @@ contract LucidDesk is ILucidDesk {
     /// @notice Free collateral plus whatever is committed to open windows, at cost.
     function equity() external view returns (uint256) {
         return _equity();
+    }
+
+    /// @notice The venue order ids this desk has on file for one window.
+    /// @dev An id here is an order the desk placed and the venue accepted; whether it is still
+    /// resting is the venue's business, not this contract's. Settlement cancels every non-zero
+    /// slot and tolerates each failure, so a stale id costs a try/catch and nothing else.
+    /// @param marketId The window.
+    /// @return The recorded ids, zero-padded to `MAX_RESTING`.
+    function restingOrders(bytes32 marketId) external view returns (uint128[MAX_RESTING] memory) {
+        return _restingOrders[marketId];
     }
 
     // -- owner controls --------------------------------------------------------
@@ -370,8 +401,11 @@ contract LucidDesk is ILucidDesk {
         _take(m, kind, sized, v.probUpBps, pBookBps);
     }
 
-    /// @notice Close out one settled window: finalize it if nobody has, redeem what pays, and
-    /// book the result. Never reverts.
+    /// @notice Close out one settled window: finalize it if nobody has, pull this desk's own
+    /// resting legs back out of the venue, redeem what pays, and book the result. Never reverts.
+    /// @dev The cancel comes first and it is not housekeeping — see `_cancelResting`. A resting
+    /// order escrows its leg, so a settlement that skipped it redeemed a balance of zero and
+    /// booked the whole mint as a loss.
     /// @param m The window that has expired.
     function onSettlement(LucidTypes.MarketInfo calldata m) external onlyRouter {
         Holding memory h = held[m.marketId];
@@ -380,6 +414,15 @@ contract LucidDesk is ILucidDesk {
         // Finalizing is permissionless and idempotent-by-failure: somebody else getting there
         // first is the expected case on a busy venue, not an error.
         try IBinaryModule(LucidTypes.MODULE).finalizeMarket(m.marketId) {} catch {}
+
+        // Snapshotted BEFORE the cancels, so anything a cancel hands back is measured as arriving
+        // during this settlement. A maker's legs come back as outcome tokens and move no
+        // collateral here, but a resting BUY would come back as collateral that `h.cost` already
+        // charged; reading the balance after the cancels would fold that refund into the opening
+        // figure and book it a second time as a loss.
+        uint256 before = _free();
+
+        _cancelResting(m.marketId, m.pool);
 
         uint256[] memory nums;
         try IBinaryMarket(m.market).payoutNumerators() returns (uint256[] memory n) {
@@ -398,7 +441,6 @@ contract LucidDesk is ILucidDesk {
         // walk the desk into its own loss-streak halt on the back of someone else's outage.
         if (nums[0] == 0 && nums[1] == 0) return;
 
-        uint256 before = _free();
         // The winner is the argmax of the payout vector, but a VOIDED window pays both legs half,
         // so the test that matters per leg is a non-zero numerator rather than equality with the
         // argmax. A zero-payout leg is skipped: it would pay nothing, and the gas is metered
@@ -414,6 +456,7 @@ contract LucidDesk is ILucidDesk {
         int256 pnl = int256(_free()) - int256(before) - int256(uint256(h.cost));
 
         delete held[m.marketId];
+        delete _restingOrders[m.marketId];
         openNotional = openNotional > h.cost ? openNotional - h.cost : 0;
         if (_state.openMarkets != 0) _state.openMarkets -= 1;
 
@@ -453,6 +496,10 @@ contract LucidDesk is ILucidDesk {
         // `VenueRejected` claims; the book failures above carry their own reasons.
         if (!placed) return _refuse(m.marketId, LucidTypes.Refusal.VenueRejected, pAi, pBook);
 
+        // An IOC order is meant to fill or die, but the venue is the one that decides: an order
+        // the desk never sees rest is still an order the desk has to be able to name at
+        // settlement, and an id nobody can name is escrow nobody gets back.
+        _recordOrder(m.marketId, id);
         _book(m.marketId, _spentSince(before), stake);
         emit Executed(m.marketId, kind, price, quantity, id);
     }
@@ -576,6 +623,7 @@ contract LucidDesk is ILucidDesk {
         (bool placed, uint128 id) =
             _place(m.pool, kind, price, quantity, m.expiry, LucidTypes.ORDER_POST_ONLY);
         if (placed) {
+            _recordOrder(m.marketId, id);
             emit Executed(m.marketId, kind, price, quantity, id);
         } else {
             // A priced, sized leg the venue turned down — `PostOnlyWouldCross` is the usual one.
@@ -604,6 +652,62 @@ contract LucidDesk is ILucidDesk {
         } catch {
             return (false, 0);
         }
+    }
+
+    /// @dev Put one accepted order id on file for its window, so settlement can name it again.
+    ///
+    /// A rejected order carries id zero and is not worth a slot. When both slots are already
+    /// taken the id is dropped rather than written: this contract places at most two orders per
+    /// open window, so the branch is unreachable from its own paths, and it exists because the
+    /// alternative — an out-of-range write — reverts, and a revert here would strand every other
+    /// desk sharing the handler for the sake of an order that was never supposed to exist.
+    function _recordOrder(bytes32 marketId, uint128 id) private {
+        if (id == 0) return;
+
+        uint128[MAX_RESTING] storage ids = _restingOrders[marketId];
+        for (uint256 i; i < MAX_RESTING; ++i) {
+            if (ids[i] == 0) {
+                ids[i] = id;
+                return;
+            }
+        }
+    }
+
+    /// @dev Pull this desk's own resting legs back out of the venue, before anything measures what
+    /// the window paid.
+    ///
+    /// Resting an order ESCROWS it. The 6909 legs leave the desk the moment the venue accepts the
+    /// order and sit with the pool until the order fills, expires or is cancelled. A settlement
+    /// that redeemed without cancelling therefore looked at a balance of zero on both legs,
+    /// redeemed nothing, measured a collateral delta of zero, and booked `pnl = 0 - 0 - cost` —
+    /// the entire mint — as a loss on a window the desk had called correctly. Four consecutive
+    /// live windows were written off that way, and the settlement receipts said so plainly: two
+    /// logs from the desk, none from the module and none from the outcome token.
+    ///
+    /// The fix is the cancel, not arithmetic. Nothing here compensates for the escrow by adding it
+    /// back on paper: P&L stays MEASURED from the collateral that actually arrived, and this is
+    /// what puts the legs where they have to be for any of it to arrive.
+    ///
+    /// Every failure is swallowed on purpose. A cancel legitimately fails when the order already
+    /// filled, already expired, or was swept by the venue's own `cancelExpiredOrders`, and none of
+    /// those is an error — nor a reason to skip the other leg's cancel or the redemption behind it.
+    function _cancelResting(bytes32 marketId, address pool) private {
+        // Not belt-and-braces: Solidity emits an `extcodesize` guard for a typed external call and
+        // that guard reverts OUTSIDE the try/catch, so `try` alone does not survive a pool address
+        // with no code behind it — a recycled or unset pool would take the whole handler down.
+        if (pool.code.length == 0) return;
+
+        uint128[MAX_RESTING] storage ids = _restingOrders[marketId];
+        uint256 cancelled;
+        for (uint256 i; i < MAX_RESTING; ++i) {
+            uint128 id = ids[i];
+            if (id == 0) continue;
+            try IBinaryPool(pool).cancelOrder(id) {
+                cancelled += 1;
+            } catch {}
+        }
+
+        if (cancelled != 0) emit OrdersCancelled(marketId, cancelled);
     }
 
     /// @dev Grant the venue everything it will ever need on this pool, once.

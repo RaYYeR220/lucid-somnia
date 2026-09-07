@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, Vm} from "forge-std/Test.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 
+import {IBinaryPool} from "../src/interfaces/IDreamDex.sol";
 import {LucidDesk} from "../src/LucidDesk.sol";
 import {LucidTypes} from "../src/types/LucidTypes.sol";
 
@@ -24,8 +25,12 @@ contract LucidDeskTest is Test {
     event Executed(bytes32 indexed marketId, uint8 kind, uint256 price, uint256 quantity, uint128 orderId);
     event Refused(bytes32 indexed marketId, LucidTypes.Refusal reason, uint16 probUpBps, uint16 pBookBps);
     event Settled(bytes32 indexed marketId, int256 pnl, uint256 equityAfter);
+    event OrdersCancelled(bytes32 indexed marketId, uint256 count);
     event ArmedSet(bool on);
     event PolicySet(LucidTypes.Policy policy);
+
+    /// @notice A settlement that booked no result at all, which no test here expects.
+    error NoSettlementLogged();
 
     LucidDesk internal implementation;
     LucidDesk internal desk;
@@ -498,10 +503,21 @@ contract LucidDeskTest is Test {
         assertEq(no.price, 580_000, "the NO quote, converted to the YES side the venue wants");
         assertEq(no.quantity, 50e6);
 
-        assertEq(outcome.balanceOf(address(desk), YES_ID), 50e6);
-        assertEq(outcome.balanceOf(address(desk), NO_ID), 50e6);
+        // Resting is not free: both legs are escrowed by the venue for as long as the quotes are
+        // on the book, so the desk holds none of what it just minted. This assertion used to read
+        // 50e6 on both lines, because the pool mock left the balance alone — and a desk that
+        // redeemed without cancelling looked healthy right up until it did it on chain.
+        assertEq(outcome.balanceOf(address(desk), YES_ID), 0, "a resting quote escrows its leg");
+        assertEq(outcome.balanceOf(address(desk), NO_ID), 0, "both of them");
+        assertEq(outcome.balanceOf(address(pool), YES_ID), 50e6, "the venue is holding the YES leg");
+        assertEq(outcome.balanceOf(address(pool), NO_ID), 50e6, "and the NO leg");
         assertEq(desk.state().spentToday, 50e6);
         assertEq(desk.state().openMarkets, 1);
+
+        // And the desk can name both of them again, which is the only way to get them back.
+        uint128[2] memory ids = desk.restingOrders(MARKET_A);
+        assertEq(ids[0], pool.orderIdAt(0));
+        assertEq(ids[1], pool.orderIdAt(1));
     }
 
     function test_maker_survives_one_leg_being_rejected() public {
@@ -599,8 +615,9 @@ contract LucidDeskTest is Test {
         assertEq(no.price, 580_000, "the NO quote, converted to the YES side the venue wants");
         assertEq(no.quantity, 50e6);
 
-        assertEq(outcome.balanceOf(address(desk), YES_ID), 50e6);
-        assertEq(outcome.balanceOf(address(desk), NO_ID), 50e6);
+        // Escrowed, not held: see `test_maker_mints_a_set_and_rests_both_legs`.
+        assertEq(outcome.balanceOf(address(pool), YES_ID), 50e6);
+        assertEq(outcome.balanceOf(address(pool), NO_ID), 50e6);
         assertEq(desk.state().spentToday, 50e6, "the mandate is the size");
         assertEq(desk.state().openMarkets, 1);
 
@@ -816,6 +833,228 @@ contract LucidDeskTest is Test {
         assertEq(module.redeemCount(), 1, "an already-finalized window must still redeem");
         assertEq(module.redeemAt(0).amount, shares);
         assertEq(desk.state().openMarkets, 0);
+    }
+
+    // -- getting the legs back before measuring what they paid ------------------
+    //
+    // A resting order ESCROWS. The moment the venue accepts a quote the outcome legs leave the
+    // desk, and they stay gone until the order fills, expires or is cancelled. A settlement that
+    // went straight to `redeem` therefore found a balance of zero on both legs, redeemed nothing,
+    // measured a collateral delta of zero, and booked `pnl = 0 - 0 - cost`: the entire mint,
+    // written off on a window the desk had called correctly. It happened four windows running on
+    // chain, and the receipts carried two logs from the desk, none from the module, none from the
+    // outcome token. The cancel is what puts something back to measure.
+
+    /// The ordering is the property, not the pair of calls. A desk that redeemed first would be
+    /// redeeming legs it does not hold, which is precisely the bug — so each cancel is checked
+    /// against how far the settlement had already got when it arrived.
+    function test_a_settling_maker_cancels_both_legs_before_it_redeems_anything() public {
+        vm.prank(owner);
+        desk.setPolicy(_makerPolicy());
+
+        _drive(MARKET_A, 6000, 5000);
+
+        uint128[2] memory ids = desk.restingOrders(MARKET_A);
+        assertTrue(ids[0] != 0 && ids[1] != 0, "both legs rested, so both ids are on file");
+        assertEq(outcome.balanceOf(address(desk), YES_ID), 0, "and the venue is holding both");
+        assertEq(outcome.balanceOf(address(desk), NO_ID), 0);
+
+        // Resolved UP, so the YES leg pays in full.
+        _settleSetup(1, 0, LucidTypes.BPS, 0);
+
+        vm.expectEmit(true, false, false, true, address(desk));
+        emit OrdersCancelled(MARKET_A, 2);
+
+        vm.prank(router);
+        desk.onSettlement(_info(MARKET_A));
+
+        assertEq(pool.cancelledCount(), 2, "both legs pulled back off the book");
+        assertEq(pool.cancelledAt(0), ids[0]);
+        assertEq(pool.cancelledAt(1), ids[1]);
+        assertEq(pool.redemptionsBeforeCancelAt(0), 0, "the first cancel ran before any redeem");
+        assertEq(pool.redemptionsBeforeCancelAt(1), 0, "and so did the second");
+
+        // The consequence of that ordering, in money: a redemption for the whole leg is only
+        // possible because the leg was back in the desk when `redeem` read the balance.
+        assertEq(module.redeemCount(), 1, "only the paying leg is worth the gas");
+        assertEq(module.redeemAt(0).outcomeIdx, 0);
+        assertEq(module.redeemAt(0).amount, 50e6, "the leg it got back, in full");
+        assertEq(outcome.balanceOf(address(desk), NO_ID), 50e6, "the worthless leg came back too");
+        assertEq(desk.equity(), FUNDING, "a complete set costs ONE and pays ONE");
+        assertEq(desk.state().consecutiveLosses, 0, "and a flat window is not a loss");
+    }
+
+    /// A cancel is allowed to fail. The venue sweeps its own expired orders, and after a sweep the
+    /// escrow is already home while the id is already dead — so the desk's cancel can only revert.
+    /// That is an ordinary Tuesday, not a reason to abandon the other leg or the redemption.
+    function test_a_cancel_that_reverts_does_not_stop_the_settlement() public {
+        vm.prank(owner);
+        desk.setPolicy(_makerPolicy());
+
+        _drive(MARKET_A, 6000, 5000);
+        uint128[2] memory ids = desk.restingOrders(MARKET_A);
+
+        pool.sweepExpired(ids[0]);
+        assertEq(outcome.balanceOf(address(desk), YES_ID), 50e6, "the sweep already sent it home");
+
+        _settleSetup(1, 0, LucidTypes.BPS, 0);
+
+        // Attempted and swallowed: the call is made, it reverts, and the walk carries on.
+        vm.expectCall(address(pool), abi.encodeCall(IBinaryPool.cancelOrder, (ids[0])));
+        vm.expectEmit(true, false, false, true, address(desk));
+        emit OrdersCancelled(MARKET_A, 1);
+
+        vm.prank(router);
+        desk.onSettlement(_info(MARKET_A));
+
+        assertEq(pool.cancelledCount(), 1, "only the leg the venue had not already taken");
+        assertEq(pool.cancelledAt(0), ids[1], "and it is the other one");
+        assertEq(module.redeemCount(), 1, "the redemption happened regardless");
+        assertEq(module.redeemAt(0).amount, 50e6);
+        assertEq(desk.state().openMarkets, 0, "and the window closed");
+        assertEq(desk.equity(), FUNDING);
+    }
+
+    /// Half the quote traded. Those legs are somebody else's now and no cancel brings them back,
+    /// so the settlement has to redeem what the desk holds rather than what it minted.
+    function test_a_filled_leg_settles_on_what_the_desk_actually_holds() public {
+        vm.prank(owner);
+        desk.setPolicy(_makerPolicy());
+
+        _drive(MARKET_A, 6000, 5000);
+        uint128[2] memory ids = desk.restingOrders(MARKET_A);
+
+        // Somebody lifted the YES quote at 0.62.
+        pool.fillResting(ids[0]);
+        uint256 proceeds = 50e6 * 620_000 / LucidTypes.ONE;
+        assertEq(usdc.balanceOf(address(desk)), FUNDING - 50e6 + proceeds, "the fill paid the desk");
+        assertEq(outcome.balanceOf(address(desk), YES_ID), 0, "and took the legs it was paid for");
+
+        // Resolved DOWN, so the NO leg — the one still on the book — is the one that pays.
+        _settleSetup(0, 1, 0, LucidTypes.BPS);
+
+        vm.prank(router);
+        desk.onSettlement(_info(MARKET_A));
+
+        assertEq(pool.cancelledCount(), 1, "a sold leg cannot be cancelled back");
+        assertEq(pool.cancelledAt(0), ids[1]);
+        assertEq(module.redeemCount(), 1, "so only the leg the desk still holds is redeemed");
+        assertEq(module.redeemAt(0).outcomeIdx, 1);
+        assertEq(module.redeemAt(0).amount, 50e6);
+        assertEq(desk.equity(), FUNDING + proceeds, "the spread it sold is the profit it keeps");
+        assertEq(desk.state().openMarkets, 0);
+    }
+
+    /// The taker path leaves at most one order behind, and it escrows COLLATERAL rather than legs:
+    /// an IOC that found no counterparty is money sitting with the venue under an id only this
+    /// desk knows. Uncancelled it is the same total write-off, in the other asset.
+    function test_a_taker_order_that_rested_is_cancelled_too() public {
+        pool.setTakerOrdersRest(true);
+
+        _drive(MARKET_A, 8800, 5000);
+
+        uint128[2] memory ids = desk.restingOrders(MARKET_A);
+        assertTrue(ids[0] != 0, "the taker leg is on file");
+        assertEq(ids[1], 0, "and it is the only one a taker can leave");
+
+        uint256 escrowed = FUNDING - usdc.balanceOf(address(desk));
+        assertGt(escrowed, 0, "the venue is holding collateral against it");
+        assertEq(outcome.balanceOf(address(desk), YES_ID), 0, "and the desk has no contracts at all");
+
+        _settleSetup(1, 0, LucidTypes.BPS, 0);
+
+        vm.expectEmit(true, false, false, true, address(desk));
+        emit OrdersCancelled(MARKET_A, 1);
+        vm.expectEmit(true, false, false, true, address(desk));
+        emit Settled(MARKET_A, 0, FUNDING);
+
+        vm.prank(router);
+        desk.onSettlement(_info(MARKET_A));
+
+        assertEq(pool.cancelledCount(), 1);
+        assertEq(pool.cancelledAt(0), ids[0]);
+        assertEq(module.redeemCount(), 0, "there was nothing to redeem, only escrow to reclaim");
+        assertEq(desk.equity(), FUNDING, "an order that never filled costs nothing");
+        assertEq(desk.state().consecutiveLosses, 0, "and must not count against the risk halt");
+    }
+
+    /// Pools are recycled and a `MarketInfo` can name one that is gone. Solidity emits an
+    /// `extcodesize` guard for a typed external call and that guard reverts OUTSIDE the try/catch,
+    /// so `try` alone would take down a handler shared with every other armed desk in the block.
+    function test_a_pool_with_no_code_does_not_escape_the_catch() public {
+        vm.prank(owner);
+        desk.setPolicy(_makerPolicy());
+
+        _drive(MARKET_A, 6000, 5000);
+        assertTrue(desk.restingOrders(MARKET_A)[0] != 0, "an id is on file, so the loop reaches the call");
+
+        _settleSetup(1, 0, LucidTypes.BPS, 0);
+
+        LucidTypes.MarketInfo memory m = _info(MARKET_A);
+        m.pool = address(0xDEAD);
+        assertEq(m.pool.code.length, 0, "nothing behind the address the window names");
+
+        vm.prank(router);
+        desk.onSettlement(m);
+
+        assertEq(pool.cancelledCount(), 0, "nothing was cancelled, and nothing reverted either");
+        assertEq(desk.state().openMarkets, 0, "the settlement still finished");
+    }
+
+    /// The live window, reproduced to the unit. A `Maker` under a 5 tUSDC mandate mints a complete
+    /// set and rests both legs — `kind=1 price=20000 qty=5000000` and `kind=3 price=1000
+    /// qty=5000000`, exactly what the chain recorded — and then the window settles.
+    ///
+    /// Four consecutive settlements booked `pnl = -5.000000`, the whole mint, and walked desk
+    /// equity down 5000 → 4995 → 4990 → 4985 → 4980 while the committee was reading the market
+    /// correctly. A complete set costs ONE and pays ONE: a quoted window nobody hit is flat, and
+    /// the only thing standing between flat and a burned stake is getting the legs back first.
+    function test_a_settled_maker_books_the_outcome_not_the_whole_mint() public {
+        LucidTypes.Policy memory p = _makerPolicy();
+        p.maxStakePerWindow = 5e6;
+        vm.prank(owner);
+        desk.setPolicy(p);
+
+        // The committee said 0% UP, which is the verdict behind those two prices.
+        _driveNoBook(MARKET_A, 0);
+
+        assertEq(pool.orderAt(0).kind, LucidTypes.SELL_YES);
+        assertEq(pool.orderAt(0).price, 20_000);
+        assertEq(pool.orderAt(0).quantity, 5e6);
+        assertEq(pool.orderAt(1).kind, LucidTypes.SELL_NO);
+        assertEq(pool.orderAt(1).price, 1000);
+        assertEq(pool.orderAt(1).quantity, 5e6);
+
+        uint256 cost = FUNDING - usdc.balanceOf(address(desk));
+        assertEq(cost, 5e6, "the mint, which is the number that used to be written off");
+
+        // The window resolved DOWN. The desk was never wrong about the market.
+        _settleSetup(0, 1, 0, LucidTypes.BPS);
+
+        vm.recordLogs();
+        vm.prank(router);
+        desk.onSettlement(_info(MARKET_A));
+
+        int256 pnl = _settledPnl(vm.getRecordedLogs());
+        // casting to 'int256' is safe because `cost` is a 6-decimal collateral balance.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        assertNotEq(pnl, -int256(cost), "the live bug: the entire stake booked as a loss");
+        assertEq(pnl, 0, "a set costs ONE and pays ONE, so an unhit quote settles flat");
+        assertEq(desk.equity(), FUNDING, "and every unit of the desk's money is still there");
+        assertEq(desk.state().consecutiveLosses, 0, "so it never walks into its own risk halt");
+    }
+
+    /// @dev The pnl the desk actually published, read back out of its own `Settled` log rather
+    /// than recomputed here: the number in the log is the number the operator saw go wrong.
+    function _settledPnl(Vm.Log[] memory logs) internal pure returns (int256) {
+        bytes32 topic = keccak256("Settled(bytes32,int256,uint256)");
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].topics.length != 0 && logs[i].topics[0] == topic) {
+                (int256 pnl,) = abi.decode(logs[i].data, (int256, uint256));
+                return pnl;
+            }
+        }
+        revert NoSettlementLogged();
     }
 
     // -- the property that protects every other desk in the fan-out ------------
