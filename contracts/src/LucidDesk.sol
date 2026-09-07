@@ -48,6 +48,12 @@ contract LucidDesk is ILucidDesk {
     /// @notice An order actually reached the venue and the venue accepted it.
     event Executed(bytes32 indexed marketId, uint8 kind, uint256 price, uint256 quantity, uint128 orderId);
     /// @notice The desk declined to trade, and exactly why.
+    /// @dev `reason` names the component that actually failed, because a refusal that cannot be
+    /// diagnosed from its own log line gets diagnosed by guesswork instead. The four venue-side
+    /// reasons are deliberately distinct: `BookUnreadable` means the pool would not describe its
+    /// book, `Unquotable` means no ordered pair of legs fits inside the venue's price range,
+    /// `MintFailed` means `mintSet` reverted, and `VenueRejected` means the venue was shown a
+    /// complete order and refused it.
     /// @dev `pBookBps` is the book value this desk actually saw. When no side of the book quoted it
     /// carries the sentinel `LucidTypes.BOOK_UNOBSERVED` (65535, outside the 0..10000 probability
     /// range) rather than a stand-in probability, so a reader can tell "there was no book" apart
@@ -443,6 +449,8 @@ contract LucidDesk is ILucidDesk {
 
         uint256 before = _free();
         (bool placed, uint128 id) = _place(m.pool, kind, price, quantity, m.expiry, LucidTypes.ORDER_MARKET);
+        // The venue saw a fully described order and said no. That is the only thing
+        // `VenueRejected` claims; the book failures above carry their own reasons.
         if (!placed) return _refuse(m.marketId, LucidTypes.Refusal.VenueRejected, pAi, pBook);
 
         _book(m.marketId, _spentSince(before), stake);
@@ -458,11 +466,13 @@ contract LucidDesk is ILucidDesk {
         view
         returns (LucidTypes.Refusal, uint256, uint256)
     {
+        // Both of these are the book failing to answer, not the venue refusing an order: no order
+        // has been described yet, let alone shown to the pool.
         (bool okParams, BookParams memory bp) = _bookParams(pool);
-        if (!okParams) return (LucidTypes.Refusal.VenueRejected, 0, 0);
+        if (!okParams) return (LucidTypes.Refusal.BookUnreadable, 0, 0);
 
         (bool okPrice, uint256 price) = _crossPrice(pool, kind, bp.tick);
-        if (!okPrice) return (LucidTypes.Refusal.VenueRejected, 0, 0);
+        if (!okPrice) return (LucidTypes.Refusal.BookUnreadable, 0, 0);
 
         uint256 unitCost = kind == LucidTypes.BUY_YES ? price : LucidTypes.ONE - price;
         uint256 quantity = _floorTo(stake * LucidTypes.ONE / unitCost, bp.lot);
@@ -480,7 +490,7 @@ contract LucidDesk is ILucidDesk {
         _ensureApprovals(m.pool);
 
         (bool okParams, BookParams memory bp) = _bookParams(m.pool);
-        if (!okParams) return _refuse(m.marketId, LucidTypes.Refusal.VenueRejected, pAi, pBook);
+        if (!okParams) return _refuse(m.marketId, LucidTypes.Refusal.BookUnreadable, pAi, pBook);
 
         uint256 size = _floorTo(stake, bp.lot);
         if (size == 0 || size < bp.minQty) {
@@ -491,12 +501,12 @@ contract LucidDesk is ILucidDesk {
         // reason not to mint at all: minting first would leave the desk sitting on an unquoted set
         // for the rest of the window, having spent the whole window's mandate to do nothing.
         (bool okQuotes, uint256 bid, uint256 ask) = _quotePair(pAi, bp.tick);
-        if (!okQuotes) return _refuse(m.marketId, LucidTypes.Refusal.VenueRejected, pAi, pBook);
+        if (!okQuotes) return _refuse(m.marketId, LucidTypes.Refusal.Unquotable, pAi, pBook);
 
         uint256 before = _free();
         try IBinaryPool(m.pool).mintSet(address(this), address(this), size) {}
         catch {
-            return _refuse(m.marketId, LucidTypes.Refusal.VenueRejected, pAi, pBook);
+            return _refuse(m.marketId, LucidTypes.Refusal.MintFailed, pAi, pBook);
         }
 
         // The set is a position whether or not either quote rests, so it is booked immediately;
@@ -568,6 +578,7 @@ contract LucidDesk is ILucidDesk {
         if (placed) {
             emit Executed(m.marketId, kind, price, quantity, id);
         } else {
+            // A priced, sized leg the venue turned down — `PostOnlyWouldCross` is the usual one.
             emit Refused(m.marketId, LucidTypes.Refusal.VenueRejected, pAi, pBook);
         }
     }

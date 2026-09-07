@@ -8,6 +8,12 @@ library LucidTypes {
     /// @dev New reasons are APPENDED, never inserted. The deployed contracts and the front end
     /// already speak the numbers below, and a renumbering would silently retitle every refusal in
     /// every log line ever emitted — the one change that cannot be noticed from the outside.
+    ///
+    /// A reason must name the component that actually failed. `VenueRejected` used to cover three
+    /// unrelated failures at once — an unreadable book, an unquotable price range, and the venue
+    /// turning the order down — which made a live refusal impossible to diagnose from its log line
+    /// alone and invited a confident story about the venue refusing an order it was never shown.
+    /// The last three values split those apart; `VenueRejected` now means only what its name says.
     enum Refusal {
         None,
         NotArmed,
@@ -21,10 +27,20 @@ library LucidTypes {
         AiUnavailable,
         AiMalformed,
         LowEdge,
+        // The venue accepted the call and turned the order down: `placeBinaryOrder` returned
+        // false, or reverted. Nothing upstream of the order is described by this value.
         VenueRejected,
         NoCredit,
         InsufficientFunds,
-        NoBook
+        NoBook,
+        // The pool would not say what its book looks like: `getOrderBookParameters` reverted or
+        // answered with an unusable tick, or `getBookLevels` reverted. No price was ever formed.
+        BookUnreadable,
+        // A price was formed and it was nonsense: no ordered pair of maker legs fits inside the
+        // venue's own `0 < price < ONE` range, so there is nothing sane to post.
+        Unquotable,
+        // `mintSet` reverted, so the complete set the maker was going to quote never existed.
+        MintFailed
     }
 
     /// @dev What a book-probability field carries when there was no book to read.

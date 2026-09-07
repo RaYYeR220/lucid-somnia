@@ -387,6 +387,9 @@ contract LucidDeskTest is Test {
         assertEq(o.quantity, 72e6, "lot alignment must round DOWN, never up");
     }
 
+    /// `VenueRejected` now claims exactly one thing: the venue was handed a fully priced, fully
+    /// sized order and turned it down. The book was readable and the price was sane — the
+    /// rejection is the venue's, and nothing upstream of it may borrow this reason.
     function test_venue_returning_false_is_refused_not_executed() public {
         pool.setPlaceSucceeds(false);
 
@@ -394,7 +397,76 @@ contract LucidDeskTest is Test {
         emit Refused(MARKET_A, LucidTypes.Refusal.VenueRejected, 8800, 5000);
         _drive(MARKET_A, 8800, 5000);
 
+        assertEq(pool.orderCount(), 1, "the venue saw a complete order and refused it");
         assertEq(desk.state().spentToday, 0, "a silent rejection was booked as a trade");
+        assertEq(desk.state().openMarkets, 0);
+        assertEq(desk.equity(), FUNDING);
+    }
+
+    // -- naming the component that actually failed ----------------------------
+    //
+    // A single `VenueRejected` used to cover an unreadable book, an unquotable price range and
+    // the venue refusing an order, which made a live refusal impossible to diagnose from its own
+    // log line — and produced a confident public claim that the venue was crossing a maker's
+    // second leg, which nothing in the trace supported. Each failure now carries its own reason,
+    // and each test below pins the exact enum rather than merely "some refusal happened".
+
+    /// The pool would not say what its tick is. No price was ever formed, so no order could have
+    /// been rejected: this is the book failing, not the venue.
+    function test_a_taker_refuses_BookUnreadable_when_the_parameters_revert() public {
+        pool.setRevertOnParams(true);
+
+        vm.expectEmit(true, false, false, true, address(desk));
+        emit Refused(MARKET_A, LucidTypes.Refusal.BookUnreadable, 8800, 5000);
+        _drive(MARKET_A, 8800, 5000);
+
+        assertEq(pool.orderCount(), 0, "nothing may reach the venue without a tick");
+        assertEq(desk.state().spentToday, 0);
+        assertEq(desk.equity(), FUNDING);
+    }
+
+    /// The parameters read fine and the levels did not. Still the book, still not the venue — the
+    /// two reads are one fact from a diagnosis's point of view: the desk never saw a price.
+    function test_a_taker_refuses_BookUnreadable_when_the_levels_revert() public {
+        pool.setRevertOnBook(true);
+
+        vm.expectEmit(true, false, false, true, address(desk));
+        emit Refused(MARKET_A, LucidTypes.Refusal.BookUnreadable, 8800, 5000);
+        _drive(MARKET_A, 8800, 5000);
+
+        assertEq(pool.orderCount(), 0);
+        assertEq(desk.state().spentToday, 0);
+    }
+
+    /// The maker reads the same parameters for its own reasons, and reports the same failure.
+    function test_a_maker_refuses_BookUnreadable_when_the_parameters_revert() public {
+        vm.prank(owner);
+        desk.setPolicy(_makerPolicy());
+        pool.setRevertOnParams(true);
+
+        vm.expectEmit(true, false, false, true, address(desk));
+        emit Refused(MARKET_A, LucidTypes.Refusal.BookUnreadable, 6000, 5000);
+        _drive(MARKET_A, 6000, 5000);
+
+        assertEq(pool.mintSetCalls(), 0, "no set may be minted against a book nobody could read");
+        assertEq(pool.orderCount(), 0);
+        assertEq(desk.equity(), FUNDING);
+    }
+
+    /// The book read fine, the quotes were priced, and `mintSet` reverted. The desk holds no set,
+    /// so there is nothing to quote and nothing to book — and the venue never saw an order.
+    function test_a_maker_refuses_MintFailed_when_the_set_cannot_be_minted() public {
+        vm.prank(owner);
+        desk.setPolicy(_makerPolicy());
+        pool.setRevertOnMintSet(true);
+
+        vm.expectEmit(true, false, false, true, address(desk));
+        emit Refused(MARKET_A, LucidTypes.Refusal.MintFailed, 6000, 5000);
+        _drive(MARKET_A, 6000, 5000);
+
+        assertEq(pool.mintSetCalls(), 0, "the mint reverted, so no set exists");
+        assertEq(pool.orderCount(), 0, "and no leg may rest against a set the desk does not hold");
+        assertEq(desk.state().spentToday, 0, "nothing was charged for a position never taken");
         assertEq(desk.state().openMarkets, 0);
         assertEq(desk.equity(), FUNDING);
     }
@@ -645,14 +717,17 @@ contract LucidDeskTest is Test {
     /// The refusal branch: a tick coarse enough that no ordered pair fits between the venue's own
     /// floor and ceiling. There is no sane price to post, so nothing is posted and nothing is
     /// minted — a set the desk cannot quote is a whole window's mandate spent doing nothing.
-    function test_a_maker_refuses_when_no_ordered_pair_fits_inside_the_range() public {
+    ///
+    /// The reason is `Unquotable`, not `VenueRejected`: the pool answered every read it was given
+    /// and was never shown an order. The desk's own arithmetic is what has nothing to say here.
+    function test_a_maker_refuses_Unquotable_when_no_ordered_pair_fits_inside_the_range() public {
         vm.prank(owner);
         desk.setPolicy(_makerPolicy());
         // Legal prices are `[tick, ONE - tick]`, which this tick empties out entirely.
         pool.setBookParams(600_000, 1000, 1000);
 
         vm.expectEmit(true, false, false, true, address(desk));
-        emit Refused(MARKET_A, LucidTypes.Refusal.VenueRejected, LucidTypes.BPS, type(uint16).max);
+        emit Refused(MARKET_A, LucidTypes.Refusal.Unquotable, LucidTypes.BPS, type(uint16).max);
         _driveNoBook(MARKET_A, LucidTypes.BPS);
 
         assertEq(pool.orderCount(), 0, "no leg may be posted at a nonsense price");
@@ -748,8 +823,10 @@ contract LucidDeskTest is Test {
     function test_never_reverts_when_the_pool_reverts() public {
         pool.setRevertOnEverything(true);
 
+        // A pool that answers nothing fails at the first read, so the refusal names that read
+        // rather than an order the venue was never shown.
         vm.expectEmit(true, false, false, true, address(desk));
-        emit Refused(MARKET_A, LucidTypes.Refusal.VenueRejected, 8800, 5000);
+        emit Refused(MARKET_A, LucidTypes.Refusal.BookUnreadable, 8800, 5000);
         _drive(MARKET_A, 8800, 5000);
 
         vm.prank(owner);
@@ -843,6 +920,59 @@ contract LucidDeskTest is Test {
         assertEq(desk.state().openMarkets, openBefore, "the position must stay open");
         assertEq(module.redeemCount(), 0, "nothing is redeemable yet");
         assertEq(usdc.balanceOf(address(desk)), collateralBefore, "no collateral moved");
+    }
+
+    // -- the wire format -------------------------------------------------------
+
+    /// Splitting `VenueRejected` into four reasons is only safe because the split APPENDS. The
+    /// deployed contracts, the SDK and the front end all decode this enum as a `uint8` position,
+    /// so a value that moved would retitle every refusal in every log line ever emitted — a
+    /// corruption that is invisible from the outside, because the numbers still decode to names.
+    ///
+    /// The numbering is therefore pinned as a list rather than as prose: the index of each name
+    /// is the wire value, and any insertion, removal or reordering shifts one of them.
+    function test_the_refusal_numbering_is_append_only() public pure {
+        string[19] memory expected = [
+            "None",
+            "NotArmed",
+            "AssetNotAllowed",
+            "CadenceNotAllowed",
+            "WindowTooShort",
+            "CapExceeded",
+            "DailyBudgetExceeded",
+            "MaxOpenReached",
+            "RiskHalt",
+            "AiUnavailable",
+            "AiMalformed",
+            "LowEdge",
+            "VenueRejected",
+            "NoCredit",
+            "InsufficientFunds",
+            "NoBook",
+            "BookUnreadable",
+            "Unquotable",
+            "MintFailed"
+        ];
+
+        assertEq(expected[uint256(LucidTypes.Refusal.None)], "None");
+        assertEq(expected[uint256(LucidTypes.Refusal.NotArmed)], "NotArmed");
+        assertEq(expected[uint256(LucidTypes.Refusal.AssetNotAllowed)], "AssetNotAllowed");
+        assertEq(expected[uint256(LucidTypes.Refusal.CadenceNotAllowed)], "CadenceNotAllowed");
+        assertEq(expected[uint256(LucidTypes.Refusal.WindowTooShort)], "WindowTooShort");
+        assertEq(expected[uint256(LucidTypes.Refusal.CapExceeded)], "CapExceeded");
+        assertEq(expected[uint256(LucidTypes.Refusal.DailyBudgetExceeded)], "DailyBudgetExceeded");
+        assertEq(expected[uint256(LucidTypes.Refusal.MaxOpenReached)], "MaxOpenReached");
+        assertEq(expected[uint256(LucidTypes.Refusal.RiskHalt)], "RiskHalt");
+        assertEq(expected[uint256(LucidTypes.Refusal.AiUnavailable)], "AiUnavailable");
+        assertEq(expected[uint256(LucidTypes.Refusal.AiMalformed)], "AiMalformed");
+        assertEq(expected[uint256(LucidTypes.Refusal.LowEdge)], "LowEdge");
+        assertEq(expected[uint256(LucidTypes.Refusal.VenueRejected)], "VenueRejected");
+        assertEq(expected[uint256(LucidTypes.Refusal.NoCredit)], "NoCredit");
+        assertEq(expected[uint256(LucidTypes.Refusal.InsufficientFunds)], "InsufficientFunds");
+        assertEq(expected[uint256(LucidTypes.Refusal.NoBook)], "NoBook");
+        assertEq(expected[uint256(LucidTypes.Refusal.BookUnreadable)], "BookUnreadable");
+        assertEq(expected[uint256(LucidTypes.Refusal.Unquotable)], "Unquotable");
+        assertEq(expected[uint256(LucidTypes.Refusal.MintFailed)], "MintFailed");
     }
 
 }

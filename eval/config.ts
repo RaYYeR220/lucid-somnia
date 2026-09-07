@@ -50,8 +50,9 @@ export interface Deployment {
   router: Address
   factory: Address
   /**
-   * The desks named in `deployed.json`. The factory's own `DeskCreated` log is the real registry;
-   * these are only a floor, so that a desk created before the scan window still counts.
+   * The desks named in `deployed.json`. These are a floor, not the registry: `LucidRouter.allDesks()`
+   * is the authoritative set, because it answers for every desk ever registered rather than for the
+   * ones a `DeskCreated` scan happened to catch inside its block range.
    */
   seedDesks: Address[]
 }
@@ -74,11 +75,36 @@ export function loadDeployment(): Deployment {
 }
 
 /**
+ * The probability scale used everywhere in this protocol. Mirrored from `LucidTypes.BPS` in
+ * `contracts/src/types/LucidTypes.sol`.
+ */
+export const BPS = 10_000
+
+/**
+ * What a book-probability field carries when there was no book to read.
+ *
+ * Mirrored from `LucidTypes.BOOK_UNOBSERVED` in `contracts/src/types/LucidTypes.sol`, where it is
+ * `type(uint16).max`. It sits outside the 0..`BPS` probability range on purpose: it is the marker
+ * for the ABSENCE of a quote, not a quote of 655.35 %.
+ *
+ * The contracts learned this the hard way — subtracting the sentinel from a verdict produced a
+ * 60435 bps "edge" and sized six times equity against a window nobody had quoted. The rule the
+ * desk now states is quoted in `contracts/src/LucidDesk.sol`: a value that encodes ABSENCE must
+ * never be an arithmetic input. This harness is bound by the same rule, which is why every metric
+ * that touches a book value filters on this constant before it divides anything.
+ */
+export const BOOK_UNOBSERVED_BPS = 65_535
+
+/**
  * `LucidTypes.Refusal`, in declaration order — the desk emits the enum as a `uint8`, so the
  * ordering here is the only thing that turns a log into a reason. Mirrored from
  * `contracts/src/types/LucidTypes.sol`. A reordering there without a matching one here would
  * mislabel every refusal, so an index past the end is reported as `Unknown` rather than being
  * folded silently into a neighbouring reason.
+ *
+ * The last three were appended when `VenueRejected` was split: it used to stand for an unreadable
+ * book, an unquotable price range and the venue refusing an order all at once, which made a
+ * refusal table unable to say which of the three had happened.
  */
 export const REFUSAL_NAMES = [
   'None',
@@ -97,6 +123,9 @@ export const REFUSAL_NAMES = [
   'NoCredit',
   'InsufficientFunds',
   'NoBook',
+  'BookUnreadable',
+  'Unquotable',
+  'MintFailed',
 ] as const
 
 export type RefusalName = (typeof REFUSAL_NAMES)[number] | 'Unknown'

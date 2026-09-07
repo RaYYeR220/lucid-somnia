@@ -2,7 +2,11 @@
  * Scoring. Every function here takes observed pairs and returns a number computed from them —
  * there is no default, no prior and no fallback value, so a metric that cannot be computed
  * comes back `null` rather than as a plausible-looking zero.
+ *
+ * The same rule covers absence: a field that says "there was nothing here" is never allowed to
+ * stand in for a measurement. See `bookComparison`.
  */
+import { BOOK_UNOBSERVED_BPS, BPS } from './config.js'
 
 /** One graded forecast: a probability the chain recorded, and the outcome that later happened. */
 export interface Observation {
@@ -114,12 +118,128 @@ export function calibration(observations: readonly Observation[]): CalibrationBu
   return buckets
 }
 
-/** Mean absolute deviation between two aligned series. Null when nothing aligns. */
-export function meanAbsoluteDeviation(pairs: readonly (readonly [number, number])[]): number | null {
-  if (pairs.length === 0) return null
+/** One row's committee forecast beside the book quote the router read at the same instant. */
+export interface BookPair {
+  /** Committee probability that the window closes UP, in bps on 0..`BPS`. */
+  probUpBps: number
+  /**
+   * The book field exactly as the chain reported it, in bps — including
+   * `BOOK_UNOBSERVED_BPS`, which is not a probability. `null` means the row carried no book
+   * field at all, which is a different fact again.
+   */
+  pBookBps: number | null
+}
+
+export interface BookComparison {
+  /** Rows carrying a real quote. These, and only these, are averaged. */
+  n: number
+  /** Mean |committee - book| on 0..1. Null when no row carried a real quote. */
+  meanAbsoluteDeviation: number | null
+  /** Rows with no book field at all: no desk verdict was joined to them. */
+  noBookField: number
+  /** Rows whose book field was the unobserved sentinel: the venue quoted neither side. */
+  bookUnobserved: number
+  /** Rows whose book field was neither a probability nor the sentinel. */
+  outOfRange: number
+}
+
+/**
+ * Mean absolute deviation between the committee and the book, over the rows that HAD a book.
+ *
+ * The exclusions are the point of this function, not housekeeping around it. `pBookBps` carries
+ * `BOOK_UNOBSERVED_BPS` when the venue quoted neither side of the book, and that value is a marker
+ * for the absence of a quote rather than a very confident one. Reading it as a probability turns
+ * 65535 bps into 6.5535 and reports a deviation of about 6.13 against verdicts that live on 0..1 —
+ * a number six times wider than the widest disagreement that can exist, produced entirely by
+ * arithmetic on a value that was never a measurement. The contracts already state the rule this
+ * obeys, in `LucidDesk._intendedStake`: a value that encodes ABSENCE must never be an arithmetic
+ * input.
+ *
+ * So the sentinel rows are removed from the average rather than folded into it, and they are
+ * counted on the way out, because "no book to compare against" is a finding about the venue and
+ * silently averaging over a smaller set would hide it. A book quoted at exactly 0 is kept: zero is
+ * a real quote, and dropping it would be the same mistake in the other direction.
+ */
+export function bookComparison(rows: readonly BookPair[]): BookComparison {
   let sum = 0
-  for (const [a, b] of pairs) sum += Math.abs(a - b)
-  return sum / pairs.length
+  let n = 0
+  let noBookField = 0
+  let bookUnobserved = 0
+  let outOfRange = 0
+
+  for (const row of rows) {
+    const book = row.pBookBps
+    if (book === null) {
+      noBookField += 1
+      continue
+    }
+    if (book === BOOK_UNOBSERVED_BPS) {
+      bookUnobserved += 1
+      continue
+    }
+    // Anything else outside the scale is not a probability either, and this harness has no way to
+    // know what it was meant to be. Counted and named rather than clamped into the average.
+    if (!Number.isFinite(book) || book < 0 || book > BPS) {
+      outOfRange += 1
+      continue
+    }
+    n += 1
+    sum += Math.abs(row.probUpBps - book) / BPS
+  }
+
+  return {
+    n,
+    meanAbsoluteDeviation: n === 0 ? null : sum / n,
+    noBookField,
+    bookUnobserved,
+    outOfRange,
+  }
+}
+
+/** A self-check that failed. Thrown rather than logged: a broken metric must stop the run. */
+export class MetricsSelfCheckError extends Error {
+  override readonly name = 'MetricsSelfCheckError'
+}
+
+/**
+ * Both halves of the sentinel rule, asserted on every run before any real number is computed:
+ * absence is excluded, and a genuine quote of zero is not.
+ *
+ * This is deliberately not a test file somebody has to remember to run. The bug it guards against
+ * did not look like a crash — it looked like a plausible metric, and it was reported as one. A
+ * check that only fires when someone remembers to type `npm test` would not have caught it.
+ */
+export function assertBookSentinelIsExcluded(): void {
+  const absent = bookComparison([{ probUpBps: 5100, pBookBps: BOOK_UNOBSERVED_BPS }])
+  if (absent.meanAbsoluteDeviation !== null || absent.n !== 0 || absent.bookUnobserved !== 1) {
+    throw new MetricsSelfCheckError(
+      `the unobserved-book sentinel (${BOOK_UNOBSERVED_BPS}) reached the deviation: ` +
+        `got n=${absent.n}, mad=${String(absent.meanAbsoluteDeviation)}`,
+    )
+  }
+
+  // Zero is a price somebody quoted. Excluding it would understate the disagreement instead of
+  // overstating it, which is the same class of error wearing the opposite sign.
+  const zeroQuote = bookComparison([{ probUpBps: 5100, pBookBps: 0 }])
+  if (zeroQuote.n !== 1 || zeroQuote.meanAbsoluteDeviation !== 0.51 || zeroQuote.bookUnobserved !== 0) {
+    throw new MetricsSelfCheckError(
+      `a genuine book quote of 0 was dropped: got n=${zeroQuote.n}, ` +
+        `mad=${String(zeroQuote.meanAbsoluteDeviation)}`,
+    )
+  }
+
+  // And the mixed case: the average must be over the real quote alone, not over both.
+  const mixed = bookComparison([
+    { probUpBps: 5100, pBookBps: BOOK_UNOBSERVED_BPS },
+    { probUpBps: 5100, pBookBps: 5000 },
+    { probUpBps: 5100, pBookBps: null },
+  ])
+  if (mixed.n !== 1 || mixed.meanAbsoluteDeviation !== 0.01 || mixed.noBookField !== 1) {
+    throw new MetricsSelfCheckError(
+      `a mixed sample averaged the wrong rows: got n=${mixed.n}, ` +
+        `mad=${String(mixed.meanAbsoluteDeviation)}, noBookField=${mixed.noBookField}`,
+    )
+  }
 }
 
 /** The realised base rate of the sample. Context for any accuracy number, not a metric of skill. */

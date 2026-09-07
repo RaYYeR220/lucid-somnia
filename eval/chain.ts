@@ -52,6 +52,47 @@ export const FACTORY_DESK_CREATED_EVENT = parseAbiItem(
   'event DeskCreated(address indexed owner, address indexed desk)',
 ) satisfies AbiEvent
 
+// ── the desk registry ───────────────────────────────────────────────────────
+
+/**
+ * `LucidRouter.allDesks()` — every desk ever registered, in registration order.
+ *
+ * This is the authoritative set. A `DeskCreated` scan can only see desks created inside the block
+ * range being scanned, and that range is anchored on the brain's deployment block; the brain has
+ * been redeployed, so every desk created before that block is invisible to the scan. A refusal
+ * table built from the visible half reports fewer refusals than the protocol emitted and makes the
+ * protocol look quieter than it is, without ever looking wrong.
+ */
+export const ROUTER_ALL_DESKS = parseAbiItem('function allDesks() view returns (address[])')
+
+/** The router would not answer `allDesks()`. */
+export class RouterRegistryError extends Error {
+  override readonly name = 'RouterRegistryError'
+}
+
+/**
+ * Every desk the router knows about, lower-cased.
+ *
+ * This throws rather than degrading to the log scan. An under-reported desk set silently
+ * under-reports every refusal that follows from it, and a missing count is a better outcome than
+ * a confident wrong one.
+ */
+export async function readRouterDesks(client: PublicClient, router: Address): Promise<Address[]> {
+  try {
+    const desks = await client.readContract({
+      address: router,
+      abi: [ROUTER_ALL_DESKS],
+      functionName: 'allDesks',
+    })
+    return desks.map((desk) => desk.toLowerCase() as Address)
+  } catch (cause) {
+    throw new RouterRegistryError(
+      `allDesks() failed on router ${router}; the desk set cannot be trusted, so nothing is reported`,
+      { cause },
+    )
+  }
+}
+
 // ── paging ──────────────────────────────────────────────────────────────────
 
 export interface BlockRange {

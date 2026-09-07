@@ -20,25 +20,36 @@ import {
   FACTORY_DESK_CREATED_EVENT,
   ROUTER_SKIPPED_EVENT,
   createClient,
+  readRouterDesks,
   resolveDeployBlock,
   scanLogs,
 } from './chain.js'
 import type { BlockRange, DeployBlock, EventLogs } from './chain.js'
-import { CHAIN_ID, HERE, INDEXER_URL, RPC_URL, loadDeployment, refusalName } from './config.js'
+import {
+  BOOK_UNOBSERVED_BPS,
+  CHAIN_ID,
+  HERE,
+  INDEXER_URL,
+  RPC_URL,
+  loadDeployment,
+  refusalName,
+} from './config.js'
 import { marketsById, settlementOf } from './indexer.js'
 import type { MarketRow, Settlement, UnresolvedReason } from './indexer.js'
 import {
   accuracy,
+  assertBookSentinelIsExcluded,
+  bookComparison,
   brier,
   calibration,
   coinFlipControl,
   constantHalfControl,
   dispersion,
-  meanAbsoluteDeviation,
   upRate,
 } from './metrics.js'
 import type {
   Accuracy,
+  BookComparison,
   CalibrationBucket,
   CoinFlipControl,
   Dispersion,
@@ -48,6 +59,9 @@ import type {
 /** Pre-registered, not tuned: fixed before any number was looked at, and never changed since. */
 const CONTROL_TRIALS = 20_000
 const CONTROL_SEED = 0x1ec1d
+
+/** How a desk came to be in the set. Printed per desk so the set can be told from the sample. */
+type DeskSource = 'router allDesks()' | 'deployed.json' | 'DeskCreated in range'
 
 // -- row shapes --------------------------------------------------------------
 
@@ -95,12 +109,8 @@ interface SampleMetrics {
   brier: number | null
   accuracy: Accuracy
   calibration: CalibrationBucket[]
-  bookComparison: {
-    /** Rows carrying a book-implied probability. Rows without one are excluded and counted. */
-    n: number
-    missing: number
-    meanAbsoluteDeviation: number | null
-  }
+  /** Every exclusion is counted and named here; nothing is dropped into the average silently. */
+  bookComparison: BookComparison
   controls: {
     constantHalf: { brier: number | null; accuracy: null }
     coinFlip: CoinFlipControl | null
@@ -123,15 +133,11 @@ function scoreSample(rows: readonly VerdictRow[]): SampleMetrics {
   const committeeBrier = brier(observations)
   const committeeAccuracy = accuracy(observations)
 
-  const bookPairs: (readonly [number, number])[] = []
-  let missingBook = 0
-  for (const row of rows) {
-    if (row.pBookBps === null) {
-      missingBook += 1
-      continue
-    }
-    bookPairs.push([row.probUpBps / 10_000, row.pBookBps / 10_000])
-  }
+  // The book values are handed over in bps, exactly as the chain reported them, so the sentinel
+  // is recognised and removed BEFORE anything divides it into a probability.
+  const book = bookComparison(
+    rows.map((row) => ({ probUpBps: row.probUpBps, pBookBps: row.pBookBps })),
+  )
 
   return {
     n: observations.length,
@@ -140,11 +146,7 @@ function scoreSample(rows: readonly VerdictRow[]): SampleMetrics {
     brier: committeeBrier,
     accuracy: committeeAccuracy,
     calibration: calibration(observations),
-    bookComparison: {
-      n: bookPairs.length,
-      missing: missingBook,
-      meanAbsoluteDeviation: meanAbsoluteDeviation(bookPairs),
-    },
+    bookComparison: book,
     controls: {
       constantHalf: constantHalfControl(observations),
       coinFlip: coinFlipControl(
@@ -196,11 +198,23 @@ function printSample(title: string, m: SampleMetrics): void {
     ),
   )
   console.log(line('  exact binomial p (one-sided)', num(m.accuracy.pValue, 4)))
+  const book = m.bookComparison
   console.log(
     line(
       'mean |committee - book|',
-      `${num(m.bookComparison.meanAbsoluteDeviation)} over ${m.bookComparison.n} rows ` +
-        `(${m.bookComparison.missing} carried no book quote)`,
+      book.meanAbsoluteDeviation === null
+        ? 'n/a - no row in this sample carried a real book quote'
+        : `${num(book.meanAbsoluteDeviation)} over ${book.n} row(s) that carried one`,
+    ),
+  )
+  // Spelled out rather than summarised, because "excluded" covers three different facts and only
+  // one of them is about the venue being empty.
+  console.log(
+    line(
+      '  rows excluded from that mean',
+      `${book.bookUnobserved} no book at the venue (sentinel ${BOOK_UNOBSERVED_BPS}), ` +
+        `${book.noBookField} no book field on the row, ` +
+        `${book.outOfRange} book value outside 0..10000`,
     ),
   )
 
@@ -258,6 +272,10 @@ function printSample(title: string, m: SampleMetrics): void {
 // -- main --------------------------------------------------------------------
 
 async function main(): Promise<void> {
+  // Before any real number is computed. This is the harness proving to itself that the absence
+  // sentinel cannot reach the arithmetic, and that a genuine quote of zero still can.
+  assertBookSentinelIsExcluded()
+
   const deployment = loadDeployment()
   const client = createClient()
 
@@ -294,8 +312,15 @@ async function main(): Promise<void> {
       if (done === total) process.stderr.write('\n')
     }
 
-  // Desks are discovered rather than assumed: a refusal breakdown covering only the demo desk
-  // would understate the protocol's own refusals without ever looking wrong.
+  // Desks are discovered rather than assumed, and the router's own registry is the base of that
+  // discovery rather than a supplement to it.
+  //
+  // A `DeskCreated` scan can only ever see desks created inside the scanned range, and that range
+  // starts at the BRAIN's deployment block. The brain has been redeployed, so every desk created
+  // before that block is invisible to the scan — and a refusal table built from half the desks
+  // reports fewer refusals than the protocol emitted while looking exactly like a complete one.
+  // `allDesks()` answers for every desk ever registered, whenever it was created.
+  const registryDesks = await readRouterDesks(client, deployment.router)
   const deskCreated = await scanLogs(
     client,
     deployment.factory,
@@ -303,12 +328,37 @@ async function main(): Promise<void> {
     range,
     progress('desk registry'),
   )
-  const desks = [
-    ...new Set<Address>([
-      ...deployment.seedDesks,
-      ...deskCreated.map((log) => log.args.desk.toLowerCase() as Address),
-    ]),
-  ]
+
+  // Provenance is kept, not just the union: a reader has to be able to tell the authoritative set
+  // apart from what this particular scan window happened to catch.
+  const deskSources = new Map<Address, Set<DeskSource>>()
+  const noteDesk = (address: string, source: DeskSource): void => {
+    const key = address.toLowerCase() as Address
+    const seen = deskSources.get(key)
+    if (seen === undefined) deskSources.set(key, new Set([source]))
+    else seen.add(source)
+  }
+  for (const desk of registryDesks) noteDesk(desk, 'router allDesks()')
+  for (const desk of deployment.seedDesks) noteDesk(desk, 'deployed.json')
+  for (const log of deskCreated) noteDesk(log.args.desk, 'DeskCreated in range')
+
+  const desks = [...deskSources.keys()]
+  const deskDiscovery = desks.map((address) => ({
+    address,
+    discoveredBy: [...(deskSources.get(address) ?? new Set<DeskSource>())],
+  }))
+
+  console.log('\ndesks driven by the router')
+  console.log(line('desks in the union', String(desks.length)))
+  console.log(
+    line(
+      '  router allDesks() / seeds / in range',
+      `${registryDesks.length} / ${deployment.seedDesks.length} / ${deskCreated.length}`,
+    ),
+  )
+  for (const entry of deskDiscovery) {
+    console.log(line(`  ${entry.address}`, entry.discoveredBy.join(', ')))
+  }
 
   const brainVerdicts = await scanLogs(
     client,
@@ -441,6 +491,7 @@ async function main(): Promise<void> {
       router: deployment.router,
       factory: deployment.factory,
       desks,
+      deskDiscovery,
       scan: {
         fromBlock: range.fromBlock.toString(),
         toBlock: range.toBlock.toString(),
