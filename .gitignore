@@ -21,6 +21,9 @@ scratch/
 *-backup*
 *.bundle
 
+# the demo film is hosted, not vendored — 49 MB of MP4 does not belong in a source tree
+video/
+
 # design exploration, not product
 ui-prototypes/
 mockups/
