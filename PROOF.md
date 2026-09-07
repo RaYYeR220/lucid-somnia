@@ -34,7 +34,7 @@ reproduced in [section 12](#12-reproduce-it-yourself).
 | `LucidBrain` | [`0x0c640E3aFc627bEec7eDB9985696e12B50AdAd25`](https://shannon-explorer.somnia.network/address/0x0c640E3aFc627bEec7eDB9985696e12B50AdAd25) | Two-stage question to Somnia's on-chain agent committees: price first, then the probability verdict. 20 621 bytes. |
 | `LucidDesk` (clone implementation) | [`0xa659b03e2349559f2d56D17F246e66e79467c17e`](https://shannon-explorer.somnia.network/address/0xa659b03e2349559f2d56D17F246e66e79467c17e) | The desk logic every desk clone delegates to: mandate enforcement, sizing, order placement, cancellation, settlement booking. 14 940 bytes. |
 | `LucidFactory` | [`0x9c1EF0C429f1F88e8247f3539DeF8a1f8FCCEb84`](https://shannon-explorer.somnia.network/address/0x9c1EF0C429f1F88e8247f3539DeF8a1f8FCCEb84) | Mints ERC-1167 desk clones, one per owner address, and registers them with the router. 4 943 bytes. |
-| `LucidKeeper` | [`0x4757599dC9A5a089270373a66BEeeD6592788707`](https://shannon-explorer.somnia.network/address/0x4757599dC9A5a089270373a66BEeeD6592788707) | Runs the venue's permissionless upkeep (`finalizeMarket`, `releasePool`, `syncSettlement`, `pokeOracle`) for every market, not only ours. 3 736 bytes. |
+| `LucidKeeper` | [`0x4757599dC9A5a089270373a66BEeeD6592788707`](https://shannon-explorer.somnia.network/address/0x4757599dC9A5a089270373a66BEeeD6592788707) | Built to run the venue's permissionless upkeep (`finalizeMarket`, `releasePool`, `syncSettlement`, `pokeOracle`) for every market, not only ours. No successful call on chain yet — see [section 11](#11-honest-limits). 3 736 bytes. |
 | `LucidRelay` | [`0xd9Eee9BE420E2CD777E55d890a940a637ed0bB7A`](https://shannon-explorer.somnia.network/address/0xd9Eee9BE420E2CD777E55d890a940a637ed0bB7A) | Queue of signed redemption authorisations anyone may drain, so a winner does not have to be online to be paid. 6 565 bytes. |
 | `LucidSeries` | [`0x747fF3a7A6FE4912c96dCe7faA711dCB6fbd1CE4`](https://shannon-explorer.somnia.network/address/0x747fF3a7A6FE4912c96dCe7faA711dCB6fbd1CE4) | Failover: watches the venue's cadence and rolls a window on our own `MarketCreator` if the venue's scheduler stops. 5 452 bytes. |
 | Desk `AiEdge` | [`0x822548990ce81b626a3c3684B0c85f2fd9EC9Fa7`](https://shannon-explorer.somnia.network/address/0x822548990ce81b626a3c3684B0c85f2fd9EC9Fa7) | Live desk, ERC-1167 clone (45 bytes), owner [`0xc84C24F7…`](https://shannon-explorer.somnia.network/address/0xc84C24F751c686568A907650FD59b1a3AC1a5E67). Takes the book when the committee disagrees with it. Holds 5 000.000000 tUSDC. |
@@ -663,21 +663,66 @@ committee's seventeen 51 % calls went 17 for 17 and everything else together wen
 chance. Its confident calls are anti-calibrated: the 0 % bucket realised 42.1 % UP and the 90–100 %
 bucket realised 25 %. **No predictive edge is claimed here.** Read EVAL.md before assuming anything.
 
-**The keeper is attached and has completed nothing.** `router.keeper()` now reads the keeper, so the
-router runs venue-wide upkeep on every firing, and its public counters say what that has produced:
+**The keeper is wired, is attempted on every firing, and has never once succeeded. We do not know
+why.** This is the weakest component in the deployment, and it is set out here at length because it
+is described elsewhere as a contribution to the venue. Three things are true at once, and each has a
+command under it.
+
+*One — the wiring is correct.* The keeper points at the deployed router, and the router has the
+keeper attached, so venue-wide upkeep is attempted on every settlement firing:
 
 ```bash
-cast call 0x4757599dC9A5a089270373a66BEeeD6592788707 'counts()(uint64,uint64,uint64,uint64,uint64,uint64)' \
-  --rpc-url https://api.infra.testnet.somnia.network
-# 0 0 0 0 0 1026    finalized · released · synced · poked · voided · failures
+cast call 0x4757599dC9A5a089270373a66BEeeD6592788707 'router()(address)' --rpc-url https://api.infra.testnet.somnia.network
+# 0x6aE21a20444141552648C1f8443bAf171BCCcB99   — the router in deployed.json
 ```
 
-Zero finalized, zero released, zero synced, zero poked, and 1 026 upkeep calls that reverted or could
-not be attempted. On a venue whose own machinery keeps up, being beaten to every call is the expected
-case and the counter is documented as such — but it means **the upkeep path has not been observed
-doing useful work on this venue**, and nobody should read those 1 026 as work performed. Venue-wide
-upkeep also measured about 8.3 SOMI/hour on this deployment, which a testnet float does not survive
-continuously.
+*Two — every attempt has reverted.* The keeper's six public counters, read at 2026-09-07 05:58 UTC:
+
+```bash
+cast call 0x4757599dC9A5a089270373a66BEeeD6592788707 'counts()(uint64,uint64,uint64,uint64,uint64,uint64)' --rpc-url https://api.infra.testnet.somnia.network
+# 0 0 0 0 0 1362    finalized · released · synced · poked · voided · failures
+```
+
+Zero finalized, zero released, zero synced, zero poked, zero voided — and 1 362 attempts that
+reverted, across roughly 260 markets. **That sixth number is a failure count, not work performed.**
+The only thing it grows with is unsuccessful attempts, so a later read shows a larger number beside
+the same five zeros. Read it yourself rather than taking either figure from us.
+
+*Three — the calls themselves are not wrong.* Simulated **from the keeper's own address** at
+2026-09-07 05:59 UTC against market `0x…5af9` — expired at 1 788 761 100, `isResolved()` true,
+`status()` 4, and still listed by the indexer as `finalized: false`:
+
+```bash
+RPC=https://api.infra.testnet.somnia.network
+MOD=0x3ecC694Cef705358864a646142ac17A90E29e388    # BinaryMarketsModule
+K=0x4757599dC9A5a089270373a66BEeeD6592788707      # LucidKeeper
+MID=0x0000000000000000000000000000000000000000000000000000000000015af9
+MKT=0x8c0962F93B50Fe0B7f76271257941f35A0A97B55    # markets(MID).market
+QID=102659976736423338484455824881934707204165729380291702598303405713070651455150
+
+cast call --from $K $MOD 'finalizeMarket(bytes32)' $MID --rpc-url $RPC   # 0x  — succeeds
+cast call --from $K $MOD 'syncSettlement(bytes32)' $MID --rpc-url $RPC   # 0x  — succeeds
+cast call --from $K $MOD 'pokeOracle(uint256)'     $QID --rpc-url $RPC   # 0x  — succeeds
+cast call --from $K $MOD 'releasePool(bytes32)'    $MID --rpc-url $RPC   # reverts 0xdf88ba21
+cast call --from $K $MKT 'voidExpired()'                --rpc-url $RPC   # reverts 0xe064752b, args (2, 4)
+```
+
+Three of the five would go through. `voidExpired` reverting is correct — the market resolved, so it
+is not void. The work is therefore real and the calls are right, and the keeper has still never
+landed one. Any expired market the indexer reports as `finalized: false` reproduces this; the ids
+turn over every few minutes, so find a current one rather than reusing the one above.
+
+*What is not known.* **The cause is not established.** A plausible story is that at `expiry + 5 s`,
+when the router's settlement wake-up fires, the oracle has not answered yet and everything reverts —
+but that is a guess, and it is not offered here as an explanation. An earlier version of this page
+carried a confident one and it was wrong: `settlementWindow()` reads **86 400** on this deployment, a
+day, and is evidently the oracle's deadline to answer rather than a waiting period a market must sit
+through before it can be finalized. Until the revert is captured at the moment of the firing instead
+of reconstructed afterwards, the accurate statement is the one above: it does not work, and we cannot
+yet say why.
+
+Venue-wide upkeep also measured about 8.3 SOMI/hour on this deployment, which a testnet float does
+not survive continuously.
 
 **Funding is the binding constraint, and it is visible.** The router must hold 32 SOMI and stops
 booking one-shots below it, re-checked on every booking rather than once at setup; it crossed that

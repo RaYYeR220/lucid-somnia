@@ -77,7 +77,7 @@ recorded run are collected in [PROOF.md](PROOF.md).
 | `Maker` adds real depth to a venue whose books are mostly empty. | The mechanism is verified live from a contract — `mintSet` needs no counterparty and both `POST_ONLY` legs rested in the live book — but no `LucidDesk` in `Maker` mode has rested an order on chain yet. See [MOCKS.md](MOCKS.md). |
 | A cross-exchange median is a better price input than a single venue endpoint. | A single endpoint can geo-block part of a validator set, costing a committee member on every request; a median across seven exchanges with a source count and a staleness stamp cannot be geo-blocked out of existence. Not A/B tested. |
 | One shared router is the only viable subscription topology. | The precompile checks the 32 SOMI floor against the *calling* contract, so per-desk subscriptions would lock 32 SOMI per user. |
-| Running the venue's permissionless upkeep for every market benefits the venue. | Markets that are never finalized never pay out and pools that are never released are never recycled. We already pay for a subscription that wakes on every market, so the marginal cost is gas. Whether anyone else was going to run it is not something we can observe. |
+| Running the venue's permissionless upkeep for every market would benefit the venue. | Markets that are never finalized never pay out and pools that are never released are never recycled. We already pay for a subscription that wakes on every market, so the marginal cost is gas. Whether anyone else was going to run it is not something we can observe. This is reasoning about a benefit, not a report of one: `LucidKeeper` has not landed a single upkeep call on chain, and why is not established. See NOT CLAIMED below. |
 
 ---
 
@@ -105,7 +105,13 @@ Stated plainly, because the absence of a claim is easy to miss.
 - **We do not claim the price the committee reads is the price the window settles on.** Stage one
   reads Somnia's on-chain price-oracle agent; DreamDEX settles against its own Prophecy Oracle.
   Those are different series and the basis between them is not measured here.
-- **We do not claim the keeper has performed venue upkeep at scale.** Its on-chain counters are
-  public via `counts()`; read them rather than taking a number from us.
+- **We do not claim the keeper has performed useful venue upkeep.** Not at scale, and not once.
+  `LucidKeeper` is wired to the deployed router and its upkeep is attempted on every settlement
+  firing, and its counters read zero finalized, zero released, zero synced, zero poked, zero voided,
+  against 1 362 attempts that reverted — a failure count, not work performed. The calls are not the
+  problem: simulated from the keeper's own address against an expired, resolved market that the
+  indexer still lists as unfinalized, `finalizeMarket`, `syncSettlement` and `pokeOracle` all
+  succeed. **We do not know why the keeper has never landed one, and we do not offer a cause.** The
+  counters are public via `counts()`; read them rather than taking a number from us.
 - **We do not claim a 60-second window can be traded.** It cannot, by construction. See the honest
   limits in [README.md](README.md).

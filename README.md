@@ -92,7 +92,8 @@ to deposit, set the mandate, arm, and withdraw.
 ```
 
 The same settlement firing also drives three things that are not about our own desks:
-`LucidKeeper` runs DreamDEX's permissionless upkeep for the whole venue, `LucidRelay` redeems
+`LucidKeeper` is built to run DreamDEX's permissionless upkeep for the whole venue — and on chain it
+has never once succeeded at it, which is set out in the honest limits below — `LucidRelay` redeems
 pre-signed exits for anybody who queued one, and `LucidSeries` rolls a replacement window if the
 venue's own scheduler has gone quiet.
 
@@ -107,7 +108,7 @@ venue's own scheduler has gone quiet.
 | `PolicyLib` | A pure, total, never-reverting function from (mandate, state, market, verdict, money) to one refusal reason. |
 | `LucidBrain` | The two-stage committee wrapper: price first, then inference — every failure path still ends in a stored verdict. |
 | `LucidFactory` | Clones desks (ERC-1167), registers them with the router, and holds the publish/follow copy-trade graph. |
-| `LucidKeeper` | Runs the venue's five permissionless upkeep calls for every settled market, not only ours. Takes no fee, holds no funds. |
+| `LucidKeeper` | Designed to run the venue's five permissionless upkeep calls for every settled market, not only ours. Takes no fee, holds no funds. Its on-chain counters show no successful call yet — see the honest limits. |
 | `LucidRelay` | Universal auto-redeem: anybody signs an EIP-712 exit once, and it is executed for them after settlement. No owner. |
 | `LucidSeries` | Failover market creation — rolls our own window when DreamDEX's scheduler stops rolling theirs. |
 
@@ -284,6 +285,20 @@ the same bond that runs our own desks, and on a testnet float it is a real const
 keeper runs in bursts rather than continuously. Nothing about the mechanism is bursty; the funding
 is.
 
+**The keeper has never completed a single upkeep call, and we do not know why.** `LucidKeeper` is
+wired correctly — `keeper.router()` reads the deployed router and the router has the keeper attached
+— and its six public counters read `0 0 0 0 0 1362` at 2026-09-07 05:58 UTC: zero finalized, zero
+released, zero synced, zero poked, zero voided, and 1 362 attempts that reverted. Every attempt, over
+roughly 260 markets. That last figure is a failure count, not work performed. The calls themselves
+are not wrong: simulating them from the keeper's own address against an expired, resolved market that
+the indexer still lists as unfinalized, `finalizeMarket`, `syncSettlement` and `pokeOracle` all
+succeed, `releasePool` reverts `0xdf88b…`, and `voidExpired` reverts `0xe0647…` — correctly, since a
+resolved market is not void. So three of the five calls would go through if made, and none of them
+ever has. **The cause is not established.** We had a confident explanation and it was wrong
+(`settlementWindow()` reads 86 400, a day, and is evidently the oracle's deadline rather than a
+waiting period before finalization), so we are not offering a replacement until one is measured. Read
+`counts()` yourself; the number only goes up.
+
 **The router must hold 32 SOMI, and stops scheduling below it.** `SomniaExtensions` checks
 `address(this).balance >= 32 ether` on whichever contract calls `subscribe`, and it re-checks on
 every subscription — including each per-settlement one-shot. It is a floor to stay above for as
@@ -338,7 +353,7 @@ Three more, smaller:
 - [CLAIMS.md](CLAIMS.md) — every claim made here, with its evidence tier and how to check it.
 - [MOCKS.md](MOCKS.md) — exactly where the line between real and simulated runs.
 - [EVAL.md](eval/EVAL.md) — what the committee actually scored, and against which controls.
-- [SDK_FEEDBACK.md](SDK_FEEDBACK.md) — three blocking issues, seven sharp edges and three
+- [SDK_FEEDBACK.md](SDK_FEEDBACK.md) — three blocking issues, eight sharp edges and three
   documentation gaps found building this, each with a reproduction.
 - [kit/README.md](kit/README.md) — client and CLI reference.
 

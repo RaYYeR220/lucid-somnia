@@ -84,10 +84,15 @@ Stated plainly, one line each.
 - **`_ensureApprovals` has never run against the real venue.** It grants the pool an ERC-20
   allowance and the module and pool ERC-6909 operator rights, and it runs on a desk's first trade —
   which has not happened.
-- **`LucidKeeper` has never performed venue upkeep on chain.** Its own counters say so: `counts()`
-  reads all zeros on the live deployment. The keeper is detached from the router while iterating, to
-  conserve testnet float, and re-attached for recorded runs. Read `counts()` yourself rather than
-  taking a number from us.
+- **`LucidKeeper` has never performed venue upkeep on chain.** Its five success counters read zero
+  and its failure counter does not: `counts()` returned `0 0 0 0 0 1362` at 2026-09-07 05:58 UTC —
+  zero finalized, released, synced, poked and voided, against 1 362 attempts that reverted, across
+  roughly 260 markets. That last number is failures, not work. The wiring is right and the calls are
+  right — simulated from the keeper's own address against an expired, resolved market the indexer
+  still lists as unfinalized, `finalizeMarket`, `syncSettlement` and `pokeOracle` all succeed — and
+  the keeper has still never landed one. **Why is not established**, and no cause is offered here.
+  Every upkeep path is therefore exercised only against `MockKeeperModule` and `MockKeeperMarket`.
+  Read `counts()` yourself rather than taking a number from us.
 - **`LucidRelay` has never relayed a redemption on chain.** `relayedCount()` and `failedCount()`
   both read zero, and no authorization has ever been submitted to it.
 - **`LucidSeries` has never rolled a window on chain.** `status()` reports zero rolls today and no

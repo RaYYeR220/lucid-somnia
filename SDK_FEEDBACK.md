@@ -419,6 +419,52 @@ not a loss; do not close a position on it". One sentence prevents a whole class 
 
 ---
 
+## S8 — The permissionless upkeep calls are genuinely open, and every one we have made from a contract has reverted
+
+**Expected.** `finalizeMarket`, `syncSettlement`, `releasePool`, `pokeOracle` and a market's own
+`voidExpired` take no allowlist, so a third-party contract that wakes on settlement can carry its own
+upkeep. The access control really is open — that part is true and it is the reason this entry is here
+rather than in Blocking.
+
+**Observed.** A contract that attempts all five after every settlement firing has landed none of
+them. Its six counters — finalized, released, synced, poked, voided, failures — read
+`0 0 0 0 0 1362` at 2026-09-07 05:58 UTC: five zeros against 1 362 reverted attempts, over roughly
+260 markets. The contract is wired correctly and the calls are not wrong. Simulated **from that same
+contract's address** against an expired market with `isResolved()` true and `status()` 4, which the
+indexer still lists as `finalized: false`:
+
+| call | result |
+| --- | --- |
+| `finalizeMarket(bytes32)` | succeeds |
+| `syncSettlement(bytes32)` | succeeds |
+| `pokeOracle(uint256)` | succeeds |
+| `releasePool(bytes32)` | reverts `0xdf88ba21` |
+| `voidExpired()` | reverts `0xe064752b`, args `(2, 4)` — correct, a resolved market is not void |
+
+So three of the five would go through if made at that moment, and in production none of them ever
+has. **We cannot yet explain the gap**, and we are not guessing at one in writing: our first
+confident explanation was wrong (`settlementWindow()` reads 86 400 — a day — and is evidently the
+oracle's deadline to answer, not a period a market must sit through before it may be finalized).
+
+**Reproduction.** Pick any expired market the indexer reports as `finalized: false`, read its
+`market` address and `oracleQuestionId` out of `markets(marketId)`, and simulate each call with
+`--from` set to the calling contract:
+
+```bash
+cast call --from $CALLER $MODULE 'finalizeMarket(bytes32)' $MARKET_ID --rpc-url $RPC
+cast call --from $CALLER $MODULE 'releasePool(bytes32)'    $MARKET_ID --rpc-url $RPC
+cast call --from $CALLER $MARKET 'voidExpired()'                      --rpc-url $RPC
+```
+
+**Suggestion.** Two sentences would close most of this. First, publish the custom-error selectors for
+the upkeep surface — `0xdf88ba21` and `0xe064752b(uint8,uint8)` are unresolvable from the docs, and a
+four-byte selector with no ABI is the difference between a diagnosis and a guess. Second, state the
+precondition each call needs and the earliest moment it is satisfiable, relative to `expiry` and to
+the oracle's answer. A third-party keeper has to decide *when* to fire; right now that timing has to
+be discovered by burning gas on reverts, which is exactly what the counter above is a record of.
+
+---
+
 # Documentation gaps
 
 Three things that exist, work well, and are not written down. Each cost between half a day and a
@@ -582,8 +628,10 @@ Price Oracle agent in D3 is testnet-only.
 `captureClose` — all callable by anyone. This means a third-party protocol can carry its own
 settlement path instead of waiting on someone else's keeper, which matters enormously when your
 positions sit on 5-minute windows. We run all of them opportunistically after each settlement
-([`contracts/src/LucidKeeper.sol`](contracts/src/LucidKeeper.sol)); most calls fail because the work
-is already done, and that is the good case. Opening these up was the right call and it is
+([`contracts/src/LucidKeeper.sol`](contracts/src/LucidKeeper.sol)); in our deployment every one of
+those attempts has reverted and we cannot yet say why, which is written up as
+[S8](#s8--the-permissionless-upkeep-calls-are-genuinely-open-and-every-one-we-have-made-from-a-contract-has-reverted).
+The permission model is not what is in the way. Opening these up was the right call and it is
 under-advertised.
 
 **`redeemFor` is relayable by anyone.** A clean EIP-712 struct, no relayer allowlist, and the only

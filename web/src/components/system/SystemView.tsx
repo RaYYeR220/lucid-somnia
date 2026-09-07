@@ -570,8 +570,10 @@ function ComponentsSection({ routerStatus }: { routerStatus: ReturnType<typeof u
             )}
           </div>
           <p className="mt-2 text-md text-ink3">
-            Runs DreamDEX&rsquo;s five permissionless upkeep calls for every settled market, not only
-            ours. Takes no fee and holds no funds.
+            Built to run DreamDEX&rsquo;s five permissionless upkeep calls for every settled market,
+            not only ours. Takes no fee and holds no funds. It has not yet landed one of those calls:
+            the counters beside it read five zeros and a failure count, and we have not established
+            why.
           </p>
 
           {keeper.status === 'ready' && !keeper.data.attachedAtRouter ? (
