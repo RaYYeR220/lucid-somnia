@@ -12,6 +12,10 @@ RPC=${RPC:-https://api.infra.testnet.somnia.network}
 AGENT_PLATFORM=0x037Bb9C718F3f7fe5eCBDB0b600D607b52706776
 MODULE=0x3ecC694Cef705358864a646142ac17A90E29e388
 VENUE=0x1a1e6821cde7d0159c0d293177871e09677b4e42307c7db3ba94f8648a5a050f
+# Our own venue and creator, registered permissionlessly. Used only when the venue above
+# stops rolling short-cadence windows; see LucidSeries.Mode.
+MARKET_CREATOR=${MARKET_CREATOR:-0x7Fa6Ac2a61C0b5A0FcC7E1d9b05a0F6AD84763b2}
+OWN_VENUE=0x7b41ffa006bd7ef1b8a539217694d4db48a2b07784690decbf6b0bc9d61e8581
 ROUTER_FUNDING=${ROUTER_FUNDING:-33ether}
 BRAIN_FUNDING=${BRAIN_FUNDING:-3ether}
 
@@ -35,6 +39,7 @@ ROUTER=$(deploy LucidRouter "$ME" "$BRAIN" | tail -1)
 FACTORY=$(deploy LucidFactory "$DESK_IMPL" "$ROUTER" "$BRAIN" | tail -1)
 KEEPER=$(deploy LucidKeeper "$ME" "$ROUTER" | tail -1)
 RELAY=$(deploy LucidRelay | tail -1)
+SERIES=$(deploy LucidSeries "$ME" "$ROUTER" | tail -1)
 
 send() { cast send "$@" --rpc-url "$RPC" --private-key "$PRIVATE_KEY" >/dev/null; }
 
@@ -43,6 +48,10 @@ send "$BRAIN"  "setRouter(address)"  "$ROUTER"
 send "$ROUTER" "setFactory(address)" "$FACTORY"
 send "$ROUTER" "setKeeper(address)"  "$KEEPER"
 send "$ROUTER" "setRelay(address)"   "$RELAY"
+send "$ROUTER" "setSeries(address)"  "$SERIES"
+# The series our own MarketCreator already has registered: 300-second BTC, series id 1.
+# Failover is the default mode, so this stays idle while DreamDEX's own scheduler is healthy.
+send "$SERIES" "setSeries(address,uint32,uint32)" "$MARKET_CREATOR" 1 300
 
 echo "funding..."
 send "$ROUTER" --value "$ROUTER_FUNDING"
@@ -60,6 +69,9 @@ cat > deployed.json <<JSON
   "factory": "$FACTORY",
   "keeper": "$KEEPER",
   "relay": "$RELAY",
+  "series": "$SERIES",
+  "marketCreator": "$MARKET_CREATOR",
+  "ownVenueId": "$OWN_VENUE",
   "venueId": "$VENUE"
 }
 JSON

@@ -17,6 +17,7 @@ kit/dist/
 !.env.example
 
 # local scratch
+.playwright-mcp/
 scratch/
 *-backup*
 *.bundle
