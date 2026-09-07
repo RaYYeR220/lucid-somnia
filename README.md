@@ -2,6 +2,8 @@
 
 **Live interface:** https://lucid-somnia.vercel.app — reads Somnia Shannon directly, no wallet needed to look around.
 
+**Demo:** https://youtu.be/b-o_-8mEyKU — three minutes on what it does and what it refuses to do.
+
 Autonomous trading desks for **DreamDEX Event Contracts** on Somnia.
 
 Event Contracts are short-dated binary markets: will BTC be above the price this window opened at

@@ -1,5 +1,7 @@
 # Reviewing Lucid
 
+**Three minutes, if you only have three:** https://youtu.be/b-o_-8mEyKU
+
 **Live interface:** https://lucid-somnia.vercel.app — reads Somnia Shannon directly, no wallet needed to look around.
 
 A guided path through this repository, in order, with the exact command for each step and what you

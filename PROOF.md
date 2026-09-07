@@ -1,5 +1,7 @@
 # Proof
 
+**Walkthrough:** https://youtu.be/b-o_-8mEyKU
+
 Every claim on this page is a link to something on a public chain, or a command you can run against
 it. Nothing here is a screenshot and nothing here is a promise.
 
