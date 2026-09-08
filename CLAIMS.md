@@ -55,7 +55,8 @@ recorded run are collected in [PROOF.md](PROOF.md).
 | number | method |
 | --- | --- |
 | **0.36 SOMI** per verdict — 0.12 for the price stage, 0.24 for the inference stage. | `brain.quote()` on chain, cross-checked against `getAdvancedRequestDeposit` plus the per-validator rewards (0.03 for the feed, 0.07 for the LLM) at a committee of 3. |
-| **~8.3 SOMI/hour** to run the router with venue-wide upkeep attached. | Router balance drain over an hour of live operation. The venue created about 40 markets per 15 minutes; each one costs a creation firing at roughly 0.017 SOMI plus the wake-ups it books, and verdicts run on top at 0.36 each. |
+| **4.7 SOMI/hour** is the floor: what the protocol costs with both desks armed and refusing every window. | Balance drain over 10 minutes on 2026-09-08 with the desks' cadence mask closed. Watch 2.74/h (it fires on every one of ~230 markets an hour the venue creates, wanted or not), router 1.95/h (the venue-wide settlement wake-ups it books for all of them). |
+| **7.8 SOMI/hour** net to trade one asset on the 300-second cadence, **12.5** for two. | Same method, 15 minutes each. One asset: router 6.61/h + watch 2.84/h, less 1.65/h of platform refunds that pile up in the brain and are recoverable with `sweep`. The difference between the two is ~0.36 per extra window the committee is asked about. |
 | **0.003–0.01 SOMI** per handler firing in the day-0 spikes; ~0.017 under the live deployment's heavier handlers. | Balance delta across firings. |
 | **~34 SOMI/hour** for `Continuous` series mode. | 2.8 SOMI of creator float per rolled window (two oracle questions at 1.296 plus the 0.2 resolve reserve) × 12 windows/hour on the 300-second cadence. |
 | **61.6M gas** for one `triggerRoll`. | Live call on Shannon. It is why `HANDLER_GAS_LIMIT` is 100M. |

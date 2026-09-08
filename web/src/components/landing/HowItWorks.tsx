@@ -25,8 +25,8 @@ export function HowItWorks() {
           title={<>Wake, ask, dispose — starting in the same block.</>}
         >
           <p>
-            A five-minute market, one decision, and a permanent record either way. Every step below
-            is a transaction on Somnia.
+            One market, one decision, and a permanent record either way. Every step below is a
+            transaction on Somnia.
           </p>
         </SectionHead>
 

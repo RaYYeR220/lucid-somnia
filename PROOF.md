@@ -739,6 +739,30 @@ resume between top-ups. Nothing about the mechanism is bursty; the funding is.
 the whole window. A desk may allow the cadence and will refuse every one of those windows with
 `WindowTooShort`. Documented, not masked.
 
+**The venue has stopped listing anything but 60 s and 300 s, which leaves one tradeable cadence.**
+Checked against the indexer on 2026-09-08 at 15:55 UTC: of the last 298 binary markets on the venue
+this deployment serves, 246 were 60-second windows and 52 were 300-second, split evenly between BTC
+and ETH. There were no 15-minute and no 1-hour windows at all, although the desks allow both and the
+venue was rolling them earlier in the week. With 60 s unreachable behind the slack floor, **300 s is
+the only window length the desks can currently act on** — every trade in this document is one, and
+that is not a design choice of ours.
+
+```bash
+curl -s https://dev.smk.somnia.host/v1/graphql -H 'content-type: application/json' \
+  --data '{"query":"{ Market(where:{marketType:{_eq:\"BINARY\"}}, order_by:{expiry:desc}, limit:400)
+           { asset intervalSec venueId } }"}'
+```
+
+**The desks are running on BTC alone, to fit a faucet.** The mandate allows what its `allowedAssets`
+mask says and the interface reads that mask from the chain, so this is visible rather than stated —
+but the reason is worth writing down. The protocol burns SOMI continuously: about 2.8 an hour for
+the venue watch, plus roughly 0.36 per window the committee is asked about. On both assets that came
+to ~12.5 SOMI an hour net, which is more than a day of Shannon faucet claims; on BTC alone it is
+7.8, which a day's claims cover with margin to spare. Nothing about the protocol is per-asset —
+`allowedAssets` is one bitmask and ETH is one transaction away — and the earlier runs in this
+document, including the hero in [section 3](#3-hero-1--one-transaction-two-mandates-two-outcomes),
+were traded on ETH. Testnet economics, not capability.
+
 **Testnet only, unaudited.** Shannon, chain 50312, faucet tUSDC. All eight contracts are
 source-verified on the explorer, which is not an audit and is not offered as one. Neither these
 contracts nor the DreamDEX binary contracts underneath them have been audited — the published Hacken
