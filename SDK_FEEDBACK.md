@@ -21,7 +21,7 @@ docs, placed where a builder is standing when they hit the problem.
 - Indexer `https://dev.smk.somnia.host/v1/graphql`.
 - Live sample pool used for book reads: `0x9df243eab4fbcbcefee61b8069cebac50d022133`.
 
-## The four highest-value changes
+## The five highest-value changes
 
 1. Put Somnia's real gas costs in the docs, with a worked number. It is the root cause of two of
    the blocking items below and it silently invalidates every gas budget a builder brings
@@ -35,6 +35,10 @@ docs, placed where a builder is standing when they hit the problem.
    that a subscription was reaped. As it stands, a contract that runs out of float can be left
    permanently unable to re-subscribe. See
    [B4](#b4--a-reaped-subscription-is-silent-and-cancelling-it-reverts-which-can-permanently-brick-the-owner).
+5. State what a reactivity subscription actually costs: it is billed per matching log, matching is
+   on topics and emitter only, and on a busy emitter that is the dominant expense of the whole
+   protocol. Ours pays for ~230 firings an hour to act on 12. See
+   [S9](#s9--a-subscription-filters-on-topics-and-emitter-never-on-content-so-a-venue-wide-watch-bills-you-for-every-market-on-the-venue).
 
 ---
 
@@ -543,6 +547,87 @@ four-byte selector with no ABI is the difference between a diagnosis and a guess
 precondition each call needs and the earliest moment it is satisfiable, relative to `expiry` and to
 the oracle's answer. A third-party keeper has to decide *when* to fire; right now that timing has to
 be discovered by burning gas on reverts, which is exactly what the counter above is a record of.
+
+## S9 — A subscription filters on topics and emitter, never on content, so a venue-wide watch bills you for every market on the venue
+
+**Expected.** Some way to pay only for the logs a protocol actually acts on.
+
+**Observed.** `SubscriptionFilter` is `{eventTopics[4], origin, emitter}`. Topics 1-3 can pin
+*indexed* arguments, and for `MarketCreated` the indexed fields are `marketId`, `market` and `pool`
+— three values that do not exist until the log does. Everything a subscriber would want to filter
+on (asset, cadence, venue) is in the non-indexed body. So a protocol that serves one venue must
+subscribe to the module's whole log stream and discard most of it inside the handler, having paid
+for the handler.
+
+Measured on our deployment on 2026-09-08, with both desks armed and their mandate closed so nothing
+was traded:
+
+| | |
+| --- | --- |
+| markets the venue created | ~230/hour |
+| markets any desk wanted | 12/hour |
+| cost of the log subscription alone | 2.8 SOMI/hour |
+| cost of the whole protocol, trading nothing | 4.7 SOMI/hour |
+
+So **95% of the firings we pay for are for markets we decline in the first twenty lines of the
+handler**, and simply being armed costs 113 SOMI/day before a single trade. On mainnet gas that is
+not a rounding error, and it is the number that decides whether a reactive protocol is viable at
+all.
+
+**Impact.** Not a bug — the filter is documented and behaves as specified. The problem is that the
+cost model is not derivable from the docs. A builder reads "subscribe to an event" and budgets for
+the events they care about; the bill is for the events the *emitter* produces. We only found the
+real number by watching a balance for ten minutes with the desks switched off, which is not a
+technique the docs suggest.
+
+**Suggestion**, cheapest first:
+
+1. One paragraph in the reactivity docs: a subscription is billed per matching log, matching is on
+   topics and emitter only, and on a busy emitter that is your dominant cost. Show the arithmetic
+   once with a real emitter.
+2. A `getSubscriptionCost(id)` view, or a cumulative `spent` field on `getSubscriptionInfo`. Today
+   the only way to know what a subscription costs is to diff the owner's balance and attribute it
+   yourself — and if the owner holds several subscriptions, you cannot attribute it at all.
+3. If it is ever on the roadmap: one non-indexed word to match on, or a `maxFiringsPerBlock`. Either
+   would let a venue-scoped protocol pay venue-scoped costs.
+
+**Note for other builders.** Budget from the emitter's log rate, not from your own interest in it,
+and measure the floor before you measure anything else: arm the protocol with every policy closed,
+watch the balance for ten minutes, and that number is what you pay to exist.
+
+## S10 — The live cadence set changes with no announcement and nothing to query, and the shipped enum still lists the ones that are gone
+
+**Expected.** Some way to ask which window lengths a venue is currently rolling.
+
+**Observed.** There is none. The front-end bundle ships `INTERVAL_CADENCE_SEC` with `1m, 5m, 15m,
+1h, 4h, 1d`; `4h` and `1d` are built but gated off; the docs describe the venue generically. What is
+actually being rolled is discoverable only by counting recent markets on the indexer.
+
+It moves. Earlier in the hackathon week the venue was rolling 5m, 15m and 1h. On 2026-09-08 at 15:55
+UTC, of the last 298 binary markets on venue `0x1a1e6821…`: **246 were 60 s and 52 were 300 s.**
+Zero 15-minute, zero 1-hour.
+
+```bash
+curl -s https://dev.smk.somnia.host/v1/graphql -H 'content-type: application/json' \
+  --data '{"query":"{ Market(where:{marketType:{_eq:\"BINARY\"}}, order_by:{expiry:desc}, limit:400)
+           { asset intervalSec venueId } }"}' | jq -r '.data.Market[] | "\(.asset) \(.intervalSec)"' | sort | uniq -c
+```
+
+**Impact.** We tuned a strategy's allowed-cadence mask to 15m and 1h to cut costs, deployed it, and
+silently switched both desks off — there was nothing at those lengths to trade. The desks were
+armed, funded, correct, and idle, and the only symptom was refusals with a reason that reads exactly
+like a deliberate mandate. It cost us an hour and it would cost a less suspicious builder a lot
+more, because every layer reports success.
+
+There is a second-order version for anyone building on the cadences: 60-second windows cannot be
+traded by anything that has to consult an off-chain or committee-backed price first, since the round
+trip does not fit inside the window. With 15m and 1h gone, that leaves exactly one usable cadence on
+the venue, and nothing anywhere says so.
+
+**Suggestion.** Expose the live set — a `series` query on the indexer, or a documented "these are the
+cadences currently rolling" line in the Event Contracts docs, updated when it changes. Failing that,
+say in the docs that the shipped enum is the set of cadences the venue *can* roll rather than the
+set it *is* rolling, and point at the indexer query above as the way to find out.
 
 ---
 

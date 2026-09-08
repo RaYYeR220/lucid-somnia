@@ -4,6 +4,10 @@
 
 **Live interface:** https://lucid-somnia.vercel.app — reads Somnia Shannon directly, no wallet needed to look around.
 
+**Feedback report:** [SDK_FEEDBACK.md](SDK_FEEDBACK.md) — seventeen findings on the Event Contracts
+and Reactivity stack, each with a reproduction. Four are failures that produce no error, no revert
+and no log; the rest cost between half a day and a day each to work out.
+
 A guided path through this repository, in order, with the exact command for each step and what you
 should see. It runs end to end in about five minutes.
 

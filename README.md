@@ -4,11 +4,21 @@
 
 **Demo:** https://youtu.be/b-o_-8mEyKU — three minutes on what it does and what it refuses to do.
 
+**Feedback for the Somnia and DreamDEX teams:** [SDK_FEEDBACK.md](SDK_FEEDBACK.md) — seventeen
+findings from three days of building on the stack, each with a reproduction and a measured number.
+Four of them are silent failures: a handler that is billed and never runs, a reaped subscription
+that bricks its owner's ability to re-subscribe, an estimator that under-quotes a `try/catch`, and
+gas costs an order of magnitude above the mainnet intuition every builder arrives with.
+
 Autonomous trading desks for **DreamDEX Event Contracts** on Somnia.
 
 Event Contracts are short-dated binary markets: will BTC be above the price this window opened at
 when the window closes. The venue opens one, settles it against an oracle, and recycles the pool.
-Lucid trades the four cadences its mandate recognises — 60, 300, 900 and 3600 seconds.
+A mandate recognises four cadences — 60, 300, 900 and 3600 seconds — but only one of them is
+tradeable today: 60-second windows are shorter than the committee round trip a desk must wait for,
+and the venue stopped listing 900 and 3600 during the hackathon week. Every live trade below is a
+300-second window. Both facts are the venue's, not ours, and
+[SDK_FEEDBACK.md](SDK_FEEDBACK.md) has the query to check the second one.
 
 Every comparable product is a process on somebody's laptop holding an API key. A Lucid desk is a
 contract, and the three jobs that normally need a server are done by Somnia validators.
@@ -390,7 +400,7 @@ Three more, smaller:
 - [CLAIMS.md](CLAIMS.md) — every claim made here, with its evidence tier and how to check it.
 - [MOCKS.md](MOCKS.md) — exactly where the line between real and simulated runs.
 - [EVAL.md](eval/EVAL.md) — what the committee actually scored, and against which controls.
-- [SDK_FEEDBACK.md](SDK_FEEDBACK.md) — four blocking issues, eight sharp edges and three
+- [SDK_FEEDBACK.md](SDK_FEEDBACK.md) — four blocking issues, ten sharp edges and three
   documentation gaps found building this, each with a reproduction.
 - [kit/README.md](kit/README.md) — client and CLI reference.
 
