@@ -253,12 +253,17 @@ function RouterSection() {
           <h3 className="text-xl tracking-tighter">Why one router</h3>
           <p className="mt-2 text-md text-ink3">
             The floor is checked against whichever contract calls <code translate="no">subscribe</code>.
-            A subscription per desk would lock {somi(SUBSCRIPTION_FLOOR_WEI, 0)}&nbsp;SOMI per user, which is not a product — so one
-            router owns every subscription and every desk shares the bond.
+            A subscription per desk would lock {somi(SUBSCRIPTION_FLOOR_WEI, 0)}&nbsp;SOMI per user, which is not a product — so the
+            desks share one bond rather than each posting their own. The venue subscription sits behind
+            a second one, so a router that runs out of float stops booking wake-ups without also going
+            deaf to the venue.
           </p>
           <dl className="mt-5 flex flex-col gap-2.5 text-base">
             <Wire label="Router">
               <AddressLink address={deployed.router} />
+            </Wire>
+            <Wire label="Venue watch">
+              <AddressLink address={deployed.watch} />
             </Wire>
             <Wire label="Venue module">
               <Value state={router} w="12ch">{(r) => <AddressLink address={r.venueModule} />}</Value>
@@ -328,7 +333,7 @@ function SubscriptionsSection() {
             onRetry={subs.refetch}
           />
         ) : decoded.length === 0 ? (
-          <EmptyState icon={<IconWarn size={20} />} title="The router owns no subscriptions">
+          <EmptyState icon={<IconWarn size={20} />} title="No subscriptions are live">
             <p>
               Nothing is listening. This is exactly what dropping below the{' '}
               {somi(SUBSCRIPTION_FLOOR_WEI, 0)}&nbsp;SOMI floor looks

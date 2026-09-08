@@ -22,7 +22,7 @@ validators. The price is Somnia's real on-chain price-oracle agent. There is no 
 
 | file | stands in for | what it fakes, and why |
 | --- | --- | --- |
-| `MockPrecompile.sol` | The reactivity precompile at `0x0100` | `vm.etch`ed at the precompile address so `subscribe` returns an id instead of reverting. It does **not** simulate reactivity — the chain does that, and it was verified there. |
+| `MockPrecompile.sol` | The reactivity precompile at `0x0100` | `vm.etch`ed at the precompile address so `subscribe` returns an id instead of reverting. It does **not** simulate reactivity — the chain does that, and it was verified there. It does model two things the chain does that are easy to be kinder than: a `Schedule` carries the instant it really fired at rather than the one requested, and a cancel is refused for a subscription it no longer holds. |
 | `MockAgentPlatform.sol` | Somnia's agent platform `0x037B…6776` | Delivers callbacks synchronously. The live platform answers asynchronously from validator transactions, which no unit test can wait for. |
 | `MockBinaryPool.sol` | A live `BinaryPool` | A CLOB that actually moves collateral, so the desk suite can measure what a window cost rather than trust what the desk claims it cost. |
 | `MockPool.sol` | A live `BinaryPool` | Top of book set directly by the test. Etched onto the pool address carried by a real captured `MarketCreated` log. |
@@ -43,6 +43,27 @@ validators. The price is Somnia's real on-chain price-oracle agent. There is no 
 Seventeen files. All of them are failure injection: a live venue will not politely return `false`
 from `placeBinaryOrder`, revert a `triggerRoll`, or hand back a malformed committee answer on
 request. That is what the mocks are for, and it is all they are for.
+
+### A mock that is kinder than the chain is worse than no mock
+
+Twice in this project a mock that behaved *better* than Somnia hid a defect that only chain time
+could find, and both times the suite was green while the product did nothing.
+
+The first was the `Schedule` timestamp. `MockPrecompile` fired the millisecond that had been
+requested; the chain fires the millisecond it actually emitted at, which is never the same number.
+A router keyed on the requested value passed 350 tests and no-opped on chain for its entire life.
+The mock now skews every firing by the 73 ms measured in a real Shannon handler transaction.
+
+The second was `unsubscribe`. The mock accepted any id at all, so the path where a cancel is refused
+was unreachable and nothing tested it. On chain, a subscription whose owner drops below the 32 SOMI
+floor is reaped without telling the owner, and every subsequent cancel of that id is refused —
+which is what permanently bricked `LucidRouter.armVenue` on 2026-09-08, told in
+[PROOF.md section 12](PROOF.md#12-the-router-bricked-itself-and-what-replaced-it). The mock now
+refuses those cancels and carries a `reap()` that takes a subscription away the way the chain does.
+
+Both fixes made the mock less convenient and the suite more honest. There is no third lesson here:
+a mock exists to force failures, and one that quietly declines to force a failure the chain will is
+not a simplification, it is a false negative with a test count attached.
 
 ---
 
@@ -75,15 +96,17 @@ of this is possible. They do **not** establish that `LucidDesk`'s own order path
 
 Stated plainly, one line each.
 
-- **No Lucid desk has ever placed an order on chain.** Every live decision so far has been a
-  refusal — `Refused(LowEdge)` for all six desk decisions in the recorded 15-minute run. The
-  `AiEdge` taker path and the `Maker` complete-set path are covered by the desk suite against
-  `MockBinaryPool`, which moves real balances, and by nothing on chain.
-- **No Lucid desk has ever settled or redeemed a position on chain,** because it has never held one.
-  `onSettlement`, `finalizeMarket` and `redeem` from a desk are tested only against mocks.
-- **`_ensureApprovals` has never run against the real venue.** It grants the pool an ERC-20
-  allowance and the module and pool ERC-6909 operator rights, and it runs on a desk's first trade —
-  which has not happened.
+- **The `AiEdge` taker path has never executed on chain.** Every live `AiEdge` decision has ended
+  in a refusal, and since the escrow fix every one of them has been `NoBook`: the venue's books are
+  empty, so there is no price to disagree with and nothing to take. `_take` is covered by the desk
+  suite against `MockBinaryPool`, which moves real balances, and by nothing on chain. The `Maker`
+  path is not in this list — it mints, quotes, cancels, redeems and settles on the live venue, and
+  [PROOF.md section 2](PROOF.md#2-the-loop-proven-end-to-end) walks one window of it transaction by
+  transaction.
+- **No desk has ever been filled by a counterparty on the taker side.** The `Maker` legs that have
+  been filled were lifted by whoever was on the other side of the venue's book, which is a fill of
+  ours but not a trade we initiated. What that means for the P&L numbers is set out in
+  [PROOF.md section 11](PROOF.md#11-honest-limits).
 - **`LucidKeeper` has never performed venue upkeep on chain.** Its five success counters read zero
   and its failure counter does not: `counts()` returned `0 0 0 0 0 1362` at 2026-09-07 05:58 UTC —
   zero finalized, released, synced, poked and voided, against 1 362 attempts that reverted, across

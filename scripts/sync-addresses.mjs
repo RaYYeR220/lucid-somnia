@@ -29,11 +29,13 @@ const EXPLORERS = {
 }
 
 /**
- * Display names, in the order the table lists them. The router is first because it is the only
- * contract that talks to the reactivity precompile, and everything else is reachable from it.
+ * Display names, in the order the table lists them. The router is first because everything else
+ * is reachable from it, and the watch sits next to it because between them they own every
+ * reactivity subscription this protocol holds.
  */
 const LABELS = [
   ['router', 'LucidRouter'],
+  ['watch', 'LucidWatch (venue subscription)'],
   ['brain', 'LucidBrain'],
   ['deskImplementation', 'LucidDesk (clone implementation)'],
   ['factory', 'LucidFactory'],

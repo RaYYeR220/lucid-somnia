@@ -56,15 +56,15 @@ to deposit, set the mandate, arm, and withdraw.
               │                                  mintSet · placeBinaryOrder
               ▼                                   · finalizeMarket · redeem
  ┌─ Somnia reactivity precompile 0x0100 ─────────┐          │
- │  log subscription on the venue                 │         │
+ │  log subscription on the venue  ← LucidWatch   │         │
  │  Schedule one-shots: decision, then settlement │         │
  └────────────┬───────────────────────────────────┘         │
               │  validator-executed synthetic transaction,  │
               │  same block as the event, msg.sender=0x0100 │
               ▼                                             │
  ┌─ LucidRouter ─────────────────────────────────┐          │
- │  the only contract that talks to 0x0100        │         │
- │  holds the 32 SOMI subscription bond           │         │
+ │  handles every callback; books its own timers  │         │
+ │  holds a 32 SOMI bond; LucidWatch holds another│         │
  │  fan-out bounded at 32 desks per firing        │         │
  └────────────┬──────────────────────┬────────────┘         │
               │ requestVerdict       │ onSettlement         │
@@ -101,11 +101,12 @@ venue's own scheduler has gone quiet.
 
 ---
 
-## The eight contracts
+## The nine contracts
 
 | contract | responsibility |
 | --- | --- |
-| `LucidRouter` | The protocol's only subscriber to `0x0100`; decodes venue logs, fans out to desks, schedules wake-ups, holds the bond. |
+| `LucidRouter` | Handles every reactivity callback: decodes venue logs, fans out to desks, books its own wake-ups, holds a bond for them. |
+| `LucidWatch` | Owns the venue's log subscription on a second bond and names the router as its handler. Exists because a drained router cannot re-arm itself. |
 | `LucidDesk` | One user's non-custodial desk: holds their tUSDC and outcome legs, executes under a mandate it cannot talk its way past. |
 | `PolicyLib` | A pure, total, never-reverting function from (mandate, state, market, verdict, money) to one refusal reason. |
 | `LucidBrain` | The two-stage committee wrapper: price first, then inference — every failure path still ends in a stored verdict. |
@@ -114,10 +115,43 @@ venue's own scheduler has gone quiet.
 | `LucidRelay` | Universal auto-redeem: anybody signs an EIP-712 exit once, and it is executed for them after settlement. No owner. |
 | `LucidSeries` | Failover market creation — rolls our own window when DreamDEX's scheduler stops rolling theirs. |
 
-`PolicyLib` is an internal library compiled into `LucidDesk`; the other seven are deployed
+`PolicyLib` is an internal library compiled into `LucidDesk`; the other eight are deployed
 separately. Source is in [`contracts/src`](contracts/src). The natspec carries the reasoning —
 most of the non-obvious constants in this codebase are there because something measured on Shannon
 said so, and each one says which measurement.
+
+### Why the subscription sits in its own contract
+
+Somnia requires a subscription's owner to hold at least 32 SOMI and reaps the subscriptions of an
+owner that falls below that line. The router pays for committee calls and settlement wake-ups out
+of the same balance that backs its bond, so it running out of float is not an edge case — it is the
+ordinary end of a funding round.
+
+Running dry was survivable. Coming back was not. `LucidRouter.armVenue` cancels the previous
+subscription before creating the new one, and the cancel reverts when the precompile refuses it.
+Once the chain has already removed the subscription, the id the router still holds names nothing,
+the cancel fails, and the whole call reverts — so a router that ran dry can never be re-armed, no
+matter how much SOMI it is later handed. That is not a hypothetical: it is what happened to this
+deployment on 2026-09-08, with 40 SOMI in hand and every other part of the protocol healthy.
+
+Desks bind to their router permanently, so redeploying the router would have stranded their
+collateral. `LucidWatch` is the way out that does not touch anything holding money. It owns the
+venue's `MarketCreated` subscription, names the router as the handler, and carries its own bond;
+Somnia's handler base admits any call from `0x0100` without asking who owns the subscription behind
+it, so the router needed no change at all. Its own cancel goes through a low-level call whose
+failure is recorded and ignored — a contract whose job is to recover from an empty balance must not
+carry a path that an empty balance can close permanently.
+
+The split is worth having on its own merits. The venue watch and the router's scheduling now sit
+behind two independent bonds: the router draining stops the wake-ups it pays for and leaves the
+watch delivering markets, and the protocol resumes on the next window rather than on the next
+deployment.
+
+`test_router_armVenue_is_bricked_by_a_reap` in
+[`contracts/test/LucidWatch.t.sol`](contracts/test/LucidWatch.t.sol) reproduces the bug against the
+deployed router's own code, and the test beside it runs the identical setup through the watch.
+Neither could be written until `MockPrecompile` stopped accepting cancels for subscriptions it no
+longer held — the mock being kinder than the chain is exactly why this shipped.
 
 ---
 
@@ -214,6 +248,7 @@ node scripts/sync-addresses.mjs            # refreshes the tables in this file a
 | contract | address |
 | --- | --- |
 | `LucidRouter` | [`0x6aE21a20444141552648C1f8443bAf171BCCcB99`](https://shannon-explorer.somnia.network/address/0x6aE21a20444141552648C1f8443bAf171BCCcB99) |
+| `LucidWatch (venue subscription)` | [`0xA0eb631bc7bD386C05Dcc1b1BFFd0021Ef1f6D3C`](https://shannon-explorer.somnia.network/address/0xA0eb631bc7bD386C05Dcc1b1BFFd0021Ef1f6D3C) |
 | `LucidBrain` | [`0x0c640E3aFc627bEec7eDB9985696e12B50AdAd25`](https://shannon-explorer.somnia.network/address/0x0c640E3aFc627bEec7eDB9985696e12B50AdAd25) |
 | `LucidDesk (clone implementation)` | [`0xa659b03e2349559f2d56D17F246e66e79467c17e`](https://shannon-explorer.somnia.network/address/0xa659b03e2349559f2d56D17F246e66e79467c17e) |
 | `LucidFactory` | [`0x9c1EF0C429f1F88e8247f3539DeF8a1f8FCCEb84`](https://shannon-explorer.somnia.network/address/0x9c1EF0C429f1F88e8247f3539DeF8a1f8FCCEb84) |
@@ -344,7 +379,7 @@ Three more, smaller:
 
 | path | what it is |
 | --- | --- |
-| `contracts/` | Foundry project: the eight contracts, the suite, deploy and verification scripts. |
+| `contracts/` | Foundry project: the nine contracts, the suite, deploy and verification scripts. |
 | `kit/` | `lucid-kit` — typed viem client and the `lucid` CLI. Read commands need no key. |
 | `eval/` | Pre-registered, read-only scoring harness for the committee. Signs nothing. |
 | `scripts/sync-addresses.mjs` | Regenerates the address tables in this file and `JUDGES.md`. |
@@ -355,7 +390,7 @@ Three more, smaller:
 - [CLAIMS.md](CLAIMS.md) — every claim made here, with its evidence tier and how to check it.
 - [MOCKS.md](MOCKS.md) — exactly where the line between real and simulated runs.
 - [EVAL.md](eval/EVAL.md) — what the committee actually scored, and against which controls.
-- [SDK_FEEDBACK.md](SDK_FEEDBACK.md) — three blocking issues, eight sharp edges and three
+- [SDK_FEEDBACK.md](SDK_FEEDBACK.md) — four blocking issues, eight sharp edges and three
   documentation gaps found building this, each with a reproduction.
 - [kit/README.md](kit/README.md) — client and CLI reference.
 

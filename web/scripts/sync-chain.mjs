@@ -159,8 +159,13 @@ export const deployed = {
   /** ERC-1167 master copy every user desk is cloned from. Never call it directly. */
   deskImplementation: '${deployed.deskImplementation}',
   brain: '${deployed.brain}',
-  /** Sole owner of every reactivity subscription; must hold >= 32 SOMI to keep them alive. */
+  /** Handles every reactivity callback and owns the wake-ups it books; must hold >= 32 SOMI. */
   router: '${deployed.router}',
+  /**
+   * Owns the venue's MarketCreated subscription on a bond of its own, with the router as its
+   * handler. Undefined on deployments that predate it, where the router owns that one too.
+   */
+  watch: ${deployed.watch ? `'${deployed.watch}'` : 'undefined'},
   factory: '${deployed.factory}',
   keeper: '${deployed.keeper}',
   relay: '${deployed.relay}',

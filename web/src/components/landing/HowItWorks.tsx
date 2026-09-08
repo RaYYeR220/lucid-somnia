@@ -36,7 +36,7 @@ export function HowItWorks() {
               <StepNumber>1</StepNumber>
               <h3 className="text-xl">Somnia wakes the desk</h3>
               <p className="mt-2 text-md text-ink3">
-                A window opens on DreamDEX. The reactivity subscription the router owns fires its
+                A window opens on DreamDEX. A reactivity subscription runs the router&rsquo;s
                 handler in the same block as the venue&rsquo;s own log — no cron, no worker, no
                 listener of ours. The router decodes the log and asks each armed desk&rsquo;s
                 pre-filter whether it wants the window.

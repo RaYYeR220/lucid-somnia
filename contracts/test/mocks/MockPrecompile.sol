@@ -36,10 +36,21 @@ contract MockPrecompile is ISomniaReactivityPrecompile {
     SubscriptionData[] internal _subs;
     address[] internal _owners;
 
-    /// @dev Every id passed to `unsubscribe`, in call order.
+    /// @dev Which ids the precompile still holds. An id leaves this set when it is cancelled and
+    /// when it is reaped, and it never comes back: the chain does not resurrect a subscription.
+    mapping(uint256 => bool) internal _live;
+
+    /// @dev Every id passed to `unsubscribe`, in call order. Only accepted cancels are recorded,
+    /// because a refused one cancelled nothing.
     uint256[] internal _unsubscribed;
 
-    /// @notice A caller asked about a subscription that was never created here.
+    /// @notice A caller asked about, or tried to cancel, a subscription this contract does not hold.
+    /// @dev Shared by both, because from a caller's side they are the same fact: the id names
+    /// nothing. **This mock used to accept any id at all in `unsubscribe`**, and that leniency is
+    /// exactly what let `LucidRouter.armVenue` ship with a re-arm path that reverts forever once
+    /// the chain has reaped the subscription it still holds an id for. A mock that is kinder than
+    /// the chain does not make a contract safer; it makes the test suite stop mentioning the way
+    /// it breaks. See `LucidWatch`.
     error NoSuchSubscription(uint256 subscriptionId);
 
     /// @inheritdoc ISomniaReactivityPrecompile
@@ -48,13 +59,39 @@ contract MockPrecompile is ISomniaReactivityPrecompile {
         _owners.push(msg.sender);
         // Ids start at 1 so that a stored zero unambiguously means "no subscription".
         subscriptionId = _subs.length;
+        _live[subscriptionId] = true;
         emit SubscriptionCreated(subscriptionId, msg.sender, subscriptionData);
     }
 
     /// @inheritdoc ISomniaReactivityPrecompile
+    /// @dev Reverts on an id this contract does not hold, which is what Shannon does. The failure
+    /// is not hypothetical: a subscription whose owner drops below the 32 SOMI floor is reaped by
+    /// the chain, its owner goes on holding the id, and the cancel that id was for is refused from
+    /// then on.
     function unsubscribe(uint256 subscriptionId) external {
+        if (!_live[subscriptionId]) revert NoSuchSubscription(subscriptionId);
+
+        _live[subscriptionId] = false;
         _unsubscribed.push(subscriptionId);
         emit SubscriptionRemoved(subscriptionId, msg.sender);
+    }
+
+    /// @notice Take a subscription away from its owner the way the chain does when the owner's
+    /// balance falls through `SUBSCRIPTION_OWNER_MINIMUM_BALANCE`.
+    /// @dev Deliberately not `unsubscribe`: the owner never asked, learns nothing, and is left
+    /// holding an id that now names nothing. That gap is the whole failure mode, and a test cannot
+    /// reach it through a cancel the owner performed on purpose.
+    /// @param subscriptionId The id the chain drops.
+    function reap(uint256 subscriptionId) external {
+        if (!_live[subscriptionId]) revert NoSuchSubscription(subscriptionId);
+
+        _live[subscriptionId] = false;
+        emit SubscriptionRemoved(subscriptionId, _owners[subscriptionId - 1]);
+    }
+
+    /// @notice Whether this contract still holds `subscriptionId`.
+    function isLive(uint256 subscriptionId) external view returns (bool) {
+        return _live[subscriptionId];
     }
 
     /// @inheritdoc ISomniaReactivityPrecompile
@@ -63,7 +100,7 @@ contract MockPrecompile is ISomniaReactivityPrecompile {
         view
         returns (SubscriptionData memory subscriptionData, address owner)
     {
-        if (subscriptionId == 0 || subscriptionId > _subs.length) revert NoSuchSubscription(subscriptionId);
+        if (!_live[subscriptionId]) revert NoSuchSubscription(subscriptionId);
         return (_subs[subscriptionId - 1], _owners[subscriptionId - 1]);
     }
 

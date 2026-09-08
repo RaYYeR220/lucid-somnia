@@ -61,17 +61,21 @@ describe('parseSubscriptionInfo', () => {
 })
 
 describe('describeSubscription', () => {
+  // The handler in these fixtures is whatever router the kit is configured for, so the expected
+  // line is built the same way rather than pinned to the address of one deployment.
+  const handler = `${ROUTER.slice(0, 8)}…${ROUTER.slice(-4)}`
+
   it('recognises the venue listener that wakes the router', () => {
     const line = describeSubscription(parseSubscriptionInfo(raw(RAW_SUBSCRIPTION_MARKET_LISTENER)))
     expect(line).toBe(
-      'market listener — calls 0x4fbb2d…9f2f.onEvent in the same block as every new DreamDEX market (8.0M gas)',
+      `market listener — calls ${handler}.onEvent in the same block as every new DreamDEX market (8.0M gas)`,
     )
   })
 
   it('reads a Schedule one-shot back as the wall-clock time it will fire', () => {
     const line = describeSubscription(parseSubscriptionInfo(raw(RAW_SUBSCRIPTION_ONE_SHOT)))
     expect(line).toBe(
-      'one-shot timer — calls 0x4fbb2d…9f2f.onEvent at 2026-09-06T01:30:05.000Z (8.0M gas)',
+      `one-shot timer — calls ${handler}.onEvent at 2026-09-06T01:30:05.000Z (8.0M gas)`,
     )
   })
 

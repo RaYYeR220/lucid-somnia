@@ -105,6 +105,11 @@ ccall() { cast call "$@" --rpc-url "$RPC" 2>/dev/null; }
 jkey() { py -c "import json,sys;print(json.load(open('deployed.json')).get(sys.argv[1],''))" "$1"; }
 
 ROUTER=$(jkey router)
+# The venue watch. It owns the `MarketCreated` subscription and names the router as its
+# handler, so the loop starts on its bond rather than on the router's. Older records predate
+# it and carry no `watch` key; the checks below then fall back to the router owning its own
+# subscription, which is what those deployments actually do.
+WATCH=$(jkey watch)
 BRAIN=$(jkey brain)
 SERIES=$(jkey series)
 MARKET_CREATOR=$(jkey marketCreator)
@@ -183,28 +188,55 @@ while IFS=$'\t' read -r verdict line; do
 done <<< "$CODE_REPORT"
 
 # -- 2 ----------------------------------------------------------------------------------------
-section "2. the router stays above the reactivity subscription floor"
-ROUTER_BAL=$(num "$(cast balance "$ROUTER" --rpc-url "$RPC" 2>/dev/null)")
-if [ -z "$ROUTER_BAL" ]; then
-  bad "could not read the router balance from $RPC"
-else
-  VERDICT=$(py - "$ROUTER_BAL" "$SUBSCRIPTION_FLOOR_WEI" <<'PY'
+section "2. every contract that owns a subscription stays above the reactivity floor"
+# The floor is checked against whichever contract calls `subscribe`, so it binds on each of
+# them separately. The watch pays for delivering markets; the router pays for the wake-ups and
+# the committee. Either one falling through the floor stops its own half and nothing else,
+# which is the entire reason they are two contracts and not one.
+floor_check() { # label, address
+  local label=$1 addr=$2 bal verdict
+  [ -n "$addr" ] || { skip "$label balance — deployed.json names no address for it"; return; }
+  bal=$(num "$(cast balance "$addr" --rpc-url "$RPC" 2>/dev/null)")
+  if [ -z "$bal" ]; then
+    bad "could not read the $label balance from $RPC"
+    return
+  fi
+  verdict=$(py - "$bal" "$SUBSCRIPTION_FLOOR_WEI" <<'PY'
 import sys
 bal, floor = int(sys.argv[1]), int(sys.argv[2])
 print("%s %.6f SOMI held, floor is %.0f SOMI (%+.6f)" %
       ("OK" if bal >= floor else "LOW", bal / 1e18, floor / 1e18, (bal - floor) / 1e18))
 PY
 )
-  case "$VERDICT" in
-    OK*) ok  "router balance — ${VERDICT#OK }" ;;
-    *)   bad "router balance — ${VERDICT#LOW }" ;;
+  case "$verdict" in
+    OK*) ok  "$label balance — ${verdict#OK }" ;;
+    *)   bad "$label balance — ${verdict#LOW }" ;;
+  esac
+}
+floor_check router "$ROUTER"
+
+# The watch is a standby on a fresh deployment: deployed, cold, holding nothing. The floor
+# binds on it only once it actually owns the venue subscription, and reporting a cold standby
+# as underfunded would be reporting a deployment that is working exactly as designed as broken.
+if [ -n "$WATCH" ]; then
+  WATCH_ARMED=$(ccall "$WATCH" "armed()(bool)")
+  case "$WATCH_ARMED" in
+    true)  floor_check watch "$WATCH" ;;
+    false) ok "watch is a cold standby — holds no subscription, so the floor does not bind on it" ;;
+    *)     bad "watch.armed() did not answer — got '${WATCH_ARMED:-<nothing>}'" ;;
   esac
 fi
 
 # -- 3 ----------------------------------------------------------------------------------------
-section "3. the router owns a live reactivity subscription on the DreamDEX venue"
-SUBS_RAW=$(rpc somnia_reactivityGetSubscriptions "[\"$ROUTER\"]")
-SUB_IDS=$(SUBS="$SUBS_RAW" py - <<'PY'
+section "3. a live reactivity subscription on the DreamDEX venue delivers to the router"
+# Ownership of that subscription is not the claim; delivery to the router is. Both owners are
+# asked, because a deployment whose router still holds it and one whose watch holds it are
+# equally live, and a check written against only one of them would report the other as dead.
+SUB_IDS=""; SUB_SOURCES=""
+for holder in "$ROUTER" "$WATCH"; do
+  [ -n "$holder" ] || continue
+  HOLDER_RAW=$(rpc somnia_reactivityGetSubscriptions "[\"$holder\"]")
+  HOLDER_IDS=$(SUBS="$HOLDER_RAW" py - <<'PY'
 import json, os
 try:
     print("\n".join(json.loads(os.environ["SUBS"]).get("result") or []))
@@ -212,12 +244,16 @@ except Exception:
     pass
 PY
 )
-if [ -z "$SUB_IDS" ]; then
-  bad "somnia_reactivityGetSubscriptions($ROUTER) returned no subscriptions — raw: $SUBS_RAW"
+  N=$(printf '%s' "$HOLDER_IDS" | grep -c . || true)
+  SUB_SOURCES="$SUB_SOURCES$holder -> ${N:-0} id(s) $(printf '%s ' $HOLDER_IDS); "
+  if [ -n "$HOLDER_IDS" ]; then SUB_IDS="$SUB_IDS $HOLDER_IDS"; fi
+done
+if [ -z "$(printf '%s' "$SUB_IDS" | tr -d '[:space:]')" ]; then
+  bad "no subscription is owned by the router or the watch — $SUB_SOURCES"
   skip "subscription fields (emitter / topic / handler / gas limit) — no subscription to inspect"
 else
-  SUB_COUNT=$(printf '%s\n' "$SUB_IDS" | grep -c .)
-  ok "somnia_reactivityGetSubscriptions($ROUTER) — $SUB_COUNT subscription id(s): $(printf '%s ' $SUB_IDS)"
+  SUB_COUNT=$(printf '%s\n' $SUB_IDS | grep -c .)
+  ok "somnia_reactivityGetSubscriptions — $SUB_COUNT id(s) across owners: $SUB_SOURCES"
 
   MATCH_ID=""; MATCH_DETAIL=""; LAST_DETAIL=""
   for id in $SUB_IDS; do

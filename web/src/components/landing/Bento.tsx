@@ -83,7 +83,7 @@ function NoServerCard() {
         price the same way. There is no queue to drain, no cron to miss, and no key in an env file.
       </p>
       <CardFoot>
-        <Stat label="subscriptions the router owns" size="sm">
+        <Stat label="live subscriptions" size="sm">
           <Value state={subs} w="1ch">{(list) => count(list.length)}</Value>
         </Stat>
         <Stat label="SOMI at the router" size="sm">
@@ -270,8 +270,8 @@ function ReactiveCard() {
           </li>
         ) : decoded.length === 0 ? (
           <li className="text-ink4">
-            The router owns no subscriptions right now. Nothing is listening, which is exactly what
-            dropping below the {somi(SUBSCRIPTION_FLOOR_WEI, 0)}&nbsp;SOMI floor looks like.
+            No subscriptions right now. Nothing is listening, which is exactly what dropping below
+            the {somi(SUBSCRIPTION_FLOOR_WEI, 0)}&nbsp;SOMI floor looks like.
           </li>
         ) : (
           decoded.map((sub) => (

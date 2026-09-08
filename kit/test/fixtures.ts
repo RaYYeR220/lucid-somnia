@@ -1,4 +1,5 @@
 import type { Address, Hex } from 'viem'
+import { addresses } from '../src/addresses.js'
 import type { MarketRow } from '../src/markets.js'
 
 /**
@@ -24,7 +25,18 @@ function data(...words: (bigint | number | string)[]): Hex {
 }
 
 export const DESK: Address = '0x4eedabcc63448b11bd689eea4021e7e5b2b314f5'
-export const ROUTER: Address = '0x4fbb2dbc34b74e8837e1bd2dc83d8dcdfd859f2f'
+
+/**
+ * Taken from the deployment rather than pinned to the address these logs were captured under.
+ *
+ * `decodeLucidLog` tells a router log from a desk log by comparing the emitter against the router
+ * the kit is configured for, so a fixture carrying a *different* router is not a stale detail —
+ * it decodes as a desk log and the test fails. That is exactly what happened when the router was
+ * redeployed and this constant stayed behind: a shipped suite with a red test in it, for a decoder
+ * that was working correctly. The address the logs were really emitted by was
+ * 0x4fbb2dbc34b74e8837e1bd2dc83d8dcdfd859f2f, and nothing in them depends on it.
+ */
+export const ROUTER: Address = addresses.router
 
 export const MARKET_ID: Hex = '0x0000000000000000000000000000000000000000000000000000000000014a51'
 

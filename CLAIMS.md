@@ -21,7 +21,7 @@ recorded run are collected in [PROOF.md](PROOF.md).
 
 | claim | how to check |
 | --- | --- |
-| The eight contracts compile and the suite passes with zero failures. | `bash contracts/setup.sh && cd contracts && forge test` |
+| The nine contracts compile and the suite passes with zero failures. | `bash contracts/setup.sh && cd contracts && forge test` |
 | A desk can never spend past its per-window cap or its daily budget, can never trade without a passing verdict, and stays halted once halted. | `contracts/test/PolicyLib.invariant.t.sol` — invariant campaign, `fail_on_revert = true`, pinned fuzz seed. |
 | `PolicyLib` never reverts, and its checks always report the same first failure in the same order. | `contracts/test/PolicyLib.t.sol` |
 | A desk that reverts, loops, has no code or has no credit is skipped by name and does not take the rest of the fan-out down with it. | `contracts/test/LucidRouter.t.sol` |
@@ -29,7 +29,7 @@ recorded run are collected in [PROOF.md](PROOF.md).
 | The brain's quote is stage 1 plus stage 2, each re-derived from the agent platform's own `getAdvancedRequestDeposit` rather than taken on the brain's word. | `verify-onchain.sh`, section 10 |
 | The committee's on-chain verdicts, joined to how those windows actually settled, produce the metrics in `EVAL.md` against a constant-50% control and 20,000 coin-flip twins. | `cd eval && npm install && npm run eval` |
 | The typed client decodes real Shannon logs and enforces the venue's traps (stale `Trading` rows, the 90-second slack, `Finalized` as the only terminal status). | `cd kit && npm install && npm test` |
-| All seven Lucid contracts and the demo desk clone are source-verified on Blockscout. | Explorer links in [JUDGES.md](JUDGES.md) |
+| All eight Lucid contracts and the demo desk clone are source-verified on Blockscout. | Explorer links in [JUDGES.md](JUDGES.md) |
 | The `Refusal` enum is append-only, and every value has one distinct meaning. | `contracts/src/types/LucidTypes.sol` |
 
 ## VERIFIED-LIVE

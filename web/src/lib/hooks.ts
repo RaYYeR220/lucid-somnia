@@ -84,8 +84,25 @@ export function useSeriesStatus(routerSeries: Address | undefined) {
   )
 }
 
+/**
+ * Every subscription the protocol holds, across both bonded owners.
+ *
+ * The router owns the wake-ups it books for itself; the watch owns the venue listener and names
+ * the router as its handler. Reading only the router would show a protocol with no way of hearing
+ * about a new market, which is the opposite of what is true.
+ */
 export function useSubscriptions() {
-  return useQuery('subs', () => getOwnedSubscriptions(deployed.router), { refreshMs: 15_000 })
+  return useQuery(
+    'subs',
+    async () => {
+      const owners: Address[] = [deployed.router, deployed.watch].filter(
+        (a) => typeof a === 'string',
+      )
+      const sets = await Promise.all(owners.map((owner) => getOwnedSubscriptions(owner)))
+      return sets.flat()
+    },
+    { refreshMs: 15_000 },
+  )
 }
 
 export function useDeskTable() {

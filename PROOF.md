@@ -28,11 +28,12 @@ Related documents, not repeated here: [README.md](README.md) · [CLAIMS.md](CLAI
 ## 1. The addresses
 
 Runtime-code sizes are the ones `eth_getCode` returned during the run of `verify-onchain.sh`
-reproduced in [section 12](#12-reproduce-it-yourself).
+reproduced in [section 13](#13-reproduce-it-yourself).
 
 | what | address | one line |
 | --- | --- | --- |
-| `LucidRouter` | [`0x6aE21a20444141552648C1f8443bAf171BCCcB99`](https://shannon-explorer.somnia.network/address/0x6aE21a20444141552648C1f8443bAf171BCCcB99) | Owns the reactivity subscription, wakes on the venue's `MarketCreated`, books the decision and settlement one-shots, fans out to armed desks. 24 112 bytes. |
+| `LucidRouter` | [`0x6aE21a20444141552648C1f8443bAf171BCCcB99`](https://shannon-explorer.somnia.network/address/0x6aE21a20444141552648C1f8443bAf171BCCcB99) | Handles every reactivity callback: wakes on the venue's `MarketCreated`, books the decision and settlement one-shots, fans out to armed desks. 24 112 bytes. |
+| `LucidWatch` | [`0xA0eb631bc7bD386C05Dcc1b1BFFd0021Ef1f6D3C`](https://shannon-explorer.somnia.network/address/0xA0eb631bc7bD386C05Dcc1b1BFFd0021Ef1f6D3C) | Owns the venue's `MarketCreated` subscription on a bond of its own and names the router as its handler. Why it exists: [section 12](#12-the-router-bricked-itself-and-what-replaced-it). 3 626 bytes. |
 | `LucidBrain` | [`0x0c640E3aFc627bEec7eDB9985696e12B50AdAd25`](https://shannon-explorer.somnia.network/address/0x0c640E3aFc627bEec7eDB9985696e12B50AdAd25) | Two-stage question to Somnia's on-chain agent committees: price first, then the probability verdict. 20 621 bytes. |
 | `LucidDesk` (clone implementation) | [`0xa659b03e2349559f2d56D17F246e66e79467c17e`](https://shannon-explorer.somnia.network/address/0xa659b03e2349559f2d56D17F246e66e79467c17e) | The desk logic every desk clone delegates to: mandate enforcement, sizing, order placement, cancellation, settlement booking. 14 940 bytes. |
 | `LucidFactory` | [`0x9c1EF0C429f1F88e8247f3539DeF8a1f8FCCEb84`](https://shannon-explorer.somnia.network/address/0x9c1EF0C429f1F88e8247f3539DeF8a1f8FCCEb84) | Mints ERC-1167 desk clones, one per owner address, and registers them with the router. 4 943 bytes. |
@@ -68,7 +69,7 @@ Third-party addresses this document refers to:
 
 ### Source verification
 
-**All seven Lucid contracts are source-verified on Blockscout right now.** Do not take our word for
+**All eight Lucid contracts are source-verified on Blockscout right now.** Do not take our word for
 it. One command per address, no key:
 
 ```bash
@@ -87,8 +88,9 @@ Observed at 2026-09-07 04:50 UTC:
 | `LucidSeries` | `True` — `LucidSeries` | 2026-09-06T20:12:34Z |
 | `LucidDesk` (implementation) | `True` — `LucidDesk` | 2026-09-07T03:43:38Z |
 | `LucidFactory` | `True` — `LucidFactory` | 2026-09-07T03:44:17Z |
+| `LucidWatch` | `True` — `LucidWatch` | 2026-09-08T14:41:19Z |
 
-All seven report compiler `v0.8.30+commit.73712a01` with the optimizer at 200 runs. An earlier
+All eight report compiler `v0.8.30+commit.73712a01` with the optimizer at 200 runs. An earlier
 version of this page recorded `LucidDesk` and `LucidFactory` as unverified, because at that moment
 they were; the two verifications above landed shortly after the redeploy. Re-run the command — it is
 the authority, not the paragraph.
@@ -508,7 +510,7 @@ Nothing of ours is running. Check it:
   and the top-ups; nothing repeats them on a schedule.
 - The router is still reacting **now**, with no help. Run
   [`verify-onchain.sh`](contracts/verify-onchain.sh) and read section 4/5 — at the run reproduced in
-  [section 12](#12-reproduce-it-yourself) it found 6 `MarketSeen` and 6 `SettlementScheduled` in the
+  [section 13](#13-reproduce-it-yourself) it found 6 `MarketSeen` and 6 `SettlementScheduled` in the
   last 950 blocks, the newest 73 blocks (about seven seconds) old.
 - Turn off every machine we own and the loop does not change. There is no endpoint to switch off:
   the router's address is the process.
@@ -621,7 +623,7 @@ float to zero, and every protocol pointed at it stopped at the same instant. The
 support ticket; it is your own creator, your own venue, and the venue's oracle answering it exactly
 as it answers DreamDEX's own. The deployment runs in `Failover` mode — mode `1`, confirmed by section
 11 of `verify-onchain.sh` — so it spends nothing while the venue's own scheduler is healthy. At the
-run in [section 12](#12-reproduce-it-yourself) the watcher reported the venue healthy, 0 rolls of the
+run in [section 13](#13-reproduce-it-yourself) the watcher reported the venue healthy, 0 rolls of the
 12 allowed today, and a creator float of 9.223132 SOMI against a 6 SOMI roll floor.
 
 ---
@@ -737,14 +739,99 @@ resume between top-ups. Nothing about the mechanism is bursty; the funding is.
 the whole window. A desk may allow the cadence and will refuse every one of those windows with
 `WindowTooShort`. Documented, not masked.
 
-**Testnet only, unaudited.** Shannon, chain 50312, faucet tUSDC. All seven contracts are
+**Testnet only, unaudited.** Shannon, chain 50312, faucet tUSDC. All eight contracts are
 source-verified on the explorer, which is not an audit and is not offered as one. Neither these
 contracts nor the DreamDEX binary contracts underneath them have been audited — the published Hacken
 audit covered the spot venue only.
 
 ---
 
-## 12. Reproduce it yourself
+## 12. The router bricked itself, and what replaced it
+
+At 13:56 UTC on 2026-09-08 the router held 0.68 SOMI. Somnia requires a subscription's owner to
+hold at least 32, and it had spent the difference the way it is supposed to — 0.36 SOMI per
+committee call, a handler bill per firing, one settlement wake-up per window it served. The chain
+had already reaped its venue subscription. Nothing was delivering markets, and the whole loop was
+quiet.
+
+That part was expected: a router below the floor stops, and topping it up starts it again. It did
+not start again.
+
+```
+$ cast call $ROUTER 'armVenue(address,bytes32)' $MODULE $VENUE --from $OWNER
+Error: execution reverted, data: "0x13e7ce5d"
+
+$ cast sig 'UnsubscribeFailed()'
+0x13e7ce5d
+```
+
+`armVenue` cancels the previous subscription before it creates the new one, and
+`SomniaExtensions.unsubscribe` reverts when the precompile refuses the cancel. The precompile
+refuses a cancel for an id it no longer holds — which is precisely the state the router was left
+in, holding `venueSubscriptionId = 16531811` for a subscription the chain had already taken away:
+
+```
+$ curl -s $RPC -d '{"method":"somnia_reactivityGetSubscriptions","params":["'$ROUTER'"]}'
+{"result":[]}
+```
+
+The router had been funded to 40 SOMI before that call. Money was never the problem, and no amount
+of it would have been: **a router that runs out of float can never be re-armed.**
+
+Every desk binds to its router in `initialize` and there is no setter, so redeploying the router
+means redeploying the desks that hold the collateral. That was not an acceptable answer at 14:00
+UTC, and it would not have been an acceptable answer at any other hour either.
+
+### LucidWatch
+
+The precompile lets a subscription name a handler other than its owner, and Somnia's
+`SomniaEventHandler` admits any call from `0x0100` without asking who owns the subscription behind
+it. So the venue subscription can be owned and paid for by one contract and executed on another —
+and the router needed no change at all to accept that.
+
+`LucidWatch` at
+[`0xA0eb631bc7bD386C05Dcc1b1BFFd0021Ef1f6D3C`](https://shannon-explorer.somnia.network/address/0xA0eb631bc7bD386C05Dcc1b1BFFd0021Ef1f6D3C)
+owns the `MarketCreated` subscription on a bond of its own and names the router as its handler. Its
+own cancel goes through a low-level call whose failure is recorded in an event and otherwise
+ignored, because "the subscription is already gone" and "the cancel was refused" leave the caller in
+the same place. A contract whose job is to recover from an empty balance must not carry a path that
+an empty balance can close permanently.
+
+```
+14:12 UTC  deploy  LucidWatch(owner, router)      0xA0eb631b…
+14:14 UTC  fund    36 SOMI                         0xd24624cc…
+14:15 UTC  arm(0x3ecC694C…)                        0x31271b6d…  subscription 16982453
+14:15 UTC  router decisionQueue = 2, settlementQueue = 4
+16:17 UTC  committee 55 % / 51 %, two maker legs filled on the venue
+```
+
+The split is worth having beyond the recovery. The venue watch and the router's own scheduling now
+sit behind two independent bonds: the router draining stops the wake-ups it pays for and leaves the
+watch delivering markets, so the protocol resumes on the next window instead of on the next
+deployment. `verify-onchain.sh` checks both bonds and reports a cold standby as a standby rather
+than as an underfunded contract.
+
+### Why the suite did not catch it
+
+`MockPrecompile.unsubscribe` accepted any id at all. Under that mock the re-arm path is
+unreachable, so 402 passing tests said nothing about it. The mock now refuses a cancel for a
+subscription it does not hold and carries a `reap()` that takes one away the way the chain does —
+without telling its owner, which is the whole failure mode.
+
+`test_router_armVenue_is_bricked_by_a_reap` in
+[`contracts/test/LucidWatch.t.sol`](contracts/test/LucidWatch.t.sol) then reproduces the production
+revert against the deployed router's own code, and
+`test_arm_recovers_after_the_chain_reaped_the_id` runs the identical setup through the watch. The
+pair is the argument; the other nineteen tests in that file are housekeeping.
+
+This is the second time in this project that a mock kinder than the chain hid a defect that only
+chain time could find — the first is the `Schedule` timestamp in
+[section 8](#8-there-is-no-server). Both are recorded in
+[`MOCKS.md`](MOCKS.md).
+
+---
+
+## 13. Reproduce it yourself
 
 No wallet, no key, no funds. Node 20+ and Foundry.
 
@@ -755,16 +842,17 @@ DESK=0x3ffbB71aec0D5459677021Ad888195042eDA4AA2 bash contracts/verify-onchain.sh
 ```
 
 `deployed.json` records two desks rather than a single `demoDesk`, so pass `DESK=`; without it the
-script exits early and says so. It runs **40 checks** — every address carries code, the router is
-above the reactivity floor, the subscription's emitter/topic/handler/gas-limit all match, the router
-is reacting right now, its wiring matches `deployed.json`, the desk is registered/armed/funded, its
-mandate is printed in words, the brain's quote is re-derived from the platform's own deposit
-function, the failover watcher's status, and our own venue's resolution through the indexer.
+script exits early and says so. It runs **42 checks** — every address carries code, both bonded
+contracts are above the reactivity floor, the venue subscription's emitter/topic/handler/gas-limit
+all match whichever of them owns it, the router is reacting right now, its wiring matches
+`deployed.json`, the desk is registered/armed/funded, its mandate is printed in words, the brain's
+quote is re-derived from the platform's own deposit function, the failover watcher's status, and our
+own venue's resolution through the indexer.
 
-Observed at 2026-09-07 05:00 UTC, head block 481 841 032:
+Observed at 2026-09-08 16:30 UTC, head block 483 045 475:
 
 ```
-40 checks: 40 passed, 0 failed, 0 skipped
+42 checks: 42 passed, 0 failed, 0 skipped
 OK — every claim was checked against the chain and held.
 ```
 
@@ -782,12 +870,15 @@ bash contracts/setup.sh          # forge install: forge-std + OpenZeppelin v5.4.
 cd contracts && forge test
 ```
 
-Observed at 2026-09-07 04:35 UTC: **402 passed, 0 failed, 0 skipped, across 14 suites.** No network,
+Observed at 2026-09-08 16:35 UTC: **423 passed, 0 failed, 0 skipped, across 15 suites.** No network,
 no key. The counts move as tests are added; the line that has to hold is `0 failed`. Per suite:
 `PolicyLibTest` 85 · `LucidRouterTest` 77 · `LucidBrainStageTest` 49 · `LucidDeskTest` 49 ·
-`LucidSeriesTest` 33 · `LucidBrainTest` 21 · `LucidRelayTest` 19 · `PromptLibTest` 15 ·
-`LucidFactoryTest` 14 · `LucidKeeperTest` 13 · `PolicyLibInvariantTest` 11 · `MarketDecoderTest` 7 ·
-`LucidDeskArmSyncTest` 5 · `TypesTest` 4.
+`LucidSeriesTest` 33 · `LucidWatchTest` 21 · `LucidBrainTest` 21 · `LucidRelayTest` 19 ·
+`PromptLibTest` 15 · `LucidFactoryTest` 14 · `LucidKeeperTest` 13 · `PolicyLibInvariantTest` 11 ·
+`MarketDecoderTest` 7 · `LucidDeskArmSyncTest` 5 · `TypesTest` 4.
+
+`LucidWatchTest` is the newest suite and the only one written against a defect in a contract that
+was already deployed — see [section 12](#12-the-router-bricked-itself-and-what-replaced-it).
 
 Eleven of those are new since the escrow defect in [section 5](#5-the-defect-the-desks-found-live):
 `LucidDeskTest` went from 38 to 49, covering the cancel-before-redeem order, a cancel that reverts,

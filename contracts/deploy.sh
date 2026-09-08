@@ -40,6 +40,11 @@ FACTORY=$(deploy LucidFactory "$DESK_IMPL" "$ROUTER" "$BRAIN" | tail -1)
 KEEPER=$(deploy LucidKeeper "$ME" "$ROUTER" | tail -1)
 RELAY=$(deploy LucidRelay | tail -1)
 SERIES=$(deploy LucidSeries "$ME" "$ROUTER" | tail -1)
+# The standby that takes the venue subscription over when the router can no longer re-arm
+# itself. Deployed with everything else and left cold: it costs nothing until it is funded
+# to the 32 SOMI floor and armed, and the day it is needed is a day nobody wants to be
+# deploying a contract. See LucidWatch for what "can no longer re-arm itself" means.
+WATCH=$(deploy LucidWatch "$ME" "$ROUTER" | tail -1)
 
 send() { cast send "$@" --rpc-url "$RPC" --private-key "$PRIVATE_KEY" >/dev/null; }
 
@@ -57,6 +62,17 @@ echo "funding..."
 send "$ROUTER" --value "$ROUTER_FUNDING"
 send "$BRAIN"  --value "$BRAIN_FUNDING"
 
+# `armVenue` is also what records `venue` and `venueModule`, which the router checks the emitter
+# against before it decodes anything — so it runs on a fresh deployment whether or not the router
+# is the contract that ends up owning the subscription.
+#
+# Exactly one contract owns it at a time. Two subscriptions on the same logs would run the handler
+# twice per market, and while the second pass books nothing twice, it is a second handler bill on
+# every window for no added coverage. To hand over later:
+#
+#     cast send $WATCH --value 33ether            # the watch needs its own bond
+#     cast send $WATCH 'arm(address)' $MODULE     # and the router's own subscription lapses
+#
 echo "arming the venue subscription..."
 send "$ROUTER" "armVenue(address,bytes32)" "$MODULE" "$VENUE"
 
@@ -66,6 +82,7 @@ cat > deployed.json <<JSON
   "deskImplementation": "$DESK_IMPL",
   "brain": "$BRAIN",
   "router": "$ROUTER",
+  "watch": "$WATCH",
   "factory": "$FACTORY",
   "keeper": "$KEEPER",
   "relay": "$RELAY",

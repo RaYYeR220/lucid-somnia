@@ -49,8 +49,8 @@ What each section is for:
 | section | what it settles |
 | --- | --- |
 | 1 | Every address in `deployed.json` carries runtime code, with byte counts. |
-| 2 | The router is above the 32 SOMI reactivity floor, with the margin printed. |
-| 3 | The router owns a live subscription whose emitter, topic, handler and gas limit all match. |
+| 2 | Both bonded contracts are above the 32 SOMI reactivity floor, with the margins printed. |
+| 3 | A live subscription delivers to the router — emitter, topic, handler and gas limit all match — whichever of the two owns it. |
 | 4/5 | `MarketSeen` and `SettlementScheduled` logs from the last few minutes — the router is reacting *right now*, with nothing of ours running. |
 | 6 | The router's wiring matches `deployed.json` contract by contract. |
 | 7–9 | The demo desk is registered and armed, holds real tUSDC, and its mandate is printed in words rather than as two bitmasks. |
@@ -69,7 +69,7 @@ you exactly which read produced it.
 
 ## 2. Open the contracts on the explorer
 
-All seven Lucid contracts are source-verified on Blockscout, along with the demo desk clone. The
+All eight Lucid contracts are source-verified on Blockscout, along with the demo desk clone. The
 `MarketCreator` row is a DreamDEX deployment we registered permissionlessly, so its source is
 theirs, not ours.
 
@@ -79,6 +79,7 @@ theirs, not ours.
 | contract | address |
 | --- | --- |
 | `LucidRouter` | [`0x6aE21a20444141552648C1f8443bAf171BCCcB99`](https://shannon-explorer.somnia.network/address/0x6aE21a20444141552648C1f8443bAf171BCCcB99) |
+| `LucidWatch (venue subscription)` | [`0xA0eb631bc7bD386C05Dcc1b1BFFd0021Ef1f6D3C`](https://shannon-explorer.somnia.network/address/0xA0eb631bc7bD386C05Dcc1b1BFFd0021Ef1f6D3C) |
 | `LucidBrain` | [`0x0c640E3aFc627bEec7eDB9985696e12B50AdAd25`](https://shannon-explorer.somnia.network/address/0x0c640E3aFc627bEec7eDB9985696e12B50AdAd25) |
 | `LucidDesk (clone implementation)` | [`0xa659b03e2349559f2d56D17F246e66e79467c17e`](https://shannon-explorer.somnia.network/address/0xa659b03e2349559f2d56D17F246e66e79467c17e) |
 | `LucidFactory` | [`0x9c1EF0C429f1F88e8247f3539DeF8a1f8FCCEb84`](https://shannon-explorer.somnia.network/address/0x9c1EF0C429f1F88e8247f3539DeF8a1f8FCCEb84) |
@@ -175,11 +176,11 @@ bash contracts/setup.sh     # forge install: forge-std + OpenZeppelin v5.4.0
 cd contracts && forge test
 ```
 
-No network, no key. Over 300 test functions across 13 suites; the summary line at the bottom must
+No network, no key. Over 400 test functions across 15 suites; the summary line at the bottom must
 read `0 failed` for every one. One of those suites is an invariant campaign on `PolicyLib`, run
 with `fail_on_revert = true` and a pinned fuzz seed so a review reproduces exactly what we saw.
 
-The two worth opening:
+The three worth opening:
 
 - `contracts/test/PolicyLib.invariant.t.sol` — the mandate cannot be talked past. Spend never
   exceeds the caps, a halted desk stays halted, and no path reaches execution without a passing
@@ -189,6 +190,11 @@ The two worth opening:
   code or has no credit must be skipped **by name** without taking the other desks in the same
   firing down with it. A revert inside a reactivity handler discards the whole firing and the router
   is charged for the gas regardless, so this is the file where that rule is enforced.
+- `contracts/test/LucidWatch.t.sol` — the only suite here written against a defect in a contract
+  that was already deployed. `test_router_armVenue_is_bricked_by_a_reap` reproduces the revert that
+  took this deployment down on 2026-09-08, and the test beside it runs the identical setup through
+  the contract that replaced it. Neither could be written until `MockPrecompile` stopped being
+  kinder than the chain, which is why the bug shipped in the first place.
 
 ---
 
@@ -233,6 +239,7 @@ it turns four opaque topics into a sentence naming the emitter, the handler and 
 | question | file |
 | --- | --- |
 | How does anything get woken up? | `contracts/src/LucidRouter.sol`, `_onEvent` → `_onMarketCreated` → `_onDecision` → `_onSchedule` |
+| Who owns the subscription that wakes it, and why is that not the router? | `contracts/src/LucidWatch.sol`, and [PROOF.md section 12](PROOF.md#12-the-router-bricked-itself-and-what-replaced-it) |
 | What can a desk never be talked into? | `contracts/src/lib/PolicyLib.sol`, `gate` |
 | How is the committee asked, and what if it fails? | `contracts/src/LucidBrain.sol`, `requestVerdict` → `handlePrice` → `handleResponse` |
 | How does a trade actually reach the venue? | `contracts/src/LucidDesk.sol`, `_take`, `_make`, `_place` |

@@ -21,23 +21,30 @@ docs, placed where a builder is standing when they hit the problem.
 - Indexer `https://dev.smk.somnia.host/v1/graphql`.
 - Live sample pool used for book reads: `0x9df243eab4fbcbcefee61b8069cebac50d022133`.
 
-## The three highest-value changes
+## The four highest-value changes
 
 1. Put Somnia's real gas costs in the docs, with a worked number. It is the root cause of two of
-   the three blocking items below and it silently invalidates every gas budget a builder brings
+   the blocking items below and it silently invalidates every gas budget a builder brings
    from mainnet. See [B3](#b3--somnias-gas-costs-are-far-above-mainnet-and-this-is-not-stated-anywhere).
 2. Document the Hasura indexer as a product surface, or say plainly in the Event Contracts docs
    that `api.dreamdex.io/v0` is spot-only and the indexer is the answer. See
    [D1](#d1--there-is-no-restwebsocket-api-for-event-contracts-and-the-docs-do-not-say-so).
 3. Document a minimum working reactivity `gasLimit`, or make the precompile refuse one that is too
    low. See [B1](#b1--a-reactivity-handler-with-a-2000000-gas-limit-is-charged-in-full-and-never-executes).
+4. Make `unsubscribe` a no-op on an id the precompile no longer holds, or give owners a way to see
+   that a subscription was reaped. As it stands, a contract that runs out of float can be left
+   permanently unable to re-subscribe. See
+   [B4](#b4--a-reaped-subscription-is-silent-and-cancelling-it-reverts-which-can-permanently-brick-the-owner).
 
 ---
 
 # Blocking
 
-Three failures that produce no error, no revert, and no log — the transaction looks like a success
-and the work did not happen. Each cost us hours, and each is fixable with documentation alone.
+Four failures that produce no error, no revert, and no log — the transaction looks like a success
+and the work did not happen. Three are fixable with documentation alone; the fourth
+([B4](#b4--a-reaped-subscription-is-silent-and-cancelling-it-reverts-which-can-permanently-brick-the-owner))
+we think needs a one-line change to the precompile, because no amount of documentation gets a
+bricked contract back.
 
 ## B1 — A reactivity handler with a 2,000,000 gas limit is charged in full and never executes
 
@@ -197,6 +204,80 @@ reactivity page, where `gasLimit` is a required field a builder has to guess at.
 - A skip or failure reason must name the component that actually failed. "The callee reverted" and
   "we did not give the callee enough gas" are indistinguishable from a `catch`, and a label that
   blames the callee sends the reader to debug the wrong contract.
+
+## B4 — A reaped subscription is silent, and cancelling it reverts, which can permanently brick the owner
+
+**Expected.** A contract that falls below `SUBSCRIPTION_OWNER_MINIMUM_BALANCE`, is topped back up,
+and re-subscribes, ends up where it started.
+
+**Observed.** It can end up unable to subscribe again, for good, with any balance.
+
+Three behaviours compose into that:
+
+1. The chain removes a subscription when its owner's balance falls below 32 SOMI. The owner is not
+   told — there is no callback, no flag on the subscription, and nothing readable from the owner's
+   own storage changes. It goes on holding an id.
+2. `somnia_reactivityGetSubscriptionInfo(id)` for a reaped id returns `{"result":[]}` — an empty
+   array, not an error and not a row with a status. So the "it is gone" signal exists, but only over
+   RPC, and only if you already suspect it.
+3. `ISomniaReactivityPrecompile.unsubscribe(id)` **reverts** for an id the precompile no longer
+   holds, and `SomniaExtensions.unsubscribe` turns that into `UnsubscribeFailed()`.
+
+Any contract that does the natural thing — cancel the old subscription before creating the new one,
+which is what you must do to avoid two live subscriptions on the same filter — now has a
+re-subscribe path that reverts forever. Ours did:
+
+```
+$ cast call $ROUTER 'armVenue(address,bytes32)' $MODULE $VENUE --from $OWNER
+Error: execution reverted, data: "0x13e7ce5d"      # UnsubscribeFailed()
+
+$ cast balance $ROUTER                              # 40 SOMI, well over the floor
+$ curl -s $RPC -d '{"method":"somnia_reactivityGetSubscriptions","params":["'$ROUTER'"]}'
+{"result":[]}
+```
+
+**Reproduction.** Deploy a handler contract with a `rearm()` that cancels `lastId` and subscribes
+again. Fund it to 33 SOMI, arm it, then move its balance below 32 and wait for the reap. Top it
+back up to any amount and call `rearm()`: it reverts, and there is no state on the contract you can
+change to get past it.
+
+**Impact.** For us this was the most expensive single failure in the project, and unlike B1 and B2
+it was not recoverable by understanding it. Running out of float is not an exotic state for a
+reactivity contract — it is the ordinary end of a funding round, and the docs correctly describe
+the floor as a balance to maintain. What they do not say is that crossing it can be terminal for
+the contract's ability to subscribe at all. Our desks bind to their router permanently, so
+redeploying the router would have stranded live collateral; we shipped a second bonded contract
+that owns the subscription and names the original as its handler, which works only because the
+precompile lets a subscription name a handler other than its owner and `SomniaEventHandler` does
+not check who owns the subscription behind a callback. Not every architecture has that escape.
+
+**Suggestion**, in the order we would want them:
+
+1. Make `unsubscribe` a no-op — or return `false` — for an id that is not live, rather than
+   reverting. A cancel whose goal is "this id is not delivering to me any more" has already
+   succeeded. This is a one-line change and it removes the whole failure class.
+2. Failing that, expose the liveness of an id in a way a *contract* can read: a
+   `isSubscriptionLive(uint256) returns (bool)` view on `0x0100`. Today the only source is an RPC
+   method returning an empty array, which no contract can consult before deciding whether to
+   cancel.
+3. Document it either way. One sentence next to `SUBSCRIPTION_OWNER_MINIMUM_BALANCE` — "a
+   subscription removed for insufficient balance cannot be cancelled afterwards; guard your
+   re-subscribe path" — would have turned an outage into a paragraph.
+
+**Note for other builders reading this before it is fixed.** Wrap the cancel in a low-level call
+and ignore the failure:
+
+```solidity
+(bool ok,) = address(0x0100).call(
+    abi.encodeWithSelector(ISomniaReactivityPrecompile.unsubscribe.selector, id)
+);
+// `ok == false` means the id was already gone. Record it; do not revert on it.
+```
+
+There is a second lesson underneath this one that is not Somnia's problem but is worth stating: our
+test double for the precompile accepted `unsubscribe` for any id at all, so the failing path was
+unreachable in 402 passing tests. A mock that is kinder than the chain does not make a contract
+safer.
 
 ---
 
