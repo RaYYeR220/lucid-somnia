@@ -132,10 +132,16 @@ said so, and each one says which measurement.
 
 ### Why the subscription sits in its own contract
 
-Somnia requires a subscription's owner to hold at least 32 SOMI and reaps the subscriptions of an
-owner that falls below that line. The router pays for committee calls and settlement wake-ups out
-of the same balance that backs its bond, so it running out of float is not an edge case — it is the
-ordinary end of a funding round.
+Somnia requires a subscription's owner to hold at least 32 SOMI at `subscribe` time, and it removes
+the subscriptions of an owner that has run its balance down — without telling it. The router pays
+for committee calls and settlement wake-ups out of the same balance that backs its bond, so running
+out of float is not an edge case for it; it is the ordinary end of a funding round.
+
+(How far down is not established. We have seen a contract at 0.68 SOMI lose its subscription and
+another sit at 7.65 for nineteen hours and keep it. `LucidWatch`'s own natspec says "falls below
+that line", which is the guess we were working from when it was written and is more than we can
+show. The contract is correct either way — it defends against the subscription being gone, not
+against a particular reason for it.)
 
 Running dry was survivable. Coming back was not. `LucidRouter.armVenue` cancels the previous
 subscription before creating the new one, and the cancel reverts when the precompile refuses it.

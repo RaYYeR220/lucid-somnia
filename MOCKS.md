@@ -55,8 +55,8 @@ A router keyed on the requested value passed 350 tests and no-opped on chain for
 The mock now skews every firing by the 73 ms measured in a real Shannon handler transaction.
 
 The second was `unsubscribe`. The mock accepted any id at all, so the path where a cancel is refused
-was unreachable and nothing tested it. On chain, a subscription whose owner drops below the 32 SOMI
-floor is reaped without telling the owner, and every subsequent cancel of that id is refused —
+was unreachable and nothing tested it. On chain, a subscription can be taken from an owner that has
+run its balance down, without telling it, and every subsequent cancel of that id is refused —
 which is what permanently bricked `LucidRouter.armVenue` on 2026-09-08, told in
 [PROOF.md section 12](PROOF.md#12-the-router-bricked-itself-and-what-replaced-it). The mock now
 refuses those cancels and carries a `reap()` that takes a subscription away the way the chain does.

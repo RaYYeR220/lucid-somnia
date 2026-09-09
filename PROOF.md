@@ -773,10 +773,15 @@ audit covered the spot venue only.
 ## 12. The router bricked itself, and what replaced it
 
 At 13:56 UTC on 2026-09-08 the router held 0.68 SOMI. Somnia requires a subscription's owner to
-hold at least 32, and it had spent the difference the way it is supposed to — 0.36 SOMI per
-committee call, a handler bill per firing, one settlement wake-up per window it served. The chain
-had already reaped its venue subscription. Nothing was delivering markets, and the whole loop was
-quiet.
+hold at least 32 at `subscribe` time, and the router had spent the difference the way it is
+supposed to — 0.36 SOMI per committee call, a handler bill per firing, one settlement wake-up per
+window it served. The chain had already taken its venue subscription away. Nothing was delivering
+markets, and the whole loop was quiet.
+
+At what point it was taken away we do not know, and this section used to assert that crossing the
+32 SOMI line was enough to do it. It is not: the watch described below ran for nineteen hours at
+7.65 SOMI, far under the floor, and kept its subscription and kept delivering. Two observations —
+gone at 0.68, alive at 7.65 — do not identify a mechanism, and none is claimed here.
 
 That part was expected: a router below the floor stops, and topping it up starts it again. It did
 not start again.

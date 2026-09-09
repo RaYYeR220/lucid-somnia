@@ -218,9 +218,21 @@ and re-subscribes, ends up where it started.
 
 Three behaviours compose into that:
 
-1. The chain removes a subscription when its owner's balance falls below 32 SOMI. The owner is not
-   told — there is no callback, no flag on the subscription, and nothing readable from the owner's
-   own storage changes. It goes on holding an id.
+1. The chain removes a subscription from an owner that has run its balance down, and the owner is
+   not told — there is no callback, no flag on the subscription, and nothing readable from the
+   owner's own storage changes. It goes on holding an id.
+
+   **What triggers the removal is not established, and an earlier version of this report said it
+   was the 32 SOMI floor.** That is more than we observed. What we observed is two points: a
+   contract at 0.68 SOMI had lost its subscription, and a second contract sat at 7.65 SOMI for
+   nineteen hours with its subscription still live and still delivering. So the trigger is
+   somewhere below the floor the docs name, and it may not be a balance threshold at all — running
+   out of money to pay a firing would produce the same two observations. The floor itself is
+   enforced at `subscribe` time; `SomniaExtensions._subscribe` checks it and reverts, which is
+   visible in the library.
+
+   Either way the hazard is the same and the fix below is the same: an owner can lose a
+   subscription without being told, and then cannot cancel the id it is still holding.
 2. `somnia_reactivityGetSubscriptionInfo(id)` for a reaped id returns `{"result":[]}` — an empty
    array, not an error and not a row with a status. So the "it is gone" signal exists, but only over
    RPC, and only if you already suspect it.
@@ -241,9 +253,10 @@ $ curl -s $RPC -d '{"method":"somnia_reactivityGetSubscriptions","params":["'$RO
 ```
 
 **Reproduction.** Deploy a handler contract with a `rearm()` that cancels `lastId` and subscribes
-again. Fund it to 33 SOMI, arm it, then move its balance below 32 and wait for the reap. Top it
-back up to any amount and call `rearm()`: it reverts, and there is no state on the contract you can
-change to get past it.
+again. Fund it to 33 SOMI, arm it against a busy emitter, and let the firings drain it to near
+zero. Top it back up to any amount and call `rearm()`: it reverts, and there is no state on the
+contract you can change to get past it. Draining it is the part that takes patience — dropping the
+balance just under 32 is not sufficient, which is the correction in point 1 above.
 
 **Impact.** For us this was the most expensive single failure in the project, and unlike B1 and B2
 it was not recoverable by understanding it. Running out of float is not an exotic state for a
