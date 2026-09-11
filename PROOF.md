@@ -532,8 +532,8 @@ cast call $B 'verdictLatencyEma()(uint256)' --rpc-url $RPC   # 0
 cast call $B 'requiredSlack()(uint256)'     --rpc-url $RPC   # 90
 ```
 
-Both stages are marked observed, both exponential moving averages have settled at 0 seconds, and
-`requiredSlack()` reads **90** — its hard floor. It was seeded at 60 s per stage, which put the
+On 2026-09-07 both stages were marked observed, both exponential moving averages had settled at
+0 seconds, and `requiredSlack()` read **90** — its hard floor. It was seeded at 60 s per stage, which put the
 requirement at **270 s**; a 300-second window asked at the halfway point offers 150 s, so the guard
 refused every window and, because an EMA only updates when its stage *completes*, refusing meant the
 measurement never happened. Sixteen consecutive wake-ups skipped `TOO_LATE` on a router that was
@@ -549,6 +549,42 @@ and found them fast — not because anyone edited a constant. The measurements a
 [`0x5e170dbb…`](https://shannon-explorer.somnia.network/tx/0x5e170dbb00608b70eedaeca00c5cea4772b1b28206e5dbab52562d65c3bc5f18).
 The general rule that came out of it: a self-calibrating guard must never be able to prevent its own
 calibration, so an unobserved stage contributes its floor rather than its seed.
+
+### The same deadlock, through the other door
+
+That rule closed one door and left another open, and the deployment walked through it on
+2026-09-11.
+
+Contributing the floor only helps a stage that has never been measured. It does nothing for a stage
+that has been measured *slowly*. At some point before 01:52 UTC the price committee delivered one
+answer late enough to move `feedLatencyEma` from 0 to 81 in a single sample — the average folds in a
+quarter of each observation, so that is a round trip of roughly 324 s. `requiredSlack()` became
+`(81 + 0) × 2 + 30 = 192`. A 300-second window asked at the halfway point has 150 s left, so the
+router's own pre-check, `_tooLateToAsk`, which reads the same `requiredSlack()` before it pays for
+anything, refused every window with `TOO_LATE`. An average only moves when a stage completes, and
+nothing was being asked, so nothing was ever going to move it back.
+
+The desks sat armed, funded and silent for at least thirteen hours. A scan back to 01:52 UTC found
+no committee request at all, and the maker's `dayKey` never rolled over into the 11th. Every layer
+was healthy on its own terms: the watch was delivering markets, the router was booking decisions,
+and each decision was being declined for a reason that reads exactly like prudence.
+
+The cap on a single sample does not prevent this. `MAX_SLACK` is 600 s, and one capped sample puts
+the average at 150 and the requirement at 330 — more than a 300-second window leaves at any decision
+point the router allows.
+
+It was recovered without a redeploy at 14:40 UTC on 2026-09-11 by moving the decision point from
+50 % of the window to 25 % — `setDecisionPoint(2500)` in [`0x3b40a2d5…`](https://shannon-explorer.somnia.network/tx/0x3b40a2d5b2b8f6a903b2e72da8d820c58dd8bddaa1be345399e5df0329e7c361).
+That leaves 225 s at the decision instant against 192 required. The first committee request after
+it went out at block 485 644 108, 14:41:15 UTC. The price stage answered in 14 s and the verdict
+stage in 1 s, the average fell from 81 to 64, and the requirement from 192 to 158; each fast answer
+takes another quarter off, so it reaches the 90-second floor within a handful of windows, and the
+decision point can then go back to halfway.
+
+That is a recovery, not a fix. A guard that is only re-measured when it lets work through can always
+lock itself shut, and moving the decision point widens the margin without removing the loop. The fix
+is a contract change — let the router ask anyway after some number of consecutive `TOO_LATE`
+refusals, so a stale average is always given the chance to be corrected — and it is not deployed.
 
 The quote it charges for those two stages is re-derived from the platform's own deposit function
 rather than taken on the brain's word, in section 10 of `verify-onchain.sh`:

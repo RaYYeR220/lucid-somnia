@@ -180,7 +180,8 @@ longer held — the mock being kinder than the chain is exactly why this shipped
    armed desk's `preCheck` whether it wants the window. This costs nothing but gas — no committee
    is paid to tell a desk what its own mandate already knows.
 4. If at least one desk wants it, the router books a `Schedule` one-shot part-way into the window
-   (`decisionPointBps`, default 5,000 — halfway) rather than asking immediately. These windows
+   (`decisionPointBps`, default 5,000 — halfway; the live router has run at 2,500 since 2026-09-11,
+   for the reason in [PROOF.md section 9](PROOF.md#9-self-calibration)) rather than asking immediately. These windows
    settle against the price they *opened* at, so at `tradingStart` spot equals strike and "will it
    close above the strike" is a question with no content. A committee asked an empty question
    answers 50, which is exactly what the first live run produced, three validators agreeing on
